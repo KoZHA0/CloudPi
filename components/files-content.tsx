@@ -148,20 +148,20 @@ export function FilesContent() {
       {/* Selected Actions */}
       {selectedFiles.length > 0 && (
         <Card className="bg-secondary border-border">
-          <CardContent className="flex items-center justify-between py-3">
+          <CardContent className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 py-3">
             <span className="text-sm text-secondary-foreground">{selectedFiles.length} item(s) selected</span>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
               <Button variant="ghost" size="sm" className="gap-2">
                 <Download className="h-4 w-4" />
-                Download
+                <span className="hidden xs:inline">Download</span>
               </Button>
               <Button variant="ghost" size="sm" className="gap-2">
                 <Share2 className="h-4 w-4" />
-                Share
+                <span className="hidden xs:inline">Share</span>
               </Button>
               <Button variant="ghost" size="sm" className="gap-2 text-destructive">
                 <Trash2 className="h-4 w-4" />
-                Delete
+                <span className="hidden xs:inline">Delete</span>
               </Button>
             </div>
           </CardContent>
@@ -217,15 +217,15 @@ export function FilesContent() {
           })}
         </div>
       ) : (
-        <Card className="bg-card border-border">
-          <CardHeader className="border-b border-border py-3">
+        <Card className="bg-card border-border overflow-hidden">
+          <CardHeader className="border-b border-border py-3 hidden sm:block">
             <div className="grid grid-cols-12 gap-4 text-xs font-medium text-muted-foreground">
               <div className="col-span-1">
                 <Checkbox />
               </div>
-              <div className="col-span-5">Name</div>
-              <div className="col-span-2">Size</div>
-              <div className="col-span-3">Modified</div>
+              <div className="col-span-6 sm:col-span-5">Name</div>
+              <div className="col-span-2 hidden sm:block">Size</div>
+              <div className="col-span-3 hidden md:block">Modified</div>
               <div className="col-span-1" />
             </div>
           </CardHeader>
@@ -236,24 +236,27 @@ export function FilesContent() {
                 <div
                   key={file.id}
                   className={cn(
-                    "grid grid-cols-12 gap-4 items-center px-6 py-3 border-b border-border last:border-0 hover:bg-secondary cursor-pointer",
+                    "flex sm:grid sm:grid-cols-12 gap-2 sm:gap-4 items-center px-4 sm:px-6 py-3 border-b border-border last:border-0 hover:bg-secondary cursor-pointer",
                     selectedFiles.includes(file.id) && "bg-secondary",
                   )}
                 >
-                  <div className="col-span-1">
+                  <div className="sm:col-span-1 flex-shrink-0">
                     <Checkbox
                       checked={selectedFiles.includes(file.id)}
                       onCheckedChange={() => toggleFileSelection(file.id)}
                     />
                   </div>
-                  <div className="col-span-5 flex items-center gap-3">
-                    <Icon className={cn("h-5 w-5", getFileColor(file.type))} />
-                    <span className="text-sm font-medium text-card-foreground truncate">{file.name}</span>
-                    {file.starred && <Star className="h-4 w-4 fill-yellow-400 text-yellow-400" />}
+                  <div className="flex-1 sm:col-span-6 md:col-span-5 flex items-center gap-3 min-w-0">
+                    <Icon className={cn("h-5 w-5 flex-shrink-0", getFileColor(file.type))} />
+                    <div className="min-w-0 flex-1">
+                      <span className="text-sm font-medium text-card-foreground truncate block">{file.name}</span>
+                      <span className="text-xs text-muted-foreground sm:hidden">{file.size}</span>
+                    </div>
+                    {file.starred && <Star className="h-4 w-4 fill-yellow-400 text-yellow-400 flex-shrink-0" />}
                   </div>
-                  <div className="col-span-2 text-sm text-muted-foreground">{file.size}</div>
-                  <div className="col-span-3 text-sm text-muted-foreground">{file.modified}</div>
-                  <div className="col-span-1 flex justify-end">
+                  <div className="hidden sm:block sm:col-span-2 text-sm text-muted-foreground">{file.size}</div>
+                  <div className="hidden md:block md:col-span-3 text-sm text-muted-foreground">{file.modified}</div>
+                  <div className="sm:col-span-1 flex justify-end flex-shrink-0">
                     <DropdownMenu>
                       <DropdownMenuTrigger asChild>
                         <Button variant="ghost" size="icon" className="h-8 w-8">

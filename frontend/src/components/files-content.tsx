@@ -303,23 +303,24 @@ export function FilesContent() {
     return (
         <div className="space-y-6">
             {/* Breadcrumb Navigation */}
-            <div className="flex items-center gap-2 text-sm">
+            <div className="flex items-center gap-1 sm:gap-2 text-sm overflow-x-auto pb-2">
                 <Button
                     variant="ghost"
                     size="sm"
-                    className="gap-2"
+                    className="gap-1 sm:gap-2 flex-shrink-0"
                     onClick={() => navigateToFolder(null)}
                 >
                     <Home className="h-4 w-4" />
-                    My Files
+                    <span className="hidden sm:inline">My Files</span>
                 </Button>
                 {breadcrumbs.map((crumb) => (
-                    <div key={crumb.id} className="flex items-center gap-2">
-                        <ChevronRight className="h-4 w-4 text-muted-foreground" />
+                    <div key={crumb.id} className="flex items-center gap-1 sm:gap-2 flex-shrink-0">
+                        <ChevronRight className="h-4 w-4 text-muted-foreground flex-shrink-0" />
                         <Button
                             variant="ghost"
                             size="sm"
                             onClick={() => navigateToFolder(crumb.id)}
+                            className="truncate max-w-[100px] sm:max-w-none"
                         >
                             {crumb.name}
                         </Button>
@@ -473,7 +474,7 @@ export function FilesContent() {
 
             {/* Files Grid */}
             {view === "grid" && filteredFiles.length > 0 && (
-                <div className="grid gap-4 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
+                <div className="grid gap-3 grid-cols-1 xs:grid-cols-2 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
                     {filteredFiles.map((file) => {
                         const Icon = getFileIcon(file.type)
                         return (
@@ -540,8 +541,8 @@ export function FilesContent() {
                                         className="flex flex-col items-center pt-4"
                                         onClick={() => file.type === "folder" && handleFileClick(file)}
                                     >
-                                        <Icon className={cn("h-12 w-12 mb-3", getFileColor(file.type))} />
-                                        <p className="text-sm font-medium text-card-foreground text-center truncate w-full">
+                                        <Icon className={cn("h-10 w-10 sm:h-12 sm:w-12 mb-2 sm:mb-3", getFileColor(file.type))} />
+                                        <p className="text-xs sm:text-sm font-medium text-card-foreground text-center line-clamp-2 w-full px-1" title={file.name}>
                                             {file.name}
                                         </p>
                                         <p className="text-xs text-muted-foreground mt-1">

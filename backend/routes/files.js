@@ -21,7 +21,7 @@
 const express = require('express');
 const multer = require('multer');
 const path = require('path');
-const fs = require('fs')
+const fs = require('fs');
 const jwt = require('jsonwebtoken');
 const db = require('../database/db');
 const { v4: uuidv4 } = require('uuid');

@@ -5,22 +5,23 @@
  * 
  * ENDPOINTS:
  * GET    /api/files              - List files/folders in directory
+ * GET    /api/files/trash        - List trashed items
+ * GET    /api/files/recent       - Get recently modified files
  * POST   /api/files/folder       - Create new folder
  * POST   /api/files/upload       - Upload file(s)
  * GET    /api/files/:id/download - Download file
  * PUT    /api/files/:id          - Rename file/folder
  * PUT    /api/files/:id/star     - Toggle star status
  * PUT    /api/files/:id/move     - Move to different folder
- * DELETE /api/files/:id          - Move to trash
- * GET    /api/files/trash        - List trashed items
  * PUT    /api/files/:id/restore  - Restore from trash
+ * DELETE /api/files/:id          - Move to trash
  * DELETE /api/files/:id/permanent - Permanently delete
  */
 
 const express = require('express');
 const multer = require('multer');
 const path = require('path');
-const fs = require('fs');
+const fs = require('fs')
 const jwt = require('jsonwebtoken');
 const db = require('../database/db');
 const { v4: uuidv4 } = require('uuid');
@@ -41,7 +42,7 @@ if (!fs.existsSync(STORAGE_DIR)) {
 const storage = multer.diskStorage({
     destination: (req, file, cb) => {
         // Create user-specific directory
-        const userDir = path.join(STORAGE_DIR, String(req.user.username));
+        const userDir = path.join(STORAGE_DIR, String(req.user.userId));
         if (!fs.existsSync(userDir)) {
             fs.mkdirSync(userDir, { recursive: true });
         }
@@ -101,15 +102,12 @@ function getFileType(mimeType) {
 }
 
 // ============================================
-// LIST FILES/FOLDERS
+// STATIC ROUTES FIRST (before :id routes)
 // ============================================
 
 /**
  * GET /api/files
  * List files and folders in a directory
- * Query params:
- *   - parent_id: Folder ID (optional, null for root)
- *   - starred: If true, show only starred items
  */
 router.get('/', requireAuth, (req, res) => {
     try {
@@ -161,9 +159,53 @@ router.get('/', requireAuth, (req, res) => {
     }
 });
 
-// ============================================
-// CREATE FOLDER
-// ============================================
+/**
+ * GET /api/files/trash
+ * List trashed items (MUST come before /:id routes)
+ */
+router.get('/trash', requireAuth, (req, res) => {
+    try {
+        const userId = req.user.userId;
+
+        const files = db.prepare(`
+            SELECT id, name, type, size, mime_type, trashed_at
+            FROM files 
+            WHERE user_id = ? AND trashed = 1
+            AND (parent_id IS NULL OR parent_id NOT IN (
+                SELECT id FROM files WHERE trashed = 1
+            ))
+            ORDER BY trashed_at DESC
+        `).all(userId);
+
+        res.json({ files });
+    } catch (error) {
+        console.error('List trash error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+/**
+ * GET /api/files/recent
+ * Get recently modified files (MUST come before /:id routes)
+ */
+router.get('/recent', requireAuth, (req, res) => {
+    try {
+        const userId = req.user.userId;
+
+        const files = db.prepare(`
+            SELECT id, name, type, size, mime_type, parent_id, starred, modified_at
+            FROM files 
+            WHERE user_id = ? AND trashed = 0 AND type != 'folder'
+            ORDER BY modified_at DESC
+            LIMIT 20
+        `).all(userId);
+
+        res.json({ files });
+    } catch (error) {
+        console.error('Recent files error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
 
 /**
  * POST /api/files/folder
@@ -225,10 +267,6 @@ router.post('/folder', requireAuth, (req, res) => {
     }
 });
 
-// ============================================
-// UPLOAD FILE
-// ============================================
-
 /**
  * POST /api/files/upload
  * Upload one or more files
@@ -279,30 +317,28 @@ router.post('/upload', requireAuth, upload.array('files', 10), (req, res) => {
             files: uploadedFiles
         });
     } catch (error) {
-    console.error('Upload error:', error);
+        console.error('Upload error:', error);
 
-    // CLEANUP
-    if (req.files) {
-        req.files.forEach(file => {
-            // "file.path" comes directly from the uploader middleware
-            // It is safer than reconstructing it manually
-            if (file.path && fs.existsSync(file.path)) {
-                try {
-                    fs.unlinkSync(file.path);
-                    console.log('Cleaned up:', file.filename);
-                } catch (cleanupErr) {
-                    console.error('Failed to delete:', file.filename);
+        // CLEANUP - delete uploaded files if DB insert failed
+        if (req.files) {
+            req.files.forEach(file => {
+                if (file.path && fs.existsSync(file.path)) {
+                    try {
+                        fs.unlinkSync(file.path);
+                        console.log('Cleaned up:', file.filename);
+                    } catch (cleanupErr) {
+                        console.error('Failed to delete:', file.filename);
+                    }
                 }
-            }
-        });
-    }
+            });
+        }
 
-    res.status(500).json({ error: 'Server error during upload' });
-}
+        res.status(500).json({ error: 'Server error during upload' });
+    }
 });
 
 // ============================================
-// DOWNLOAD FILE
+// DYNAMIC ROUTES (with :id parameter)
 // ============================================
 
 /**
@@ -334,10 +370,6 @@ router.get('/:id/download', requireAuth, (req, res) => {
         res.status(500).json({ error: 'Server error during download' });
     }
 });
-
-// ============================================
-// RENAME FILE/FOLDER
-// ============================================
 
 /**
  * PUT /api/files/:id
@@ -394,10 +426,6 @@ router.put('/:id', requireAuth, (req, res) => {
     }
 });
 
-// ============================================
-// TOGGLE STAR
-// ============================================
-
 /**
  * PUT /api/files/:id/star
  * Toggle starred status
@@ -427,10 +455,6 @@ router.put('/:id/star', requireAuth, (req, res) => {
         res.status(500).json({ error: 'Server error' });
     }
 });
-
-// ============================================
-// MOVE FILE/FOLDER
-// ============================================
 
 /**
  * PUT /api/files/:id/move
@@ -482,87 +506,6 @@ router.put('/:id/move', requireAuth, (req, res) => {
     }
 });
 
-// ============================================
-// DELETE (MOVE TO TRASH)
-// ============================================
-
-/**
- * DELETE /api/files/:id
- * Move file/folder to trash
- */
-router.delete('/:id', requireAuth, (req, res) => {
-    try {
-        const userId = req.user.userId;
-        const fileId = req.params.id;
-
-        const file = db.prepare(
-            'SELECT * FROM files WHERE id = ? AND user_id = ?'
-        ).get(fileId, userId);
-
-        if (!file) {
-            return res.status(404).json({ error: 'File not found' });
-        }
-
-        // Move to trash (soft delete)
-        db.prepare(`
-            UPDATE files SET trashed = 1, trashed_at = CURRENT_TIMESTAMP WHERE id = ?
-        `).run(fileId);
-
-        // Also trash all children if it's a folder
-        if (file.type === 'folder') {
-            const trashChildren = (parentId) => {
-                const children = db.prepare('SELECT id, type FROM files WHERE parent_id = ?').all(parentId);
-                for (const child of children) {
-                    db.prepare('UPDATE files SET trashed = 1, trashed_at = CURRENT_TIMESTAMP WHERE id = ?').run(child.id);
-                    if (child.type === 'folder') {
-                        trashChildren(child.id);
-                    }
-                }
-            };
-            trashChildren(fileId);
-        }
-
-        res.json({ message: 'Moved to trash' });
-    } catch (error) {
-        console.error('Delete error:', error);
-        res.status(500).json({ error: 'Server error' });
-    }
-});
-
-// ============================================
-// LIST TRASH
-// ============================================
-
-/**
- * GET /api/files/trash
- * List trashed items
- */
-router.get('/trash', requireAuth, (req, res) => {
-    try {
-        const userId = req.user.userId;
-
-        // Only show top-level trashed items (not children of trashed folders)
-        const files = db.prepare(`
-            SELECT id, name, type, size, mime_type, trashed_at
-            FROM files 
-            WHERE user_id = ? AND trashed = 1
-            AND (parent_id IS NULL OR parent_id NOT IN (
-                SELECT id FROM files WHERE trashed = 1
-            ))
-            ORDER BY trashed_at DESC
-        `).all(userId);
-
-        res.json({ files });
-    } catch (error) {
-        console.error('List trash error:', error);
-        res.status(500).json({ error: 'Server error' });
-    }
-});
-
-// ============================================
-// RESTORE FROM TRASH
-// ============================================
-
 /**
  * PUT /api/files/:id/restore
  * Restore file/folder from trash
@@ -606,9 +549,48 @@ router.put('/:id/restore', requireAuth, (req, res) => {
     }
 });
 
-// ============================================
-// PERMANENT DELETE
-// ============================================
+/**
+ * DELETE /api/files/:id
+ * Move file/folder to trash
+ */
+router.delete('/:id', requireAuth, (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const fileId = req.params.id;
+
+        const file = db.prepare(
+            'SELECT * FROM files WHERE id = ? AND user_id = ?'
+        ).get(fileId, userId);
+
+        if (!file) {
+            return res.status(404).json({ error: 'File not found' });
+        }
+
+        // Move to trash (soft delete)
+        db.prepare(`
+            UPDATE files SET trashed = 1, trashed_at = CURRENT_TIMESTAMP WHERE id = ?
+        `).run(fileId);
+
+        // Also trash all children if it's a folder
+        if (file.type === 'folder') {
+            const trashChildren = (parentId) => {
+                const children = db.prepare('SELECT id, type FROM files WHERE parent_id = ?').all(parentId);
+                for (const child of children) {
+                    db.prepare('UPDATE files SET trashed = 1, trashed_at = CURRENT_TIMESTAMP WHERE id = ?').run(child.id);
+                    if (child.type === 'folder') {
+                        trashChildren(child.id);
+                    }
+                }
+            };
+            trashChildren(fileId);
+        }
+
+        res.json({ message: 'Moved to trash' });
+    } catch (error) {
+        console.error('Delete error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
 
 /**
  * DELETE /api/files/:id/permanent
@@ -660,33 +642,6 @@ router.delete('/:id/permanent', requireAuth, (req, res) => {
         res.json({ message: 'Permanently deleted' });
     } catch (error) {
         console.error('Permanent delete error:', error);
-        res.status(500).json({ error: 'Server error' });
-    }
-});
-
-// ============================================
-// GET RECENT FILES
-// ============================================
-
-/**
- * GET /api/files/recent
- * Get recently modified files
- */
-router.get('/recent', requireAuth, (req, res) => {
-    try {
-        const userId = req.user.userId;
-
-        const files = db.prepare(`
-            SELECT id, name, type, size, mime_type, parent_id, starred, modified_at
-            FROM files 
-            WHERE user_id = ? AND trashed = 0 AND type != 'folder'
-            ORDER BY modified_at DESC
-            LIMIT 20
-        `).all(userId);
-
-        res.json({ files });
-    } catch (error) {
-        console.error('Recent files error:', error);
         res.status(500).json({ error: 'Server error' });
     }
 });

@@ -28,9 +28,10 @@ const app = express();
 
 // CORS: Allows your Next.js frontend (port 3000) to call this API (port 3001)
 // Without this, browsers block cross-origin requests for security
+// Using dynamic origin to support localhost AND Tailscale IP
 app.use(cors({
-  origin: 'http://localhost:3000',  // Your frontend URL
-  credentials: true                  // Allow cookies if needed later
+  origin: true,  // Reflects the request origin (allows any origin)
+  credentials: true
 }));
 
 // Parse JSON bodies - lets you read req.body when frontend sends JSON
@@ -68,9 +69,9 @@ app.use('/api/auth', authRoutes);
 const adminRoutes = require('./routes/admin');
 app.use('/api/admin', adminRoutes);
 
-// Future routes will go here:
-// const fileRoutes = require('./routes/files');
-// app.use('/api/files', fileRoutes);
+// File routes (upload, download, folders)
+const fileRoutes = require('./routes/files');
+app.use('/api/files', fileRoutes);
 
 // Start server
 const PORT = 3001;

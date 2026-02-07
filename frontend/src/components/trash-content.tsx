@@ -162,18 +162,20 @@ export function TrashContent() {
     return (
         <div className="space-y-6">
             {/* Header */}
-            <div className="flex items-center justify-between">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <div>
-                    <h1 className="text-2xl font-bold">Trash</h1>
-                    <p className="text-muted-foreground text-sm">
+                    <h1 className="text-xl sm:text-2xl font-bold">Trash</h1>
+                    <p className="text-muted-foreground text-xs sm:text-sm">
                         Items in trash will be permanently deleted after 30 days
                     </p>
                 </div>
                 {files.length > 0 && (
                     <Button
                         variant="destructive"
+                        size="sm"
                         onClick={() => setShowEmptyDialog(true)}
                         disabled={isProcessing}
+                        className="w-full sm:w-auto"
                     >
                         <Trash2 className="h-4 w-4 mr-2" />
                         Empty Trash
@@ -222,10 +224,10 @@ export function TrashContent() {
                                     key={file.id}
                                     className="flex sm:grid sm:grid-cols-12 gap-2 sm:gap-4 items-center px-4 sm:px-6 py-3 border-b border-border last:border-0 hover:bg-secondary"
                                 >
-                                    <div className="flex-1 sm:col-span-6 md:col-span-5 flex items-center gap-3 min-w-0">
+                                    <div className="flex-1 sm:col-span-6 md:col-span-5 flex items-center gap-2 sm:gap-3 min-w-0">
                                         <Icon className={cn("h-5 w-5 flex-shrink-0 opacity-50", getFileColor(file.type))} />
                                         <div className="min-w-0 flex-1">
-                                            <span className="text-sm font-medium text-card-foreground truncate block opacity-75">
+                                            <span className="text-xs sm:text-sm font-medium text-card-foreground line-clamp-1 opacity-75" title={file.name}>
                                                 {file.name}
                                             </span>
                                             <span className="text-xs text-muted-foreground sm:hidden">

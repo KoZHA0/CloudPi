@@ -26,6 +26,7 @@ db.pragma('foreign_keys = ON');
  * Stores user account information
  * - password will store a HASHED password (never store plain text!)
  * - is_admin: 1 for admin users, 0 for regular users
+ * - token_version: Incremented to invalidate all existing tokens for a user
  */
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
@@ -34,6 +35,7 @@ db.exec(`
     email TEXT UNIQUE NOT NULL,
     password TEXT NOT NULL,
     is_admin INTEGER DEFAULT 0,
+    token_version INTEGER DEFAULT 1,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )
 `);
@@ -41,6 +43,13 @@ db.exec(`
 // Add is_admin column if it doesn't exist (for existing databases)
 try {
   db.exec(`ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0`);
+} catch (e) {
+  // Column already exists, ignore error
+}
+
+// Add token_version column if it doesn't exist (for existing databases)
+try {
+  db.exec(`ALTER TABLE users ADD COLUMN token_version INTEGER DEFAULT 1`);
 } catch (e) {
   // Column already exists, ignore error
 }

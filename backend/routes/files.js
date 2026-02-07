@@ -64,7 +64,7 @@ const upload = multer({
 
 /**
  * AUTH MIDDLEWARE
- * Verifies JWT token and adds user info to request
+ * Verifies JWT token and validates token_version against database
  */
 function requireAuth(req, res, next) {
     try {
@@ -76,6 +76,20 @@ function requireAuth(req, res, next) {
 
         const token = authHeader.split(' ')[1];
         const decoded = jwt.verify(token, JWT_SECRET);
+
+        // Validate token_version against database
+        const user = db.prepare('SELECT token_version FROM users WHERE id = ?').get(decoded.userId);
+        
+        if (!user) {
+            return res.status(401).json({ error: 'User not found' });
+        }
+
+        const tokenVersion = decoded.tokenVersion || 0;
+        const dbTokenVersion = user.token_version || 1;
+        
+        if (tokenVersion !== dbTokenVersion) {
+            return res.status(401).json({ error: 'Token expired or invalidated' });
+        }
 
         req.user = decoded;
         next();

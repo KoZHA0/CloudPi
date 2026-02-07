@@ -79,9 +79,9 @@ router.post('/setup', async (req, res) => {
             'INSERT INTO users (username, email, password, is_admin) VALUES (?, ?, ?, 1)'
         ).run(username, email, hashedPassword);
 
-        // Create JWT token
+        // Create JWT token with token_version
         const token = jwt.sign(
-            { userId: result.lastInsertRowid, email, username, isAdmin: true },
+            { userId: result.lastInsertRowid, email, username, isAdmin: true, tokenVersion: 1 },
             JWT_SECRET,
             { expiresIn: '7d' }
         );
@@ -146,9 +146,9 @@ router.post('/login', async (req, res) => {
             return res.status(401).json({ error: 'Invalid email or password' });
         }
 
-        // Create JWT token
+        // Create JWT token with token_version
         const token = jwt.sign(
-            { userId: user.id, email: user.email, username: user.username },
+            { userId: user.id, email: user.email, username: user.username, tokenVersion: user.token_version || 1 },
             JWT_SECRET,
             { expiresIn: '7d' }
         );
@@ -197,11 +197,20 @@ router.get('/me', (req, res) => {
 
         // Get fresh user data from database
         const user = db.prepare(
-            'SELECT id, username, email, is_admin, created_at FROM users WHERE id = ?'
+            'SELECT id, username, email, is_admin, token_version, created_at FROM users WHERE id = ?'
         ).get(decoded.userId);
 
         if (!user) {
             return res.status(401).json({ error: 'User not found' });
+        }
+
+        // Validate token_version - if token version doesn't match, token is invalid
+        // This prevents old tokens from working after database reset or logout
+        const tokenVersion = decoded.tokenVersion || 0;
+        const dbTokenVersion = user.token_version || 1;
+        
+        if (tokenVersion !== dbTokenVersion) {
+            return res.status(401).json({ error: 'Token expired or invalidated' });
         }
 
         res.json({ user });

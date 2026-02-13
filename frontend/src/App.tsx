@@ -14,6 +14,7 @@ import { ProfilePage } from '@/pages/profile'
 import { SettingsPage } from '@/pages/settings'
 import AdminPage from '@/pages/admin'
 import { NotFoundPage } from '@/pages/not-found'
+import { ShareViewPage } from '@/pages/share-view'
 import { getSetupStatus } from '@/lib/api'
 import { Loader2 } from 'lucide-react'
 
@@ -58,6 +59,9 @@ function AppContent() {
             {/* Auth routes - no layout */}
             <Route path="/auth/login" element={<LoginPage />} />
             <Route path="/setup" element={<Navigate to="/auth/login" replace />} />
+
+            {/* Public share view - no auth needed */}
+            <Route path="/share/:link" element={<ShareViewPage />} />
 
             {/* Dashboard routes - with layout */}
             <Route path="/" element={<DashboardLayout />}>

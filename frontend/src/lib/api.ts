@@ -236,6 +236,12 @@ export function getDownloadUrl(fileId: number): string {
     return `${API_BASE}/files/${fileId}/download`;
 }
 
+// Preview image
+export function getPreviewUrl(fileId: number): string {
+    const token = getToken();
+    return `${API_BASE}/files/${fileId}/preview?token=${token}`;
+}
+
 export async function downloadFile(fileId: number, fileName: string): Promise<void> {
     const token = getToken();
     const response = await fetch(`${API_BASE}/files/${fileId}/download`, {
@@ -299,4 +305,98 @@ export async function permanentDeleteFile(fileId: number): Promise<{ message: st
     return apiRequest<{ message: string }>(`/files/${fileId}/permanent`, {
         method: 'DELETE',
     });
+}
+
+// ============= SHARES =============
+
+export interface ShareUser {
+    id: number;
+    username: string;
+    email: string;
+}
+
+export interface ShareItem {
+    id: number;
+    file_id: number;
+    shared_by: number;
+    shared_with: number;
+    permission: string;
+    share_link: string;
+    created_at: string;
+    file_name: string;
+    file_type: string;
+    file_size: number;
+    mime_type: string;
+    // For my-shares
+    shared_with_name?: string;
+    shared_with_user_email?: string;
+    // For shared-with-me
+    shared_by_name?: string;
+}
+
+// List users to share with
+export async function getShareUsers(): Promise<{ users: ShareUser[] }> {
+    return apiRequest<{ users: ShareUser[] }>('/shares/users');
+}
+
+// Share a file with a user
+export async function createShareLink(fileId: number, sharedWithId: number, permission: string = 'view'): Promise<{ message: string; share: ShareItem }> {
+    return apiRequest<{ message: string; share: ShareItem }>('/shares', {
+        method: 'POST',
+        body: JSON.stringify({ fileId, sharedWithId, permission }),
+    });
+}
+
+// List files I've shared
+export async function getMyShares(): Promise<{ shares: ShareItem[] }> {
+    return apiRequest<{ shares: ShareItem[] }>('/shares/my-shares');
+}
+
+// List files shared with me
+export async function getSharedWithMe(): Promise<{ shares: ShareItem[] }> {
+    return apiRequest<{ shares: ShareItem[] }>('/shares/shared-with-me');
+}
+
+// Revoke a share
+export async function revokeShare(shareId: number): Promise<{ message: string }> {
+    return apiRequest<{ message: string }>(`/shares/${shareId}`, {
+        method: 'DELETE',
+    });
+}
+
+// ============= DASHBOARD =============
+
+export interface DashboardStats {
+    totalFiles: number;
+    totalStorage: number;
+    totalFolders: number;
+    byType: Record<string, { count: number; size: number }>;
+    recentFiles: {
+        id: number;
+        name: string;
+        type: string;
+        size: number;
+        mime_type: string;
+        created_at: string;
+    }[];
+    sharedByMe: number;
+    sharedWithMe: number;
+}
+
+export interface SystemHealth {
+    cpu: { usage: number; model: string; cores: number; temperature: number | null };
+    ram: { total: number; used: number; free: number; percentage: number };
+    disk: { total: number; used: number; free: number; percentage: number };
+    uptime: number;
+    platform: string;
+    hostname: string;
+    ip: string;
+}
+
+export async function getDashboardStats(): Promise<DashboardStats> {
+    return apiRequest<DashboardStats>('/dashboard/stats');
+}
+
+export async function getSystemHealth(): Promise<SystemHealth> {
+    return apiRequest<SystemHealth>('/dashboard/health');
 }

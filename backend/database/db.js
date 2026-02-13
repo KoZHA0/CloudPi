@@ -115,5 +115,12 @@ db.exec(`
 
 console.log('✅ Database tables initialized!');
 
+// Add shared_with column to shares if it doesn't exist (for user-to-user sharing)
+try {
+  db.exec(`ALTER TABLE shares ADD COLUMN shared_with INTEGER REFERENCES users(id) ON DELETE CASCADE`);
+} catch (e) {
+  // Column already exists, ignore
+}
+
 // Export the database connection so other files can use it
 module.exports = db;

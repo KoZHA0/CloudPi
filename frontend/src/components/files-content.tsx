@@ -53,6 +53,10 @@ import {
     Loader2,
     Pencil,
     FolderOpen,
+    Link2,
+    Users,
+    Check,
+    AlertCircle,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import {
@@ -63,8 +67,12 @@ import {
     renameFile,
     toggleStar,
     deleteFile,
+    getPreviewUrl,
+    createShareLink,
+    getShareUsers,
     type FileItem,
     type Breadcrumb,
+    type ShareUser,
 } from "@/lib/api"
 
 const getFileIcon = (type: FileItem["type"]) => {
@@ -129,10 +137,26 @@ export function FilesContent() {
     const [renameValue, setRenameValue] = useState("")
     const [selectedItem, setSelectedItem] = useState<FileItem | null>(null)
 
+    // Image preview
+    const [previewFile, setPreviewFile] = useState<FileItem | null>(null)
+
     // Upload
     const [isUploading, setIsUploading] = useState(false)
     const [uploadProgress, setUploadProgress] = useState(0)
     const fileInputRef = useRef<HTMLInputElement>(null)
+
+    // Drag and drop
+    const [isDragging, setIsDragging] = useState(false)
+    const dragCounter = useRef(0)
+
+    // Share dialog
+    const [showShareDialog, setShowShareDialog] = useState(false)
+    const [shareFile, setShareFile] = useState<FileItem | null>(null)
+    const [shareUsers, setShareUsers] = useState<ShareUser[]>([])
+    const [shareLoading, setShareLoading] = useState(false)
+    const [selectedShareUsers, setSelectedShareUsers] = useState<number[]>([])
+    const [shareStatus, setShareStatus] = useState<{ type: 'success' | 'warning' | 'error'; message: string } | null>(null)
+    const [isSharing, setIsSharing] = useState(false)
 
     // Load files
     useEffect(() => {
@@ -225,12 +249,146 @@ export function FilesContent() {
         }
     }
 
+    // Drag and drop handlers
+    function handleDragEnter(e: React.DragEvent) {
+        e.preventDefault()
+        e.stopPropagation()
+        dragCounter.current++
+        if (e.dataTransfer.items && e.dataTransfer.items.length > 0) {
+            setIsDragging(true)
+        }
+    }
+
+    function handleDragLeave(e: React.DragEvent) {
+        e.preventDefault()
+        e.stopPropagation()
+        dragCounter.current--
+        if (dragCounter.current === 0) {
+            setIsDragging(false)
+        }
+    }
+
+    function handleDragOver(e: React.DragEvent) {
+        e.preventDefault()
+        e.stopPropagation()
+    }
+
+    async function handleDrop(e: React.DragEvent) {
+        e.preventDefault()
+        e.stopPropagation()
+        setIsDragging(false)
+        dragCounter.current = 0
+
+        const droppedFiles = e.dataTransfer.files
+        if (!droppedFiles || droppedFiles.length === 0) return
+
+        setIsUploading(true)
+        setUploadProgress(0)
+
+        try {
+            const filesArray = Array.from(droppedFiles)
+            const progressInterval = setInterval(() => {
+                setUploadProgress((prev) => Math.min(prev + 10, 90))
+            }, 200)
+
+            await uploadFiles(filesArray, currentFolderId)
+
+            clearInterval(progressInterval)
+            setUploadProgress(100)
+
+            setTimeout(() => {
+                setIsUploading(false)
+                setUploadProgress(0)
+                loadFiles()
+            }, 500)
+        } catch (err) {
+            setError(err instanceof Error ? err.message : "Upload failed")
+            setIsUploading(false)
+        }
+    }
+
     // Download
     async function handleDownload(file: FileItem) {
         try {
             await downloadFile(file.id, file.name)
         } catch (err) {
             setError(err instanceof Error ? err.message : "Download failed")
+        }
+    }
+
+    // Share
+    async function handleShare(file: FileItem) {
+        setShareFile(file)
+        setShowShareDialog(true)
+        setShareLoading(true)
+        setSelectedShareUsers([])
+        setShareStatus(null)
+        try {
+            const data = await getShareUsers()
+            setShareUsers(data.users)
+        } catch (err) {
+            setError(err instanceof Error ? err.message : "Failed to load users")
+        } finally {
+            setShareLoading(false)
+        }
+    }
+
+    function toggleShareUser(userId: number) {
+        setSelectedShareUsers(prev =>
+            prev.includes(userId)
+                ? prev.filter(id => id !== userId)
+                : [...prev, userId]
+        )
+        setShareStatus(null)
+    }
+
+    async function handleShareWithSelected() {
+        if (!shareFile || selectedShareUsers.length === 0) return
+        setIsSharing(true)
+        setShareStatus(null)
+
+        const results: string[] = []
+        const alreadyShared: string[] = []
+        let hadError = false
+
+        for (const userId of selectedShareUsers) {
+            try {
+                const result = await createShareLink(shareFile.id, userId)
+                if (result.message.includes('Already')) {
+                    const user = shareUsers.find(u => u.id === userId)
+                    alreadyShared.push(user?.username || 'user')
+                } else {
+                    const user = shareUsers.find(u => u.id === userId)
+                    results.push(user?.username || 'user')
+                }
+            } catch {
+                hadError = true
+            }
+        }
+
+        setIsSharing(false)
+        setSelectedShareUsers([])
+
+        if (results.length > 0 && alreadyShared.length > 0) {
+            setShareStatus({
+                type: 'warning',
+                message: `Shared with ${results.join(', ')}. Already shared with ${alreadyShared.join(', ')}.`
+            })
+        } else if (results.length > 0) {
+            setShareStatus({
+                type: 'success',
+                message: `Successfully shared with ${results.join(', ')}!`
+            })
+        } else if (alreadyShared.length > 0) {
+            setShareStatus({
+                type: 'warning',
+                message: `Already shared with ${alreadyShared.join(', ')}.`
+            })
+        } else if (hadError) {
+            setShareStatus({
+                type: 'error',
+                message: 'Failed to share. Please try again.'
+            })
         }
     }
 
@@ -301,7 +459,23 @@ export function FilesContent() {
     }
 
     return (
-        <div className="space-y-6">
+        <div
+            className="space-y-6 relative"
+            onDragEnter={handleDragEnter}
+            onDragLeave={handleDragLeave}
+            onDragOver={handleDragOver}
+            onDrop={handleDrop}
+        >
+            {/* Drag & Drop Overlay */}
+            {isDragging && (
+                <div className="fixed inset-0 z-50 bg-background/80 backdrop-blur-sm flex items-center justify-center">
+                    <div className="border-2 border-dashed border-primary rounded-2xl p-16 text-center animate-pulse">
+                        <Upload className="h-16 w-16 mx-auto mb-4 text-primary" />
+                        <p className="text-xl font-semibold text-primary">Drop files here to upload</p>
+                        <p className="text-sm text-muted-foreground mt-2">Files will be uploaded to the current folder</p>
+                    </div>
+                </div>
+            )}
             {/* Breadcrumb Navigation */}
             <div className="flex items-center gap-1 sm:gap-2 text-sm overflow-x-auto pb-2">
                 <Button
@@ -526,6 +700,10 @@ export function FilesContent() {
                                                     <Star className="h-4 w-4 mr-2" />
                                                     {file.starred ? "Unstar" : "Star"}
                                                 </DropdownMenuItem>
+                                                <DropdownMenuItem onClick={() => handleShare(file)}>
+                                                    <Link2 className="h-4 w-4 mr-2" />
+                                                    Share
+                                                </DropdownMenuItem>
                                                 <DropdownMenuSeparator />
                                                 <DropdownMenuItem
                                                     className="text-destructive"
@@ -539,9 +717,32 @@ export function FilesContent() {
                                     </div>
                                     <div
                                         className="flex flex-col items-center pt-4"
-                                        onClick={() => file.type === "folder" && handleFileClick(file)}
+                                        onClick={() => {
+                                            if (file.type === "folder") handleFileClick(file)
+                                            else if (file.type === "image") setPreviewFile(file)
+                                        }}
                                     >
-                                        <Icon className={cn("h-10 w-10 sm:h-12 sm:w-12 mb-2 sm:mb-3", getFileColor(file.type))} />
+                                        {file.type === "image" ? (
+                                            <div className="w-full h-20 sm:h-24 mb-2 sm:mb-3 rounded overflow-hidden bg-secondary flex items-center justify-center">
+                                                <img
+                                                    src={getPreviewUrl(file.id)}
+                                                    alt={file.name}
+                                                    className="w-full h-full object-cover"
+                                                    loading="lazy"
+                                                    onError={(e) => {
+                                                        // If image fails to load, replace with icon
+                                                        const target = e.target as HTMLImageElement
+                                                        target.style.display = 'none'
+                                                        const parent = target.parentElement
+                                                        if (parent) {
+                                                            parent.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-green-400"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>'
+                                                        }
+                                                    }}
+                                                />
+                                            </div>
+                                        ) : (
+                                            <Icon className={cn("h-10 w-10 sm:h-12 sm:w-12 mb-2 sm:mb-3", getFileColor(file.type))} />
+                                        )}
                                         <p className="text-xs sm:text-sm font-medium text-card-foreground text-center line-clamp-2 w-full px-1" title={file.name}>
                                             {file.name}
                                         </p>
@@ -637,6 +838,10 @@ export function FilesContent() {
                                                     <Star className="h-4 w-4 mr-2" />
                                                     {file.starred ? "Unstar" : "Star"}
                                                 </DropdownMenuItem>
+                                                <DropdownMenuItem onClick={() => handleShare(file)}>
+                                                    <Link2 className="h-4 w-4 mr-2" />
+                                                    Share
+                                                </DropdownMenuItem>
                                                 <DropdownMenuSeparator />
                                                 <DropdownMenuItem
                                                     className="text-destructive"
@@ -727,6 +932,142 @@ export function FilesContent() {
                     </AlertDialogFooter>
                 </AlertDialogContent>
             </AlertDialog>
+
+            {/* Image Preview Lightbox */}
+            {previewFile && (
+                <div
+                    className="fixed inset-0 z-50 bg-black/90 flex items-center justify-center p-4"
+                    onClick={() => setPreviewFile(null)}
+                >
+                    <div className="absolute top-4 right-4 flex items-center gap-2 z-10">
+                        <Button
+                            variant="secondary"
+                            size="sm"
+                            onClick={(e) => {
+                                e.stopPropagation()
+                                handleDownload(previewFile)
+                            }}
+                        >
+                            <Download className="h-4 w-4 mr-2" />
+                            Download
+                        </Button>
+                        <Button
+                            variant="secondary"
+                            size="sm"
+                            onClick={() => setPreviewFile(null)}
+                        >
+                            ✕
+                        </Button>
+                    </div>
+                    <img
+                        src={getPreviewUrl(previewFile.id)}
+                        alt={previewFile.name}
+                        className="max-w-full max-h-[90vh] object-contain rounded-lg"
+                        onClick={(e) => e.stopPropagation()}
+                    />
+                    <p className="absolute bottom-4 left-1/2 -translate-x-1/2 text-white text-sm bg-black/50 px-4 py-2 rounded-full">
+                        {previewFile.name}
+                    </p>
+                </div>
+            )}
+            {/* Share Dialog */}
+            <Dialog open={showShareDialog} onOpenChange={(open) => {
+                setShowShareDialog(open)
+                if (!open) {
+                    setShareStatus(null)
+                    setSelectedShareUsers([])
+                }
+            }}>
+                <DialogContent className="sm:max-w-md">
+                    <DialogHeader>
+                        <DialogTitle className="flex items-center gap-2">
+                            <Users className="h-5 w-5" />
+                            Share "{shareFile?.name}"
+                        </DialogTitle>
+                    </DialogHeader>
+
+                    {/* Status message */}
+                    {shareStatus && (
+                        <div className={cn(
+                            "flex items-center gap-2 px-3 py-2.5 rounded-lg text-sm",
+                            shareStatus.type === 'success' && "bg-green-500/10 text-green-500",
+                            shareStatus.type === 'warning' && "bg-amber-500/10 text-amber-500",
+                            shareStatus.type === 'error' && "bg-destructive/10 text-destructive",
+                        )}>
+                            {shareStatus.type === 'success' ? (
+                                <Check className="h-4 w-4 shrink-0" />
+                            ) : (
+                                <AlertCircle className="h-4 w-4 shrink-0" />
+                            )}
+                            {shareStatus.message}
+                        </div>
+                    )}
+
+                    {/* User list */}
+                    <div className="space-y-1 max-h-60 overflow-y-auto">
+                        {shareLoading ? (
+                            <div className="flex items-center justify-center py-8">
+                                <Loader2 className="h-6 w-6 animate-spin text-primary" />
+                            </div>
+                        ) : shareUsers.length === 0 ? (
+                            <div className="text-center py-8 text-muted-foreground">
+                                <Users className="h-10 w-10 mx-auto mb-2 opacity-50" />
+                                <p>No other users found</p>
+                                <p className="text-xs mt-1">Create more users from the Admin panel</p>
+                            </div>
+                        ) : (
+                            shareUsers.map((user) => (
+                                <div
+                                    key={user.id}
+                                    className={cn(
+                                        "flex items-center gap-3 p-3 rounded-lg cursor-pointer transition-colors",
+                                        selectedShareUsers.includes(user.id)
+                                            ? "bg-primary/10 border border-primary/20"
+                                            : "hover:bg-secondary"
+                                    )}
+                                    onClick={() => toggleShareUser(user.id)}
+                                >
+                                    <Checkbox
+                                        checked={selectedShareUsers.includes(user.id)}
+                                        onCheckedChange={() => toggleShareUser(user.id)}
+                                        className="shrink-0"
+                                    />
+                                    <div className="h-9 w-9 rounded-full bg-primary/10 flex items-center justify-center text-primary font-medium text-sm shrink-0">
+                                        {user.username.charAt(0).toUpperCase()}
+                                    </div>
+                                    <div className="min-w-0">
+                                        <p className="text-sm font-medium">{user.username}</p>
+                                        <p className="text-xs text-muted-foreground truncate">{user.email}</p>
+                                    </div>
+                                </div>
+                            ))
+                        )}
+                    </div>
+
+                    {/* Share button */}
+                    {shareUsers.length > 0 && (
+                        <DialogFooter>
+                            <Button
+                                onClick={handleShareWithSelected}
+                                disabled={selectedShareUsers.length === 0 || isSharing}
+                                className="w-full gap-2"
+                            >
+                                {isSharing ? (
+                                    <Loader2 className="h-4 w-4 animate-spin" />
+                                ) : (
+                                    <Link2 className="h-4 w-4" />
+                                )}
+                                {isSharing
+                                    ? "Sharing..."
+                                    : selectedShareUsers.length === 0
+                                        ? "Select users to share"
+                                        : `Share with ${selectedShareUsers.length} user${selectedShareUsers.length > 1 ? 's' : ''}`
+                                }
+                            </Button>
+                        </DialogFooter>
+                    )}
+                </DialogContent>
+            </Dialog>
         </div>
     )
 }

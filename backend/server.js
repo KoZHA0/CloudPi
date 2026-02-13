@@ -73,6 +73,14 @@ app.use('/api/admin', adminRoutes);
 const fileRoutes = require('./routes/files');
 app.use('/api/files', fileRoutes);
 
+// Share routes (share links, public access)
+const shareRoutes = require('./routes/shares');
+app.use('/api/shares', shareRoutes);
+
+// Dashboard routes (stats, system health)
+const dashboardRoutes = require('./routes/dashboard');
+app.use('/api/dashboard', dashboardRoutes);
+
 // Start server
 const PORT = 3001;
 app.listen(PORT, () => {

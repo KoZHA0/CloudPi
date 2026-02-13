@@ -356,6 +356,67 @@ router.post('/upload', requireAuth, upload.array('files', 10), (req, res) => {
 // ============================================
 
 /**
+ * GET /api/files/:id/preview
+ * Serve an image file for preview/thumbnail display
+ * Accepts token via query string (needed for <img> tags)
+ */
+router.get('/:id/preview', (req, res) => {
+    try {
+        // Accept token from query string OR Authorization header
+        let token = req.query.token ? String(req.query.token) : null;
+        if (!token) {
+            const authHeader = req.headers.authorization;
+            if (authHeader && authHeader.startsWith('Bearer ')) {
+                token = authHeader.split(' ')[1];
+            }
+        }
+
+        if (!token) {
+            return res.status(401).json({ error: 'No token provided' });
+        }
+
+        const decoded = jwt.verify(token, JWT_SECRET);
+        const userId = decoded.userId;
+        const fileId = req.params.id;
+
+        // Validate token_version (skip if token was created before this feature)
+        const dbUser = db.prepare('SELECT token_version FROM users WHERE id = ?').get(userId);
+        if (!dbUser) return res.status(401).json({ error: 'User not found' });
+        
+        if (decoded.tokenVersion !== undefined) {
+            if (decoded.tokenVersion !== (dbUser.token_version || 1)) {
+                return res.status(401).json({ error: 'Token invalidated' });
+            }
+        }
+
+        const file = db.prepare(
+            "SELECT * FROM files WHERE id = ? AND user_id = ? AND type = 'image'"
+        ).get(fileId, userId);
+
+        if (!file) {
+            return res.status(404).json({ error: 'Image not found' });
+        }
+
+        const filePath = path.join(STORAGE_DIR, String(userId), file.path);
+
+        if (!fs.existsSync(filePath)) {
+            return res.status(404).json({ error: 'File not found on disk' });
+        }
+
+        // Set content type and cache headers
+        res.set('Content-Type', file.mime_type);
+        res.set('Cache-Control', 'public, max-age=86400'); // Cache for 24 hours
+        res.sendFile(filePath);
+    } catch (error) {
+        if (error.name === 'JsonWebTokenError' || error.name === 'TokenExpiredError') {
+            return res.status(401).json({ error: 'Invalid token' });
+        }
+        console.error('Preview error:', error);
+        res.status(500).json({ error: 'Server error during preview' });
+    }
+});
+
+/**
  * GET /api/files/:id/download
  * Download a file
  */

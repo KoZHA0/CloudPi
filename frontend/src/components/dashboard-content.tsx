@@ -1,92 +1,268 @@
+"use client"
+
+import { useState, useEffect, useRef } from "react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
-import { HardDrive, FileText, ImageIcon, Video, Music, Download, Upload } from "lucide-react"
-import { Area, AreaChart, ResponsiveContainer, XAxis, YAxis, Tooltip } from "recharts"
+import {
+    HardDrive,
+    FileText,
+    ImageIcon,
+    Video,
+    Music,
+    Archive,
+    Folder,
+    Cpu,
+    MemoryStick,
+    Server,
+    Clock,
+    Share2,
+    Loader2,
+    Thermometer,
+} from "lucide-react"
+import { getDashboardStats, getSystemHealth, type DashboardStats, type SystemHealth } from "@/lib/api"
 
-const storageData = [
-    { name: "Jan", usage: 45 },
-    { name: "Feb", usage: 52 },
-    { name: "Mar", usage: 48 },
-    { name: "Apr", usage: 61 },
-    { name: "May", usage: 55 },
-    { name: "Jun", usage: 68 },
-]
+function formatBytes(bytes: number): string {
+    if (bytes === 0) return "0 B"
+    const k = 1024
+    const sizes = ["B", "KB", "MB", "GB", "TB"]
+    const i = Math.floor(Math.log(bytes) / Math.log(k))
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i]
+}
 
-const stats = [
-    { name: "Total Storage", value: "68.4 GB", icon: HardDrive, subtext: "of 128 GB" },
-    { name: "Documents", value: "2,847", icon: FileText, subtext: "files" },
-    { name: "Images", value: "1,234", icon: ImageIcon, subtext: "files" },
-    { name: "Videos", value: "156", icon: Video, subtext: "files" },
-]
+function formatUptime(seconds: number): string {
+    const days = Math.floor(seconds / 86400)
+    const hours = Math.floor((seconds % 86400) / 3600)
+    const mins = Math.floor((seconds % 3600) / 60)
+    if (days > 0) return `${days}d ${hours}h ${mins}m`
+    if (hours > 0) return `${hours}h ${mins}m`
+    return `${mins}m`
+}
 
-const recentFiles = [
-    { name: "Project Proposal.pdf", type: "PDF", size: "2.4 MB", date: "2 hours ago" },
-    { name: "Design Assets.zip", type: "Archive", size: "156 MB", date: "5 hours ago" },
-    { name: "Meeting Notes.docx", type: "Document", size: "84 KB", date: "Yesterday" },
-    { name: "Brand Guidelines.pdf", type: "PDF", size: "12 MB", date: "2 days ago" },
-    { name: "Product Photos", type: "Folder", size: "2.1 GB", date: "3 days ago" },
-]
+function formatDate(dateString: string): string {
+    const date = new Date(dateString.endsWith('Z') ? dateString : dateString + 'Z')
+    const now = new Date()
+    const diffMs = now.getTime() - date.getTime()
+    const diffMins = Math.floor(diffMs / 60000)
+    const diffHours = Math.floor(diffMs / 3600000)
+    const diffDays = Math.floor(diffMs / 86400000)
 
-const quickAccess = [
-    { name: "Documents", icon: FileText, count: 2847, color: "text-blue-400" },
-    { name: "Images", icon: ImageIcon, count: 1234, color: "text-green-400" },
-    { name: "Videos", icon: Video, count: 156, color: "text-red-400" },
-    { name: "Music", icon: Music, count: 89, color: "text-yellow-400" },
-]
+    if (diffMins < 1) return "Just now"
+    if (diffMins < 60) return `${diffMins}m ago`
+    if (diffHours < 24) return `${diffHours}h ago`
+    if (diffDays < 7) return `${diffDays}d ago`
+    return date.toLocaleDateString()
+}
+
+const fileTypeConfig: Record<string, { icon: typeof FileText; color: string; label: string }> = {
+    document: { icon: FileText, color: "text-blue-400", label: "Documents" },
+    image: { icon: ImageIcon, color: "text-green-400", label: "Images" },
+    video: { icon: Video, color: "text-purple-400", label: "Videos" },
+    audio: { icon: Music, color: "text-yellow-400", label: "Audio" },
+    archive: { icon: Archive, color: "text-orange-400", label: "Archives" },
+}
+
+// Circular gauge component
+function CircularGauge({ percentage, label, value, subtext, color, icon: Icon }: {
+    percentage: number
+    label: string
+    value: string
+    subtext: string
+    color: string
+    icon: typeof Cpu
+}) {
+    const circumference = 2 * Math.PI * 40
+    const strokeDashoffset = circumference - (percentage / 100) * circumference
+    const gaugeColor = percentage > 85 ? '#ef4444' : percentage > 60 ? '#f59e0b' : color
+
+    return (
+        <div className="flex flex-col items-center gap-3">
+            <div className="relative h-24 w-24">
+                <svg className="h-24 w-24 -rotate-90" viewBox="0 0 100 100">
+                    <circle cx="50" cy="50" r="40" fill="none" stroke="currentColor" strokeWidth="8" className="text-secondary" />
+                    <circle
+                        cx="50" cy="50" r="40" fill="none"
+                        stroke={gaugeColor} strokeWidth="8"
+                        strokeLinecap="round"
+                        strokeDasharray={circumference}
+                        strokeDashoffset={strokeDashoffset}
+                        style={{ transition: 'stroke-dashoffset 0.8s ease' }}
+                    />
+                </svg>
+                <div className="absolute inset-0 flex items-center justify-center">
+                    <span className="text-lg font-bold text-card-foreground">{percentage}%</span>
+                </div>
+            </div>
+            <div className="text-center">
+                <div className="flex items-center justify-center gap-1.5 text-sm font-medium text-card-foreground">
+                    <Icon className="h-3.5 w-3.5" style={{ color: gaugeColor }} />
+                    {label}
+                </div>
+                <p className="text-xs text-muted-foreground mt-0.5">{value}</p>
+                <p className="text-xs text-muted-foreground">{subtext}</p>
+            </div>
+        </div>
+    )
+}
 
 export function DashboardContent() {
+    const [stats, setStats] = useState<DashboardStats | null>(null)
+    const [health, setHealth] = useState<SystemHealth | null>(null)
+    const [isLoading, setIsLoading] = useState(true)
+    const healthInterval = useRef<ReturnType<typeof setInterval> | null>(null)
+
+    useEffect(() => {
+        loadData()
+
+        // Auto-refresh health every 5 seconds
+        healthInterval.current = setInterval(loadHealth, 5000)
+        return () => {
+            if (healthInterval.current) clearInterval(healthInterval.current)
+        }
+    }, [])
+
+    async function loadData() {
+        setIsLoading(true)
+        try {
+            const [statsData, healthData] = await Promise.all([
+                getDashboardStats(),
+                getSystemHealth(),
+            ])
+            setStats(statsData)
+            setHealth(healthData)
+        } catch {
+            // silently fail
+        } finally {
+            setIsLoading(false)
+        }
+    }
+
+    async function loadHealth() {
+        try {
+            const healthData = await getSystemHealth()
+            setHealth(healthData)
+        } catch {
+            // silently fail
+        }
+    }
+
+    if (isLoading) {
+        return (
+            <div className="flex items-center justify-center h-64">
+                <Loader2 className="h-8 w-8 animate-spin text-primary" />
+            </div>
+        )
+    }
+
+    const quickAccessTypes = Object.entries(fileTypeConfig).map(([type, config]) => ({
+        ...config,
+        type,
+        count: stats?.byType[type]?.count ?? 0,
+        size: stats?.byType[type]?.size ?? 0,
+    }))
+
     return (
         <div className="space-y-6">
             {/* Stats Grid */}
-            <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-                {stats.map((stat) => (
-                    <Card key={stat.name} className="bg-card border-border">
-                        <CardHeader className="flex flex-row items-center justify-between pb-2">
-                            <CardTitle className="text-sm font-medium text-muted-foreground">{stat.name}</CardTitle>
-                            <stat.icon className="h-4 w-4 text-muted-foreground" />
-                        </CardHeader>
-                        <CardContent>
-                            <div className="text-2xl font-bold text-card-foreground">{stat.value}</div>
-                            <p className="text-xs text-muted-foreground">{stat.subtext}</p>
-                        </CardContent>
-                    </Card>
-                ))}
+            <div className="grid gap-4 grid-cols-2 lg:grid-cols-4">
+                <Card className="bg-card border-border">
+                    <CardHeader className="flex flex-row items-center justify-between pb-2">
+                        <CardTitle className="text-sm font-medium text-muted-foreground">Total Files</CardTitle>
+                        <FileText className="h-4 w-4 text-muted-foreground" />
+                    </CardHeader>
+                    <CardContent>
+                        <div className="text-2xl font-bold text-card-foreground">{stats?.totalFiles ?? 0}</div>
+                        <p className="text-xs text-muted-foreground">{stats?.totalFolders ?? 0} folders</p>
+                    </CardContent>
+                </Card>
+                <Card className="bg-card border-border">
+                    <CardHeader className="flex flex-row items-center justify-between pb-2">
+                        <CardTitle className="text-sm font-medium text-muted-foreground">Storage Used</CardTitle>
+                        <HardDrive className="h-4 w-4 text-muted-foreground" />
+                    </CardHeader>
+                    <CardContent>
+                        <div className="text-2xl font-bold text-card-foreground">{formatBytes(stats?.totalStorage ?? 0)}</div>
+                        <p className="text-xs text-muted-foreground">across all files</p>
+                    </CardContent>
+                </Card>
+                <Card className="bg-card border-border">
+                    <CardHeader className="flex flex-row items-center justify-between pb-2">
+                        <CardTitle className="text-sm font-medium text-muted-foreground">Shared by Me</CardTitle>
+                        <Share2 className="h-4 w-4 text-muted-foreground" />
+                    </CardHeader>
+                    <CardContent>
+                        <div className="text-2xl font-bold text-card-foreground">{stats?.sharedByMe ?? 0}</div>
+                        <p className="text-xs text-muted-foreground">files shared</p>
+                    </CardContent>
+                </Card>
+                <Card className="bg-card border-border">
+                    <CardHeader className="flex flex-row items-center justify-between pb-2">
+                        <CardTitle className="text-sm font-medium text-muted-foreground">Shared with Me</CardTitle>
+                        <Share2 className="h-4 w-4 text-muted-foreground" />
+                    </CardHeader>
+                    <CardContent>
+                        <div className="text-2xl font-bold text-card-foreground">{stats?.sharedWithMe ?? 0}</div>
+                        <p className="text-xs text-muted-foreground">files received</p>
+                    </CardContent>
+                </Card>
             </div>
 
             <div className="grid gap-6 lg:grid-cols-3">
-                {/* Storage Usage Chart */}
+                {/* System Health */}
                 <Card className="lg:col-span-2 bg-card border-border">
                     <CardHeader>
-                        <CardTitle className="text-card-foreground">Storage Usage</CardTitle>
-                        <CardDescription>Your storage consumption over the last 6 months</CardDescription>
+                        <div className="flex items-center justify-between">
+                            <div>
+                                <CardTitle className="text-card-foreground flex items-center gap-2">
+                                    <Server className="h-5 w-5" />
+                                    System Health
+                                </CardTitle>
+                                <CardDescription>
+                                    {health?.hostname ?? '—'} · {health?.platform ?? '—'} · Uptime: {health ? formatUptime(health.uptime) : '—'}
+                                </CardDescription>
+                            </div>
+                            <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                                <Clock className="h-3 w-3" />
+                                Live
+                                <span className="relative flex h-2 w-2">
+                                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
+                                    <span className="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
+                                </span>
+                            </div>
+                        </div>
                     </CardHeader>
                     <CardContent>
-                        <div className="h-[300px]">
-                            <ResponsiveContainer width="100%" height="100%">
-                                <AreaChart data={storageData}>
-                                    <defs>
-                                        <linearGradient id="storageGradient" x1="0" y1="0" x2="0" y2="1">
-                                            <stop offset="5%" stopColor="#10b981" stopOpacity={0.3} />
-                                            <stop offset="95%" stopColor="#10b981" stopOpacity={0} />
-                                        </linearGradient>
-                                    </defs>
-                                    <XAxis dataKey="name" axisLine={false} tickLine={false} tick={{ fill: "#71717a", fontSize: 12 }} />
-                                    <YAxis
-                                        axisLine={false}
-                                        tickLine={false}
-                                        tick={{ fill: "#71717a", fontSize: 12 }}
-                                        tickFormatter={(value) => `${value}GB`}
-                                    />
-                                    <Tooltip
-                                        contentStyle={{
-                                            backgroundColor: "#27272a",
-                                            border: "1px solid #3f3f46",
-                                            borderRadius: "8px",
-                                        }}
-                                        labelStyle={{ color: "#fafafa" }}
-                                    />
-                                    <Area type="monotone" dataKey="usage" stroke="#10b981" strokeWidth={2} fill="url(#storageGradient)" />
-                                </AreaChart>
-                            </ResponsiveContainer>
+                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-6">
+                            <CircularGauge
+                                percentage={health?.cpu.usage ?? 0}
+                                label="CPU"
+                                value={`${health?.cpu.cores ?? 0} cores`}
+                                subtext={health?.cpu.model?.split(' ').slice(0, 3).join(' ') ?? ''}
+                                color="#3b82f6"
+                                icon={Cpu}
+                            />
+                            <CircularGauge
+                                percentage={health?.ram.percentage ?? 0}
+                                label="RAM"
+                                value={`${formatBytes(health?.ram.used ?? 0)} used`}
+                                subtext={`of ${formatBytes(health?.ram.total ?? 0)}`}
+                                color="#8b5cf6"
+                                icon={MemoryStick}
+                            />
+                            <CircularGauge
+                                percentage={health?.disk.percentage ?? 0}
+                                label="Disk"
+                                value={`${formatBytes(health?.disk.used ?? 0)} used`}
+                                subtext={`of ${formatBytes(health?.disk.total ?? 0)}`}
+                                color="#10b981"
+                                icon={HardDrive}
+                            />
+                            <CircularGauge
+                                percentage={health?.cpu.temperature != null ? Math.min(100, Math.round((health.cpu.temperature / 100) * 100)) : 0}
+                                label="Temp"
+                                value={health?.cpu.temperature != null ? `${health.cpu.temperature}°C` : 'N/A'}
+                                subtext="CPU temperature"
+                                color="#f97316"
+                                icon={Thermometer}
+                            />
                         </div>
                     </CardContent>
                 </Card>
@@ -97,92 +273,67 @@ export function DashboardContent() {
                         <CardTitle className="text-card-foreground">Quick Access</CardTitle>
                         <CardDescription>Browse by file type</CardDescription>
                     </CardHeader>
-                    <CardContent className="space-y-4">
-                        {quickAccess.map((item) => (
+                    <CardContent className="space-y-3">
+                        {quickAccessTypes.map((item) => (
                             <div
-                                key={item.name}
+                                key={item.type}
                                 className="flex items-center justify-between rounded-lg bg-secondary p-3 transition-colors hover:bg-secondary/80 cursor-pointer"
                             >
                                 <div className="flex items-center gap-3">
                                     <div className={`rounded-lg bg-background p-2 ${item.color}`}>
                                         <item.icon className="h-5 w-5" />
                                     </div>
-                                    <span className="font-medium text-secondary-foreground">{item.name}</span>
+                                    <span className="font-medium text-secondary-foreground">{item.label}</span>
                                 </div>
-                                <span className="text-sm text-muted-foreground">{item.count}</span>
+                                <div className="text-right">
+                                    <span className="text-sm font-medium text-secondary-foreground">{item.count}</span>
+                                    {item.size > 0 && (
+                                        <p className="text-xs text-muted-foreground">{formatBytes(item.size)}</p>
+                                    )}
+                                </div>
                             </div>
                         ))}
                     </CardContent>
                 </Card>
             </div>
 
-            {/* Activity and Recent Files */}
-            <div className="grid gap-6 lg:grid-cols-2">
-                <Card className="bg-card border-border">
-                    <CardHeader>
-                        <CardTitle className="text-card-foreground">Activity</CardTitle>
-                        <CardDescription>Recent activity on your cloud</CardDescription>
-                    </CardHeader>
-                    <CardContent className="space-y-4">
-                        <div className="flex items-center gap-4">
-                            <div className="rounded-full bg-primary/20 p-2">
-                                <Upload className="h-4 w-4 text-primary" />
-                            </div>
-                            <div className="flex-1">
-                                <p className="text-sm font-medium text-card-foreground">Uploaded 5 files</p>
-                                <p className="text-xs text-muted-foreground">2 hours ago</p>
-                            </div>
-                        </div>
-                        <div className="flex items-center gap-4">
-                            <div className="rounded-full bg-yellow-500/20 p-2">
-                                <Download className="h-4 w-4 text-yellow-400" />
-                            </div>
-                            <div className="flex-1">
-                                <p className="text-sm font-medium text-card-foreground">Downloaded Project Assets</p>
-                                <p className="text-xs text-muted-foreground">Yesterday</p>
-                            </div>
-                        </div>
-                        <div className="flex items-center gap-4">
-                            <div className="rounded-full bg-primary/20 p-2">
-                                <Upload className="h-4 w-4 text-primary" />
-                            </div>
-                            <div className="flex-1">
-                                <p className="text-sm font-medium text-card-foreground">Uploaded backup archive</p>
-                                <p className="text-xs text-muted-foreground">3 days ago</p>
-                            </div>
-                        </div>
-                    </CardContent>
-                </Card>
-
-                {/* Recent Files */}
+            {/* Recent Files */}
+            {stats && stats.recentFiles.length > 0 && (
                 <Card className="bg-card border-border">
                     <CardHeader>
                         <CardTitle className="text-card-foreground">Recent Files</CardTitle>
-                        <CardDescription>Files you recently accessed</CardDescription>
+                        <CardDescription>Recently uploaded files</CardDescription>
                     </CardHeader>
                     <CardContent>
                         <div className="space-y-3">
-                            {recentFiles.map((file) => (
-                                <div
-                                    key={file.name}
-                                    className="flex items-center justify-between rounded-lg p-2 transition-colors hover:bg-secondary cursor-pointer"
-                                >
-                                    <div className="flex items-center gap-3">
-                                        <FileText className="h-8 w-8 text-muted-foreground" />
-                                        <div>
-                                            <p className="text-sm font-medium text-card-foreground">{file.name}</p>
-                                            <p className="text-xs text-muted-foreground">
-                                                {file.type} · {file.size}
-                                            </p>
+                            {stats.recentFiles.map((file) => {
+                                const config = fileTypeConfig[file.type]
+                                const Icon = config?.icon ?? FileText
+                                const color = config?.color ?? "text-gray-400"
+                                return (
+                                    <div
+                                        key={file.id}
+                                        className="flex items-center justify-between rounded-lg p-2.5 transition-colors hover:bg-secondary cursor-pointer"
+                                    >
+                                        <div className="flex items-center gap-3">
+                                            <div className={`rounded-lg bg-secondary p-2 ${color}`}>
+                                                <Icon className="h-5 w-5" />
+                                            </div>
+                                            <div>
+                                                <p className="text-sm font-medium text-card-foreground">{file.name}</p>
+                                                <p className="text-xs text-muted-foreground">
+                                                    {formatBytes(file.size)}
+                                                </p>
+                                            </div>
                                         </div>
+                                        <span className="text-xs text-muted-foreground">{formatDate(file.created_at)}</span>
                                     </div>
-                                    <span className="text-xs text-muted-foreground">{file.date}</span>
-                                </div>
-                            ))}
+                                )
+                            })}
                         </div>
                     </CardContent>
                 </Card>
-            </div>
+            )}
         </div>
     )
 }

@@ -207,28 +207,6 @@ CloudPi/
 
 ---
 
-## How to Run
-
-### Backend
-
-```bash
-cd backend
-npm install
-npm run dev
-# Runs on http://localhost:3001
-```
-
-### Frontend
-
-```bash
-cd frontend
-npm install
-npm run dev
-# Runs on http://localhost:3000
-```
-
----
-
 ## User Flow
 
 ### First-Time Setup

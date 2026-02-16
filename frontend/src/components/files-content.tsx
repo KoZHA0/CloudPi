@@ -704,7 +704,10 @@ export function FilesContent() {
                                 onDoubleClick={() => handleFileClick(file)}
                             >
                                 <CardContent className="p-4">
-                                    <div className="absolute left-2 top-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                                    <div className={cn(
+                                        "absolute left-2 top-2 transition-opacity",
+                                        selectedFiles.includes(file.id) ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+                                    )}>
                                         <Checkbox
                                             checked={selectedFiles.includes(file.id)}
                                             onCheckedChange={() => toggleFileSelection(file.id)}

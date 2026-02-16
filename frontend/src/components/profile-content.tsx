@@ -24,7 +24,6 @@ export function ProfileContent() {
     
     // Profile form state
     const [username, setUsername] = useState(user?.username || "")
-    const [email, setEmail] = useState(user?.email || "")
     const [isUpdatingProfile, setIsUpdatingProfile] = useState(false)
     const [profileMessage, setProfileMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null)
     
@@ -42,7 +41,7 @@ export function ProfileContent() {
         setProfileMessage(null)
 
         try {
-            const response = await updateProfile(username, email)
+            const response = await updateProfile(username)
             updateUser(response.user)
             setProfileMessage({ type: 'success', text: 'Profile updated successfully!' })
         } catch (error) {
@@ -107,7 +106,7 @@ export function ProfileContent() {
                         </div>
                         <div className="flex-1">
                             <h2 className="text-2xl font-bold text-card-foreground">{user?.username || 'User'}</h2>
-                            <p className="text-muted-foreground mt-1">{user?.email || 'No email'}</p>
+                            <p className="text-muted-foreground mt-1">{user?.is_admin ? 'Administrator' : 'User'}</p>
                         </div>
                     </div>
                 </CardContent>
@@ -139,16 +138,6 @@ export function ProfileContent() {
                                     value={username}
                                     onChange={(e) => setUsername(e.target.value)}
                                     placeholder="Enter username"
-                                />
-                            </div>
-                            <div className="space-y-2">
-                                <Label htmlFor="email">Email</Label>
-                                <Input 
-                                    id="email" 
-                                    type="email" 
-                                    value={email}
-                                    onChange={(e) => setEmail(e.target.value)}
-                                    placeholder="Enter email"
                                 />
                             </div>
                             <Button type="submit" className="w-full sm:w-auto" disabled={isUpdatingProfile}>

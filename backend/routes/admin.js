@@ -4,9 +4,10 @@
  * Handles admin-only operations like user management
  * 
  * ENDPOINTS:
- * GET    /api/admin/users     - List all users
- * POST   /api/admin/users     - Create new user
- * DELETE /api/admin/users/:id - Delete user
+ * GET    /api/admin/users              - List all users
+ * POST   /api/admin/users              - Create new user
+ * DELETE /api/admin/users/:id          - Delete user
+ * PUT    /api/admin/users/:id/password - Reset user password (admin only)
  */
 
 const express = require('express');
@@ -66,7 +67,7 @@ function requireAdmin(req, res, next) {
 router.get('/users', requireAdmin, (req, res) => {
     try {
         const users = db.prepare(
-            'SELECT id, username, email, is_admin, created_at FROM users ORDER BY created_at DESC'
+            'SELECT id, username, is_admin, created_at FROM users ORDER BY created_at DESC'
         ).all();
 
         res.json({ users });
@@ -82,24 +83,24 @@ router.get('/users', requireAdmin, (req, res) => {
  */
 router.post('/users', requireAdmin, async (req, res) => {
     try {
-        const { username, email, password, isAdmin = false } = req.body;
+        const { username, password, isAdmin = false } = req.body;
 
         // Validate required fields
-        if (!username || !email || !password) {
+        if (!username || !password) {
             return res.status(400).json({
                 error: 'Missing required fields',
-                required: ['username', 'email', 'password']
+                required: ['username', 'password']
             });
         }
 
         // Check if user already exists
         const existingUser = db.prepare(
-            'SELECT id FROM users WHERE email = ? OR username = ?'
-        ).get(email, username);
+            'SELECT id FROM users WHERE username = ?'
+        ).get(username);
 
         if (existingUser) {
             return res.status(400).json({
-                error: 'User with this email or username already exists'
+                error: 'User with this username already exists'
             });
         }
 
@@ -108,15 +109,14 @@ router.post('/users', requireAdmin, async (req, res) => {
 
         // Insert new user
         const result = db.prepare(
-            'INSERT INTO users (username, email, password, is_admin) VALUES (?, ?, ?, ?)'
-        ).run(username, email, hashedPassword, isAdmin ? 1 : 0);
+            'INSERT INTO users (username, password, is_admin) VALUES (?, ?, ?)'
+        ).run(username, hashedPassword, isAdmin ? 1 : 0);
 
         res.status(201).json({
             message: 'User created successfully',
             user: {
                 id: result.lastInsertRowid,
                 username,
-                email,
                 is_admin: isAdmin ? 1 : 0
             }
         });
@@ -124,6 +124,64 @@ router.post('/users', requireAdmin, async (req, res) => {
     } catch (error) {
         console.error('Create user error:', error);
         res.status(500).json({ error: 'Server error during user creation' });
+    }
+});
+
+/**
+ * PUT /api/admin/users/:id/password
+ * Resets a user's password (Super Admin only)
+ * 
+ * PERMISSION RULES:
+ * - Only Super Admin (id=1) can reset passwords
+ * - Cannot reset your own password (use /api/auth/password instead)
+ */
+router.put('/users/:id/password', requireAdmin, async (req, res) => {
+    try {
+        const userId = parseInt(req.params.id);
+        const currentUserId = req.user.userId;
+        const { newPassword } = req.body;
+
+        // Only Super Admin can reset passwords
+        if (currentUserId !== 1) {
+            return res.status(403).json({ error: 'Only the Super Admin can reset passwords' });
+        }
+
+        if (!newPassword) {
+            return res.status(400).json({ error: 'New password is required' });
+        }
+
+        if (newPassword.length < 6) {
+            return res.status(400).json({ error: 'Password must be at least 6 characters' });
+        }
+
+        // Prevent resetting your own password via admin route
+        if (userId === currentUserId) {
+            return res.status(400).json({ error: 'Use the profile page to change your own password' });
+        }
+
+        // Check if target user exists
+        const targetUser = db.prepare(
+            'SELECT id, username, is_admin FROM users WHERE id = ?'
+        ).get(userId);
+
+        if (!targetUser) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        // Hash the new password
+        const hashedPassword = await bcrypt.hash(newPassword, SALT_ROUNDS);
+
+        // Update password and invalidate old tokens
+        const newTokenVersion = (targetUser.token_version || 1) + 1;
+        db.prepare(
+            'UPDATE users SET password = ?, token_version = ? WHERE id = ?'
+        ).run(hashedPassword, newTokenVersion, userId);
+
+        res.json({ message: `Password reset successfully for ${targetUser.username}` });
+
+    } catch (error) {
+        console.error('Reset password error:', error);
+        res.status(500).json({ error: 'Server error during password reset' });
     }
 });
 

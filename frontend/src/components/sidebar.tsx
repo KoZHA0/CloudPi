@@ -255,7 +255,7 @@ export function Sidebar() {
                                     </Avatar>
                                     <div className="flex flex-1 flex-col items-start text-sm">
                                         <span className="font-medium text-sidebar-foreground">{user?.username || 'User'}</span>
-                                        <span className="text-xs text-muted-foreground">{user?.email || 'Local Admin'}</span>
+                                        <span className="text-xs text-muted-foreground">{user?.is_admin ? 'Admin' : 'User'}</span>
                                     </div>
                                     <ChevronDown className="h-4 w-4 text-muted-foreground" />
                                 </Button>

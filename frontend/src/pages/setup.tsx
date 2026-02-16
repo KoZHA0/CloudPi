@@ -1,5 +1,5 @@
 import { useState } from "react"
-import { Cloud, Loader2, Rocket } from "lucide-react"
+import { Cloud, Loader2, Rocket, Copy, Check, ShieldAlert } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -11,9 +11,10 @@ export function SetupPage() {
     const { updateUser } = useAuth()
     const [isLoading, setIsLoading] = useState(false)
     const [error, setError] = useState<string | null>(null)
+    const [backupCode, setBackupCode] = useState<string | null>(null)
+    const [copied, setCopied] = useState(false)
     const [formData, setFormData] = useState({
         username: "",
-        email: "",
         password: "",
         confirmPassword: "",
     })
@@ -35,16 +36,99 @@ export function SetupPage() {
         setIsLoading(true)
 
         try {
-            const response = await setupAdmin(formData.username, formData.email, formData.password)
+            const response = await setupAdmin(formData.username, formData.password)
             setToken(response.token)
             updateUser(response.user)
-            // Force page reload to re-check setup status and load dashboard
-            window.location.href = "/"
+            // Show backup code before proceeding
+            setBackupCode(response.backupCode)
         } catch (err) {
             setError(err instanceof Error ? err.message : "Setup failed")
         } finally {
             setIsLoading(false)
         }
+    }
+
+    const handleCopyCode = async () => {
+        if (backupCode) {
+            await navigator.clipboard.writeText(backupCode)
+            setCopied(true)
+            setTimeout(() => setCopied(false), 2000)
+        }
+    }
+
+    const handleContinue = () => {
+        window.location.href = "/"
+    }
+
+    // Show backup code screen after successful setup
+    if (backupCode) {
+        return (
+            <div className="min-h-screen flex items-center justify-center bg-background p-4">
+                <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-background to-background" />
+                <div className="absolute top-1/4 left-1/4 w-96 h-96 bg-primary/10 rounded-full blur-3xl" />
+                <div className="absolute bottom-1/4 right-1/4 w-64 h-64 bg-primary/5 rounded-full blur-3xl" />
+
+                <div className="relative w-full max-w-md">
+                    <div className="flex items-center justify-center gap-3 mb-8">
+                        <div className="flex items-center justify-center w-12 h-12 rounded-xl bg-primary/20">
+                            <Cloud className="h-7 w-7 text-primary" />
+                        </div>
+                        <span className="text-2xl font-bold text-foreground">Cloud-Pi</span>
+                    </div>
+
+                    <Card className="border-border bg-card/80 backdrop-blur-xl shadow-2xl">
+                        <CardHeader className="space-y-1 text-center pb-4">
+                            <div className="flex justify-center mb-2">
+                                <ShieldAlert className="h-8 w-8 text-amber-500" />
+                            </div>
+                            <CardTitle className="text-2xl font-bold text-card-foreground">
+                                Save Your Backup Code
+                            </CardTitle>
+                            <CardDescription>
+                                This is your recovery code for password reset. Save it somewhere safe — you won't see it again!
+                            </CardDescription>
+                        </CardHeader>
+                        <CardContent className="space-y-4">
+                            <div className="relative p-4 rounded-lg bg-amber-500/10 border border-amber-500/30">
+                                <p className="text-center font-mono text-2xl font-bold tracking-widest text-amber-500">
+                                    {backupCode}
+                                </p>
+                            </div>
+
+                            <Button
+                                variant="outline"
+                                className="w-full gap-2"
+                                onClick={handleCopyCode}
+                            >
+                                {copied ? (
+                                    <>
+                                        <Check className="h-4 w-4 text-green-500" />
+                                        Copied!
+                                    </>
+                                ) : (
+                                    <>
+                                        <Copy className="h-4 w-4" />
+                                        Copy to Clipboard
+                                    </>
+                                )}
+                            </Button>
+
+                            <p className="text-xs text-muted-foreground text-center">
+                                Use this code on the login page if you forget your password. A new code will be generated after each use.
+                            </p>
+
+                            <Button
+                                className="w-full gap-2"
+                                onClick={handleContinue}
+                            >
+                                <Rocket className="h-4 w-4" />
+                                I've Saved It — Continue to Dashboard
+                            </Button>
+                        </CardContent>
+                    </Card>
+                </div>
+            </div>
+        )
     }
 
     return (
@@ -83,18 +167,6 @@ export function SetupPage() {
                                     placeholder="Admin"
                                     value={formData.username}
                                     onChange={(e) => setFormData({ ...formData, username: e.target.value })}
-                                    required
-                                />
-                            </div>
-
-                            <div className="space-y-2">
-                                <Label htmlFor="email">Email</Label>
-                                <Input
-                                    id="email"
-                                    type="email"
-                                    placeholder="admin@cloudpi.local"
-                                    value={formData.email}
-                                    onChange={(e) => setFormData({ ...formData, email: e.target.value })}
                                     required
                                 />
                             </div>

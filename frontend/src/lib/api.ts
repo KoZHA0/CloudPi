@@ -4,9 +4,8 @@
  * Central place for all API calls to the backend
  */
 
-// Dynamically use the same hostname as the frontend
-// Works with localhost, Tailscale IP, or any other hostname
-const API_BASE = `http://${window.location.hostname}:3001/api`;
+// Use relative path - Vite proxy forwards /api to the backend
+const API_BASE = '/api';
 
 export function getToken(): string | null {
     return localStorage.getItem('cloudpi_token');
@@ -56,13 +55,23 @@ async function apiRequest<T>(
 export interface User {
     id: number;
     username: string;
-    email: string;
     is_admin?: number;
 }
 
 export interface AuthResponse {
     message: string;
     token: string;
+    user: User;
+}
+
+export interface SetupResponse extends AuthResponse {
+    backupCode: string;
+}
+
+export interface RecoverResponse {
+    message: string;
+    token: string;
+    newBackupCode: string;
     user: User;
 }
 
@@ -73,22 +82,31 @@ export async function getSetupStatus(): Promise<{ setupRequired: boolean; userCo
 
 export async function setupAdmin(
     username: string,
-    email: string,
     password: string
-): Promise<AuthResponse> {
-    return apiRequest<AuthResponse>('/auth/setup', {
+): Promise<SetupResponse> {
+    return apiRequest<SetupResponse>('/auth/setup', {
         method: 'POST',
-        body: JSON.stringify({ username, email, password }),
+        body: JSON.stringify({ username, password }),
     });
 }
 
 export async function login(
-    email: string,
+    username: string,
     password: string
 ): Promise<AuthResponse> {
     return apiRequest<AuthResponse>('/auth/login', {
         method: 'POST',
-        body: JSON.stringify({ email, password }),
+        body: JSON.stringify({ username, password }),
+    });
+}
+
+export async function recoverWithCode(
+    backupCode: string,
+    newPassword: string
+): Promise<RecoverResponse> {
+    return apiRequest<RecoverResponse>('/auth/recover', {
+        method: 'POST',
+        body: JSON.stringify({ backupCode, newPassword }),
     });
 }
 
@@ -110,12 +128,11 @@ export interface ProfileUpdateResponse {
 }
 
 export async function updateProfile(
-    username: string,
-    email: string
+    username: string
 ): Promise<ProfileUpdateResponse> {
     return apiRequest<ProfileUpdateResponse>('/auth/profile', {
         method: 'PUT',
-        body: JSON.stringify({ username, email }),
+        body: JSON.stringify({ username }),
     });
 }
 
@@ -139,19 +156,28 @@ export async function getUsers(): Promise<{ users: User[] }> {
 
 export async function createUser(
     username: string,
-    email: string,
     password: string,
     isAdmin: boolean = false
 ): Promise<{ message: string; user: User }> {
     return apiRequest<{ message: string; user: User }>('/admin/users', {
         method: 'POST',
-        body: JSON.stringify({ username, email, password, isAdmin }),
+        body: JSON.stringify({ username, password, isAdmin }),
     });
 }
 
 export async function deleteUser(userId: number): Promise<{ message: string }> {
     return apiRequest<{ message: string }>(`/admin/users/${userId}`, {
         method: 'DELETE',
+    });
+}
+
+export async function adminResetPassword(
+    userId: number,
+    newPassword: string
+): Promise<{ message: string }> {
+    return apiRequest<{ message: string }>(`/admin/users/${userId}/password`, {
+        method: 'PUT',
+        body: JSON.stringify({ newPassword }),
     });
 }
 
@@ -312,7 +338,6 @@ export async function permanentDeleteFile(fileId: number): Promise<{ message: st
 export interface ShareUser {
     id: number;
     username: string;
-    email: string;
 }
 
 export interface ShareItem {
@@ -329,7 +354,6 @@ export interface ShareItem {
     mime_type: string;
     // For my-shares
     shared_with_name?: string;
-    shared_with_user_email?: string;
     // For shared-with-me
     shared_by_name?: string;
 }

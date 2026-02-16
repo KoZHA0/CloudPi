@@ -57,6 +57,10 @@ import {
     Users,
     Check,
     AlertCircle,
+    Eye,
+    X,
+    FileIcon,
+    Maximize2,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import {
@@ -137,8 +141,10 @@ export function FilesContent() {
     const [renameValue, setRenameValue] = useState("")
     const [selectedItem, setSelectedItem] = useState<FileItem | null>(null)
 
-    // Image preview
+    // File preview
     const [previewFile, setPreviewFile] = useState<FileItem | null>(null)
+    const [previewTextContent, setPreviewTextContent] = useState<string | null>(null)
+    const [pdfBlobUrl, setPdfBlobUrl] = useState<string | null>(null)
 
     // Upload
     const [isUploading, setIsUploading] = useState(false)
@@ -450,6 +456,43 @@ export function FilesContent() {
         }
     }
 
+    // Preview
+    function openPreview(file: FileItem) {
+        setPreviewFile(file)
+        setPreviewTextContent(null)
+        setPdfBlobUrl(null)
+        // For PDFs, fetch as blob to bypass IDM interception
+        // raw=1 tells backend to serve as octet-stream so IDM ignores it
+        if (file.mime_type?.includes('pdf')) {
+            fetch(getPreviewUrl(file.id) + '&raw=1')
+                .then(r => {
+                    if (!r.ok) throw new Error('Failed to load PDF')
+                    return r.blob()
+                })
+                .then(blob => {
+                    // Re-create blob with correct PDF type so browser's PDF viewer renders it
+                    const pdfBlob = new Blob([blob], { type: 'application/pdf' })
+                    const url = URL.createObjectURL(pdfBlob)
+                    setPdfBlobUrl(url)
+                })
+                .catch(() => setPdfBlobUrl('error'))
+        }
+        // For non-PDF documents (text, code, etc.), fetch as text
+        if (file.type === 'document' && !file.mime_type?.includes('pdf')) {
+            fetch(getPreviewUrl(file.id))
+                .then(r => r.text())
+                .then(text => setPreviewTextContent(text))
+                .catch(() => setPreviewTextContent('Failed to load file content'))
+        }
+    }
+
+    function closePreview() {
+        if (pdfBlobUrl && pdfBlobUrl !== 'error') URL.revokeObjectURL(pdfBlobUrl)
+        setPreviewFile(null)
+        setPreviewTextContent(null)
+        setPdfBlobUrl(null)
+    }
+
     if (isLoading) {
         return (
             <div className="flex items-center justify-center h-64">
@@ -671,6 +714,16 @@ export function FilesContent() {
                                         {file.starred === 1 && (
                                             <Star className="h-4 w-4 fill-yellow-400 text-yellow-400" />
                                         )}
+                                        {file.type !== 'folder' && (
+                                            <Button
+                                                variant="ghost"
+                                                size="icon"
+                                                className="h-8 w-8 sm:opacity-0 sm:group-hover:opacity-100"
+                                                onClick={(e) => { e.stopPropagation(); openPreview(file) }}
+                                            >
+                                                <Maximize2 className="h-4 w-4" />
+                                            </Button>
+                                        )}
                                         <DropdownMenu>
                                             <DropdownMenuTrigger asChild>
                                                 <Button
@@ -687,10 +740,16 @@ export function FilesContent() {
                                                         Open
                                                     </DropdownMenuItem>
                                                 ) : (
-                                                    <DropdownMenuItem onClick={() => handleDownload(file)}>
-                                                        <Download className="h-4 w-4 mr-2" />
-                                                        Download
-                                                    </DropdownMenuItem>
+                                                    <>
+                                                        <DropdownMenuItem onClick={() => openPreview(file)}>
+                                                            <Eye className="h-4 w-4 mr-2" />
+                                                            Preview
+                                                        </DropdownMenuItem>
+                                                        <DropdownMenuItem onClick={() => handleDownload(file)}>
+                                                            <Download className="h-4 w-4 mr-2" />
+                                                            Download
+                                                        </DropdownMenuItem>
+                                                    </>
                                                 )}
                                                 <DropdownMenuItem onClick={() => openRenameDialog(file)}>
                                                     <Pencil className="h-4 w-4 mr-2" />
@@ -719,7 +778,7 @@ export function FilesContent() {
                                         className="flex flex-col items-center pt-4"
                                         onClick={() => {
                                             if (file.type === "folder") handleFileClick(file)
-                                            else if (file.type === "image") setPreviewFile(file)
+                                            else openPreview(file)
                                         }}
                                     >
                                         {file.type === "image" ? (
@@ -825,10 +884,16 @@ export function FilesContent() {
                                                         Open
                                                     </DropdownMenuItem>
                                                 ) : (
-                                                    <DropdownMenuItem onClick={() => handleDownload(file)}>
-                                                        <Download className="h-4 w-4 mr-2" />
-                                                        Download
-                                                    </DropdownMenuItem>
+                                                    <>
+                                                        <DropdownMenuItem onClick={() => openPreview(file)}>
+                                                            <Eye className="h-4 w-4 mr-2" />
+                                                            Preview
+                                                        </DropdownMenuItem>
+                                                        <DropdownMenuItem onClick={() => handleDownload(file)}>
+                                                            <Download className="h-4 w-4 mr-2" />
+                                                            Download
+                                                        </DropdownMenuItem>
+                                                    </>
                                                 )}
                                                 <DropdownMenuItem onClick={() => openRenameDialog(file)}>
                                                     <Pencil className="h-4 w-4 mr-2" />
@@ -933,41 +998,134 @@ export function FilesContent() {
                 </AlertDialogContent>
             </AlertDialog>
 
-            {/* Image Preview Lightbox */}
+            {/* File Preview Modal */}
             {previewFile && (
                 <div
                     className="fixed inset-0 z-50 bg-black/90 flex items-center justify-center p-4"
-                    onClick={() => setPreviewFile(null)}
+                    onClick={() => closePreview()}
+                    onKeyDown={(e) => e.key === 'Escape' && closePreview()}
                 >
-                    <div className="absolute top-4 right-4 flex items-center gap-2 z-10">
-                        <Button
-                            variant="secondary"
-                            size="sm"
-                            onClick={(e) => {
-                                e.stopPropagation()
-                                handleDownload(previewFile)
-                            }}
-                        >
-                            <Download className="h-4 w-4 mr-2" />
-                            Download
-                        </Button>
-                        <Button
-                            variant="secondary"
-                            size="sm"
-                            onClick={() => setPreviewFile(null)}
-                        >
-                            ✕
-                        </Button>
+                    {/* Top bar */}
+                    <div className="absolute top-0 left-0 right-0 flex items-center justify-between p-4 z-10 bg-gradient-to-b from-black/60 to-transparent">
+                        <div className="flex items-center gap-3 min-w-0">
+                            <FileIcon className="h-5 w-5 text-white/70 shrink-0" />
+                            <div className="min-w-0">
+                                <p className="text-white text-sm font-medium truncate">{previewFile.name}</p>
+                                <p className="text-white/50 text-xs">{formatFileSize(previewFile.size)}</p>
+                            </div>
+                        </div>
+                        <div className="flex items-center gap-2 shrink-0">
+                            <Button
+                                variant="secondary"
+                                size="sm"
+                                className="gap-2"
+                                onClick={(e) => {
+                                    e.stopPropagation()
+                                    handleDownload(previewFile)
+                                }}
+                            >
+                                <Download className="h-4 w-4" />
+                                Download
+                            </Button>
+                            <Button
+                                variant="secondary"
+                                size="icon"
+                                className="h-8 w-8"
+                                onClick={() => closePreview()}
+                            >
+                                <X className="h-4 w-4" />
+                            </Button>
+                        </div>
                     </div>
-                    <img
-                        src={getPreviewUrl(previewFile.id)}
-                        alt={previewFile.name}
-                        className="max-w-full max-h-[90vh] object-contain rounded-lg"
-                        onClick={(e) => e.stopPropagation()}
-                    />
-                    <p className="absolute bottom-4 left-1/2 -translate-x-1/2 text-white text-sm bg-black/50 px-4 py-2 rounded-full">
-                        {previewFile.name}
-                    </p>
+
+                    {/* Preview content */}
+                    <div className="max-w-full max-h-[85vh] flex items-center justify-center" onClick={(e) => e.stopPropagation()}>
+                        {previewFile.type === 'image' && (
+                            <img
+                                src={getPreviewUrl(previewFile.id)}
+                                alt={previewFile.name}
+                                className="max-w-full max-h-[85vh] object-contain rounded-lg"
+                            />
+                        )}
+                        {previewFile.type === 'video' && (
+                            <video
+                                src={getPreviewUrl(previewFile.id)}
+                                controls
+                                autoPlay
+                                className="w-[90vw] max-h-[85vh] rounded-lg bg-black"
+                            />
+                        )}
+                        {previewFile.type === 'audio' && (
+                            <div className="bg-card rounded-2xl p-8 flex flex-col items-center gap-6 min-w-[320px]">
+                                <div className="w-24 h-24 rounded-full bg-primary/10 flex items-center justify-center">
+                                    <Music className="h-12 w-12 text-primary" />
+                                </div>
+                                <p className="text-card-foreground font-medium text-center">{previewFile.name}</p>
+                                <audio
+                                    src={getPreviewUrl(previewFile.id)}
+                                    controls
+                                    autoPlay
+                                    className="w-full"
+                                />
+                            </div>
+                        )}
+                        {previewFile.mime_type?.includes('pdf') && (
+                            <div className="flex flex-col items-center gap-3">
+                                {pdfBlobUrl === null && (
+                                    <div className="bg-card rounded-2xl p-8 flex flex-col items-center gap-4 w-[400px]">
+                                        <Loader2 className="h-10 w-10 animate-spin text-primary" />
+                                        <p className="text-card-foreground font-medium">Loading PDF...</p>
+                                    </div>
+                                )}
+                                {pdfBlobUrl && pdfBlobUrl !== 'error' && (
+                                    <embed
+                                        src={pdfBlobUrl + '#toolbar=1&navpanes=0'}
+                                        type="application/pdf"
+                                        className="w-[90vw] h-[80vh] max-w-4xl rounded-lg"
+                                    />
+                                )}
+                                {pdfBlobUrl === 'error' && (
+                                    <div className="bg-card rounded-2xl p-8 flex flex-col items-center gap-4 w-[400px]">
+                                        <FileIcon className="h-16 w-16 text-red-400" />
+                                        <p className="text-card-foreground font-medium text-center">{previewFile.name}</p>
+                                        <p className="text-muted-foreground text-sm text-center">
+                                            Could not load PDF preview
+                                        </p>
+                                    </div>
+                                )}
+                                <Button
+                                    variant="secondary"
+                                    size="sm"
+                                    className="gap-2"
+                                    onClick={(e) => {
+                                        e.stopPropagation()
+                                        window.open(getPreviewUrl(previewFile.id), '_blank')
+                                    }}
+                                >
+                                    <Maximize2 className="h-4 w-4" />
+                                    Open in New Tab
+                                </Button>
+                            </div>
+                        )}
+                        {previewFile.type === 'document' && !previewFile.mime_type?.includes('pdf') && (
+                            <div className="bg-card rounded-xl p-6 max-w-3xl w-[90vw] max-h-[85vh] overflow-auto">
+                                <pre className="text-sm text-card-foreground whitespace-pre-wrap font-mono leading-relaxed">
+                                    {previewTextContent ?? 'Loading...'}
+                                </pre>
+                            </div>
+                        )}
+                        {previewFile.type === 'archive' && (
+                            <div className="bg-card rounded-2xl p-8 flex flex-col items-center gap-4">
+                                <Archive className="h-16 w-16 text-amber-400" />
+                                <p className="text-card-foreground font-medium">{previewFile.name}</p>
+                                <p className="text-muted-foreground text-sm">Archive files cannot be previewed</p>
+                                <Button onClick={(e) => { e.stopPropagation(); handleDownload(previewFile) }} className="gap-2">
+                                    <Download className="h-4 w-4" />
+                                    Download Instead
+                                </Button>
+                            </div>
+                        )}
+                    </div>
                 </div>
             )}
             {/* Share Dialog */}
@@ -1037,7 +1195,6 @@ export function FilesContent() {
                                     </div>
                                     <div className="min-w-0">
                                         <p className="text-sm font-medium">{user.username}</p>
-                                        <p className="text-xs text-muted-foreground truncate">{user.email}</p>
                                     </div>
                                 </div>
                             ))

@@ -5,6 +5,7 @@ import { DashboardLayout } from '@/components/dashboard-layout'
 import { DashboardPage } from '@/pages/dashboard'
 import { LoginPage } from '@/pages/login'
 import { SetupPage } from '@/pages/setup'
+import { RecoverPage } from '@/pages/recover'
 import { FilesPage } from '@/pages/files'
 import { SharedPage } from '@/pages/shared'
 import { StarredPage } from '@/pages/starred'
@@ -58,6 +59,7 @@ function AppContent() {
         <Routes>
             {/* Auth routes - no layout */}
             <Route path="/auth/login" element={<LoginPage />} />
+            <Route path="/auth/recover" element={<RecoverPage />} />
             <Route path="/setup" element={<Navigate to="/auth/login" replace />} />
 
             {/* Public share view - no auth needed */}

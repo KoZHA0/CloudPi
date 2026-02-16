@@ -65,7 +65,7 @@ function requireAuth(req, res, next) {
 router.get('/users', requireAuth, (req, res) => {
     try {
         const users = db.prepare(
-            'SELECT id, username, email FROM users WHERE id != ?'
+            'SELECT id, username FROM users WHERE id != ?'
         ).all(req.user.userId);
 
         res.json({ users });
@@ -83,7 +83,7 @@ router.get('/my-shares', requireAuth, (req, res) => {
     try {
         const shares = db.prepare(`
             SELECT s.*, f.name as file_name, f.type as file_type, f.size as file_size, f.mime_type,
-                   u.username as shared_with_name, u.email as shared_with_user_email
+                   u.username as shared_with_name
             FROM shares s
             JOIN files f ON s.file_id = f.id
             LEFT JOIN users u ON s.shared_with = u.id

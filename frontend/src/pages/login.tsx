@@ -15,7 +15,7 @@ export function LoginPage() {
     const [error, setError] = useState<string | null>(null)
     const [showPassword, setShowPassword] = useState(false)
     const [formData, setFormData] = useState({
-        email: "",
+        username: "",
         password: "",
         rememberMe: false,
     })
@@ -26,7 +26,7 @@ export function LoginPage() {
         setError(null)
 
         try {
-            await login(formData.email, formData.password)
+            await login(formData.username, formData.password)
             navigate("/")
         } catch (err) {
             setError(err instanceof Error ? err.message : "Login failed")
@@ -62,13 +62,13 @@ export function LoginPage() {
                         )}
                         <form onSubmit={handleSubmit} className="space-y-4">
                             <div className="space-y-2">
-                                <Label htmlFor="email">Email</Label>
+                                <Label htmlFor="username">Username</Label>
                                 <Input
-                                    id="email"
-                                    type="email"
-                                    placeholder="you@example.com"
-                                    value={formData.email}
-                                    onChange={(e) => setFormData({ ...formData, email: e.target.value })}
+                                    id="username"
+                                    type="text"
+                                    placeholder="Enter your username"
+                                    value={formData.username}
+                                    onChange={(e) => setFormData({ ...formData, username: e.target.value })}
                                     required
                                 />
                             </div>
@@ -76,7 +76,7 @@ export function LoginPage() {
                             <div className="space-y-2">
                                 <div className="flex items-center justify-between">
                                     <Label htmlFor="password">Password</Label>
-                                    <Link to="/auth/forgot-password" className="text-xs text-primary hover:text-primary/80">
+                                    <Link to="/auth/recover" className="text-xs text-primary hover:text-primary/80">
                                         Forgot password?
                                     </Link>
                                 </div>

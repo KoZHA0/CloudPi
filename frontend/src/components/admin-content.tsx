@@ -5,17 +5,18 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 import { Badge } from "@/components/ui/badge"
-import { 
-    Users, 
-    UserPlus, 
-    Trash2, 
-    Loader2, 
-    Check, 
-    X,
+import { Avatar, AvatarFallback } from "@/components/ui/avatar"
+import {
+    Users,
+    UserPlus,
     Shield,
-    User as UserIcon
+    Trash2,
+    Loader2,
+    User as UserIcon,
+    Check,
+    X,
+    KeyRound,
 } from "lucide-react"
 import {
     Dialog,
@@ -38,7 +39,7 @@ import {
 } from "@/components/ui/alert-dialog"
 import { Checkbox } from "@/components/ui/checkbox"
 import { useAuth } from "@/contexts/auth-context"
-import { getUsers, createUser, deleteUser, type User } from "@/lib/api"
+import { getUsers, createUser, deleteUser, adminResetPassword, type User } from "@/lib/api"
 
 export function AdminContent() {
     const { user: currentUser } = useAuth()
@@ -52,10 +53,16 @@ export function AdminContent() {
     const [createMessage, setCreateMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null)
     const [newUser, setNewUser] = useState({
         username: "",
-        email: "",
         password: "",
         isAdmin: false,
     })
+
+    // Reset password state
+    const [resetDialogOpen, setResetDialogOpen] = useState(false)
+    const [resetTargetUser, setResetTargetUser] = useState<User | null>(null)
+    const [resetPassword, setResetPassword] = useState("")
+    const [isResetting, setIsResetting] = useState(false)
+    const [resetMessage, setResetMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null)
 
     const loadUsers = async () => {
         try {
@@ -80,9 +87,9 @@ export function AdminContent() {
         setCreateMessage(null)
 
         try {
-            await createUser(newUser.username, newUser.email, newUser.password, newUser.isAdmin)
+            await createUser(newUser.username, newUser.password, newUser.isAdmin)
             setCreateMessage({ type: 'success', text: 'User created successfully!' })
-            setNewUser({ username: "", email: "", password: "", isAdmin: false })
+            setNewUser({ username: "", password: "", isAdmin: false })
             loadUsers()
             setTimeout(() => setCreateDialogOpen(false), 1500)
         } catch (err) {
@@ -104,17 +111,51 @@ export function AdminContent() {
         }
     }
 
+    const handleResetPassword = async (e: React.FormEvent) => {
+        e.preventDefault()
+        if (!resetTargetUser) return
+        setIsResetting(true)
+        setResetMessage(null)
+
+        try {
+            await adminResetPassword(resetTargetUser.id, resetPassword)
+            setResetMessage({ type: 'success', text: `Password reset for ${resetTargetUser.username}!` })
+            setResetPassword("")
+            setTimeout(() => {
+                setResetDialogOpen(false)
+                setResetTargetUser(null)
+            }, 1500)
+        } catch (err) {
+            setResetMessage({ 
+                type: 'error', 
+                text: err instanceof Error ? err.message : 'Failed to reset password' 
+            })
+        } finally {
+            setIsResetting(false)
+        }
+    }
+
+    const openResetDialog = (user: User) => {
+        setResetTargetUser(user)
+        setResetPassword("")
+        setResetMessage(null)
+        setResetDialogOpen(true)
+    }
+
     // Check if current user can delete a specific user
-    // Rules: 
-    // - Cannot delete yourself
-    // - Cannot delete Super Admin (id = 1)
-    // - Only Super Admin can delete other admins
-    // - Regular admins can only delete regular users
     const canDeleteUser = (user: User): boolean => {
         if (!currentUser) return false
-        if (user.id === currentUser.id) return false // Can't delete yourself
-        if (user.id === 1) return false // Can't delete Super Admin
-        if (user.is_admin && currentUser.id !== 1) return false // Only Super Admin can delete admins
+        if (user.id === currentUser.id) return false
+        if (user.id === 1) return false
+        if (user.is_admin && currentUser.id !== 1) return false
+        return true
+    }
+
+    // Only super admin can reset passwords
+    const canResetPassword = (user: User): boolean => {
+        if (!currentUser) return false
+        if (currentUser.id !== 1) return false // Only super admin
+        if (user.id === currentUser.id) return false // Use profile page instead
         return true
     }
 
@@ -173,16 +214,6 @@ export function AdminContent() {
                                             id="new-username" 
                                             value={newUser.username}
                                             onChange={(e) => setNewUser({ ...newUser, username: e.target.value })}
-                                            required
-                                        />
-                                    </div>
-                                    <div className="space-y-2">
-                                        <Label htmlFor="new-email">Email</Label>
-                                        <Input 
-                                            id="new-email" 
-                                            type="email"
-                                            value={newUser.email}
-                                            onChange={(e) => setNewUser({ ...newUser, email: e.target.value })}
                                             required
                                         />
                                     </div>
@@ -274,42 +305,109 @@ export function AdminContent() {
                                                     <Badge variant="secondary">You</Badge>
                                                 )}
                                             </div>
-                                            <p className="text-sm text-muted-foreground">{user.email}</p>
                                         </div>
                                     </div>
-                                    {canDeleteUser(user) && (
-                                        <AlertDialog>
-                                            <AlertDialogTrigger asChild>
-                                                <Button variant="ghost" size="icon" className="text-destructive hover:text-destructive">
-                                                    <Trash2 className="h-4 w-4" />
-                                                </Button>
-                                            </AlertDialogTrigger>
-                                            <AlertDialogContent>
-                                                <AlertDialogHeader>
-                                                    <AlertDialogTitle>Delete User</AlertDialogTitle>
-                                                    <AlertDialogDescription>
-                                                        Are you sure you want to delete <strong>{user.username}</strong>? 
-                                                        This action cannot be undone.
-                                                    </AlertDialogDescription>
-                                                </AlertDialogHeader>
-                                                <AlertDialogFooter>
-                                                    <AlertDialogCancel>Cancel</AlertDialogCancel>
-                                                    <AlertDialogAction 
-                                                        onClick={() => handleDeleteUser(user.id)}
-                                                        className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-                                                    >
-                                                        Delete
-                                                    </AlertDialogAction>
-                                                </AlertDialogFooter>
-                                            </AlertDialogContent>
-                                        </AlertDialog>
-                                    )}
+                                    <div className="flex items-center gap-1">
+                                        {canResetPassword(user) && (
+                                            <Button 
+                                                variant="ghost" 
+                                                size="icon"
+                                                className="text-amber-500 hover:text-amber-400"
+                                                onClick={() => openResetDialog(user)}
+                                                title="Reset Password"
+                                            >
+                                                <KeyRound className="h-4 w-4" />
+                                            </Button>
+                                        )}
+                                        {canDeleteUser(user) && (
+                                            <AlertDialog>
+                                                <AlertDialogTrigger asChild>
+                                                    <Button variant="ghost" size="icon" className="text-destructive hover:text-destructive">
+                                                        <Trash2 className="h-4 w-4" />
+                                                    </Button>
+                                                </AlertDialogTrigger>
+                                                <AlertDialogContent>
+                                                    <AlertDialogHeader>
+                                                        <AlertDialogTitle>Delete User</AlertDialogTitle>
+                                                        <AlertDialogDescription>
+                                                            Are you sure you want to delete <strong>{user.username}</strong>? 
+                                                            This action cannot be undone.
+                                                        </AlertDialogDescription>
+                                                    </AlertDialogHeader>
+                                                    <AlertDialogFooter>
+                                                        <AlertDialogCancel>Cancel</AlertDialogCancel>
+                                                        <AlertDialogAction 
+                                                            onClick={() => handleDeleteUser(user.id)}
+                                                            className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                                                        >
+                                                            Delete
+                                                        </AlertDialogAction>
+                                                    </AlertDialogFooter>
+                                                </AlertDialogContent>
+                                            </AlertDialog>
+                                        )}
+                                    </div>
                                 </div>
                             ))}
                         </div>
                     )}
                 </CardContent>
             </Card>
+
+            {/* Reset Password Dialog */}
+            <Dialog open={resetDialogOpen} onOpenChange={setResetDialogOpen}>
+                <DialogContent className="sm:max-w-md">
+                    <DialogHeader>
+                        <DialogTitle>Reset Password</DialogTitle>
+                        <DialogDescription>
+                            Set a new password for <strong>{resetTargetUser?.username}</strong>
+                        </DialogDescription>
+                    </DialogHeader>
+                    <form onSubmit={handleResetPassword} className="space-y-4 mt-4">
+                        {resetMessage && (
+                            <div className={`p-3 rounded-lg flex items-center gap-2 text-sm ${
+                                resetMessage.type === 'success' 
+                                    ? 'bg-green-500/10 border border-green-500/50 text-green-400' 
+                                    : 'bg-destructive/10 border border-destructive/50 text-destructive'
+                            }`}>
+                                {resetMessage.type === 'success' ? <Check className="h-4 w-4" /> : <X className="h-4 w-4" />}
+                                {resetMessage.text}
+                            </div>
+                        )}
+                        <div className="space-y-2">
+                            <Label htmlFor="reset-password">New Password</Label>
+                            <Input 
+                                id="reset-password" 
+                                type="password"
+                                placeholder="Enter new password (min 6 characters)"
+                                value={resetPassword}
+                                onChange={(e) => setResetPassword(e.target.value)}
+                                required
+                                minLength={6}
+                            />
+                        </div>
+                        <div className="flex justify-end gap-2">
+                            <Button 
+                                type="button" 
+                                variant="outline" 
+                                onClick={() => setResetDialogOpen(false)}
+                            >
+                                Cancel
+                            </Button>
+                            <Button type="submit" disabled={isResetting}>
+                                {isResetting ? (
+                                    <>
+                                        <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                                        Resetting...
+                                    </>
+                                ) : (
+                                    "Reset Password"
+                                )}
+                            </Button>
+                        </div>
+                    </form>
+                </DialogContent>
+            </Dialog>
         </div>
     )
 }

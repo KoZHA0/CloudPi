@@ -1,18 +1,22 @@
 /**
  * AUTHENTICATION ROUTES
  * =====================
- * Handles user login and setup
+ * Handles user login, setup, and password recovery
  * 
  * ENDPOINTS:
  * GET  /api/auth/setup-status - Check if first-time setup is required
- * POST /api/auth/setup        - Create first admin account
- * POST /api/auth/login        - Login and get JWT token
+ * POST /api/auth/setup        - Create first admin account (returns backup code)
+ * POST /api/auth/login        - Login with username + password
  * GET  /api/auth/me           - Get current user info (requires token)
+ * PUT  /api/auth/profile      - Update username
+ * PUT  /api/auth/password     - Change password
+ * POST /api/auth/recover      - Recover super admin with backup code
  */
 
 const express = require('express');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const db = require('../database/db');
 
 const router = express.Router();
@@ -30,6 +34,19 @@ const JWT_SECRET = 'cloudpi-secret-key-change-this-in-production';
  * 10 is a good balance for Raspberry Pi performance
  */
 const SALT_ROUNDS = 10;
+
+/**
+ * Generate a random backup code like "XXXX-XXXX-XXXX"
+ */
+function generateBackupCode() {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // No O/0/1/I to avoid confusion
+    let code = '';
+    for (let i = 0; i < 12; i++) {
+        if (i > 0 && i % 4 === 0) code += '-';
+        code += chars[crypto.randomInt(chars.length)];
+    }
+    return code;
+}
 
 /**
  * GET /api/auth/setup-status
@@ -51,6 +68,7 @@ router.get('/setup-status', (req, res) => {
 /**
  * POST /api/auth/setup
  * Creates the first admin user (only works when no users exist)
+ * Returns a one-time backup code for password recovery
  */
 router.post('/setup', async (req, res) => {
     try {
@@ -61,27 +79,31 @@ router.post('/setup', async (req, res) => {
             return res.status(403).json({ error: 'Setup already completed. Users exist.' });
         }
 
-        const { username, email, password } = req.body;
+        const { username, password } = req.body;
 
         // Validate required fields
-        if (!username || !email || !password) {
+        if (!username || !password) {
             return res.status(400).json({
                 error: 'Missing required fields',
-                required: ['username', 'email', 'password']
+                required: ['username', 'password']
             });
         }
 
         // Hash the password
         const hashedPassword = await bcrypt.hash(password, SALT_ROUNDS);
 
-        // Insert first user as admin
-        const result = db.prepare(
-            'INSERT INTO users (username, email, password, is_admin) VALUES (?, ?, ?, 1)'
-        ).run(username, email, hashedPassword);
+        // Generate backup code for super admin recovery
+        const backupCode = generateBackupCode();
+        const hashedBackupCode = await bcrypt.hash(backupCode, SALT_ROUNDS);
 
-        // Create JWT token with token_version
+        // Insert first user as admin with backup code
+        const result = db.prepare(
+            'INSERT INTO users (username, password, is_admin, backup_code) VALUES (?, ?, 1, ?)'
+        ).run(username, hashedPassword, hashedBackupCode);
+
+        // Create JWT token
         const token = jwt.sign(
-            { userId: result.lastInsertRowid, email, username, isAdmin: true, tokenVersion: 1 },
+            { userId: result.lastInsertRowid, username, tokenVersion: 1 },
             JWT_SECRET,
             { expiresIn: '7d' }
         );
@@ -89,10 +111,10 @@ router.post('/setup', async (req, res) => {
         res.status(201).json({
             message: 'Admin account created successfully',
             token,
+            backupCode, // Shown once to the user, then never again
             user: {
                 id: result.lastInsertRowid,
                 username,
-                email,
                 is_admin: 1
             }
         });
@@ -105,50 +127,45 @@ router.post('/setup', async (req, res) => {
 
 /**
  * POST /api/auth/login
- * Authenticates user and returns JWT token
+ * Authenticates user with username + password and returns JWT token
  * 
  * REQUEST BODY:
  * {
- *   "email": "john@example.com",
+ *   "username": "admin",
  *   "password": "MyPassword123"
  * }
- * 
- * RESPONSE:
- * - 200: Login successful, returns JWT token
- * - 400: Missing fields
- * - 401: Invalid credentials
  */
 router.post('/login', async (req, res) => {
     try {
-        const { email, password } = req.body;
+        const { username, password } = req.body;
 
         // Validate required fields
-        if (!email || !password) {
+        if (!username || !password) {
             return res.status(400).json({
                 error: 'Missing required fields',
-                required: ['email', 'password']
+                required: ['username', 'password']
             });
         }
 
-        // Find user by email
+        // Find user by username
         const user = db.prepare(
-            'SELECT * FROM users WHERE email = ?'
-        ).get(email);
+            'SELECT * FROM users WHERE username = ?'
+        ).get(username);
 
         if (!user) {
-            return res.status(401).json({ error: 'Invalid email or password' });
+            return res.status(401).json({ error: 'Invalid username or password' });
         }
 
         // Compare password with hash
         const passwordMatch = await bcrypt.compare(password, user.password);
 
         if (!passwordMatch) {
-            return res.status(401).json({ error: 'Invalid email or password' });
+            return res.status(401).json({ error: 'Invalid username or password' });
         }
 
-        // Create JWT token with token_version
+        // Create JWT token
         const token = jwt.sign(
-            { userId: user.id, email: user.email, username: user.username, tokenVersion: user.token_version || 1 },
+            { userId: user.id, username: user.username, tokenVersion: user.token_version || 1 },
             JWT_SECRET,
             { expiresIn: '7d' }
         );
@@ -159,7 +176,6 @@ router.post('/login', async (req, res) => {
             user: {
                 id: user.id,
                 username: user.username,
-                email: user.email,
                 is_admin: user.is_admin
             }
         });
@@ -173,17 +189,9 @@ router.post('/login', async (req, res) => {
 /**
  * GET /api/auth/me
  * Returns current user info based on JWT token
- * 
- * HEADERS:
- * Authorization: Bearer <token>
- * 
- * RESPONSE:
- * - 200: User info
- * - 401: Invalid or missing token
  */
 router.get('/me', (req, res) => {
     try {
-        // Get token from header
         const authHeader = req.headers.authorization;
 
         if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -191,21 +199,18 @@ router.get('/me', (req, res) => {
         }
 
         const token = authHeader.split(' ')[1];
-
-        // Verify token
         const decoded = jwt.verify(token, JWT_SECRET);
 
         // Get fresh user data from database
         const user = db.prepare(
-            'SELECT id, username, email, is_admin, token_version, created_at FROM users WHERE id = ?'
+            'SELECT id, username, is_admin, token_version, created_at FROM users WHERE id = ?'
         ).get(decoded.userId);
 
         if (!user) {
             return res.status(401).json({ error: 'User not found' });
         }
 
-        // Validate token_version - if token version doesn't match, token is invalid
-        // This prevents old tokens from working after database reset or logout
+        // Validate token_version
         const tokenVersion = decoded.tokenVersion || 0;
         const dbTokenVersion = user.token_version || 1;
         
@@ -229,20 +234,10 @@ router.get('/me', (req, res) => {
 
 /**
  * PUT /api/auth/profile
- * Updates user profile (username and email)
- * 
- * HEADERS:
- * Authorization: Bearer <token>
- * 
- * REQUEST BODY:
- * {
- *   "username": "newUsername",
- *   "email": "newemail@example.com"
- * }
+ * Updates user profile (username only)
  */
 router.put('/profile', async (req, res) => {
     try {
-        // Get token from header
         const authHeader = req.headers.authorization;
 
         if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -252,57 +247,28 @@ router.put('/profile', async (req, res) => {
         const token = authHeader.split(' ')[1];
         const decoded = jwt.verify(token, JWT_SECRET);
 
-        const { username, email } = req.body;
+        const { username } = req.body;
 
-        // Validate at least one field is provided
-        if (!username && !email) {
-            return res.status(400).json({ error: 'No fields to update' });
-        }
-
-        // Check if new email already exists for another user
-        if (email) {
-            const existingUser = db.prepare(
-                'SELECT id FROM users WHERE email = ? AND id != ?'
-            ).get(email, decoded.userId);
-
-            if (existingUser) {
-                return res.status(400).json({ error: 'Email already in use' });
-            }
+        if (!username) {
+            return res.status(400).json({ error: 'Username is required' });
         }
 
         // Check if new username already exists for another user
-        if (username) {
-            const existingUser = db.prepare(
-                'SELECT id FROM users WHERE username = ? AND id != ?'
-            ).get(username, decoded.userId);
+        const existingUser = db.prepare(
+            'SELECT id FROM users WHERE username = ? AND id != ?'
+        ).get(username, decoded.userId);
 
-            if (existingUser) {
-                return res.status(400).json({ error: 'Username already in use' });
-            }
+        if (existingUser) {
+            return res.status(400).json({ error: 'Username already in use' });
         }
-
-        // Build update query dynamically
-        const updates = [];
-        const values = [];
-
-        if (username) {
-            updates.push('username = ?');
-            values.push(username);
-        }
-        if (email) {
-            updates.push('email = ?');
-            values.push(email);
-        }
-
-        values.push(decoded.userId);
 
         db.prepare(
-            `UPDATE users SET ${updates.join(', ')} WHERE id = ?`
-        ).run(...values);
+            'UPDATE users SET username = ? WHERE id = ?'
+        ).run(username, decoded.userId);
 
         // Get updated user
         const updatedUser = db.prepare(
-            'SELECT id, username, email, created_at FROM users WHERE id = ?'
+            'SELECT id, username, is_admin, created_at FROM users WHERE id = ?'
         ).get(decoded.userId);
 
         res.json({
@@ -322,19 +288,9 @@ router.put('/profile', async (req, res) => {
 /**
  * PUT /api/auth/password
  * Changes user password
- * 
- * HEADERS:
- * Authorization: Bearer <token>
- * 
- * REQUEST BODY:
- * {
- *   "currentPassword": "oldPassword123",
- *   "newPassword": "newPassword456"
- * }
  */
 router.put('/password', async (req, res) => {
     try {
-        // Get token from header
         const authHeader = req.headers.authorization;
 
         if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -346,7 +302,6 @@ router.put('/password', async (req, res) => {
 
         const { currentPassword, newPassword } = req.body;
 
-        // Validate required fields
         if (!currentPassword || !newPassword) {
             return res.status(400).json({
                 error: 'Missing required fields',
@@ -354,12 +309,10 @@ router.put('/password', async (req, res) => {
             });
         }
 
-        // Validate new password length
         if (newPassword.length < 6) {
             return res.status(400).json({ error: 'New password must be at least 6 characters' });
         }
 
-        // Get current user with password
         const user = db.prepare(
             'SELECT * FROM users WHERE id = ?'
         ).get(decoded.userId);
@@ -368,17 +321,14 @@ router.put('/password', async (req, res) => {
             return res.status(401).json({ error: 'User not found' });
         }
 
-        // Verify current password
         const passwordMatch = await bcrypt.compare(currentPassword, user.password);
 
         if (!passwordMatch) {
             return res.status(401).json({ error: 'Current password is incorrect' });
         }
 
-        // Hash new password
         const hashedPassword = await bcrypt.hash(newPassword, SALT_ROUNDS);
 
-        // Update password
         db.prepare(
             'UPDATE users SET password = ? WHERE id = ?'
         ).run(hashedPassword, decoded.userId);
@@ -391,6 +341,119 @@ router.put('/password', async (req, res) => {
         }
         console.error('Password change error:', error);
         res.status(500).json({ error: 'Server error during password change' });
+    }
+});
+
+/**
+ * POST /api/auth/recover
+ * Recovers super admin account using backup code
+ * Sets a new password and generates a new backup code
+ * 
+ * REQUEST BODY:
+ * {
+ *   "backupCode": "XXXX-XXXX-XXXX",
+ *   "newPassword": "newPassword123"
+ * }
+ */
+router.post('/recover', async (req, res) => {
+    try {
+        const { backupCode, newPassword } = req.body;
+
+        if (!backupCode || !newPassword) {
+            return res.status(400).json({
+                error: 'Missing required fields',
+                required: ['backupCode', 'newPassword']
+            });
+        }
+
+        if (newPassword.length < 6) {
+            return res.status(400).json({ error: 'New password must be at least 6 characters' });
+        }
+
+        // Only the super admin (id = 1) has a backup code
+        const superAdmin = db.prepare(
+            'SELECT * FROM users WHERE id = 1'
+        ).get();
+
+        if (!superAdmin) {
+            return res.status(404).json({ error: 'Super admin not found' });
+        }
+
+        if (!superAdmin.backup_code) {
+            return res.status(400).json({ error: 'No backup code set for this account' });
+        }
+
+        // Verify backup code
+        const codeMatch = await bcrypt.compare(backupCode.toUpperCase(), superAdmin.backup_code);
+
+        if (!codeMatch) {
+            return res.status(401).json({ error: 'Invalid backup code' });
+        }
+
+        // Hash the new password
+        const hashedPassword = await bcrypt.hash(newPassword, SALT_ROUNDS);
+
+        // Generate a NEW backup code for next time
+        const newBackupCode = generateBackupCode();
+        const hashedNewBackupCode = await bcrypt.hash(newBackupCode, SALT_ROUNDS);
+
+        // Update password, backup code, and invalidate old tokens
+        const newTokenVersion = (superAdmin.token_version || 1) + 1;
+        db.prepare(
+            'UPDATE users SET password = ?, backup_code = ?, token_version = ? WHERE id = 1'
+        ).run(hashedPassword, hashedNewBackupCode, newTokenVersion);
+
+        // Create new JWT token
+        const token = jwt.sign(
+            { userId: 1, username: superAdmin.username, tokenVersion: newTokenVersion },
+            JWT_SECRET,
+            { expiresIn: '7d' }
+        );
+
+        res.json({
+            message: 'Password reset successfully',
+            token,
+            newBackupCode, // Show the new backup code to the user
+            user: {
+                id: superAdmin.id,
+                username: superAdmin.username,
+                is_admin: superAdmin.is_admin
+            }
+        });
+
+    } catch (error) {
+        console.error('Recovery error:', error);
+        res.status(500).json({ error: 'Server error during recovery' });
+    }
+});
+
+/**
+ * POST /api/auth/check-recovery
+ * Checks if a username can use backup code recovery
+ * Only the Super Admin (id=1) can recover via backup code
+ */
+router.post('/check-recovery', (req, res) => {
+    try {
+        const { username } = req.body;
+
+        if (!username) {
+            return res.status(400).json({ error: 'Username is required' });
+        }
+
+        const user = db.prepare(
+            'SELECT id FROM users WHERE username = ?'
+        ).get(username);
+
+        if (!user) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        // Only super admin (id=1) can use backup code recovery
+        res.json({ canRecover: user.id === 1 });
+
+    } catch (error) {
+        console.error('Check recovery error:', error);
+        res.status(500).json({ error: 'Server error' });
     }
 });
 

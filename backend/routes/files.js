@@ -357,8 +357,8 @@ router.post('/upload', requireAuth, upload.array('files', 10), (req, res) => {
 
 /**
  * GET /api/files/:id/preview
- * Serve an image file for preview/thumbnail display
- * Accepts token via query string (needed for <img> tags)
+ * Serve a file for inline preview (images, PDFs, videos, audio, text)
+ * Accepts token via query string (needed for <img>, <video>, <audio>, <iframe> tags)
  */
 router.get('/:id/preview', (req, res) => {
     try {
@@ -379,7 +379,7 @@ router.get('/:id/preview', (req, res) => {
         const userId = decoded.userId;
         const fileId = req.params.id;
 
-        // Validate token_version (skip if token was created before this feature)
+        // Validate token_version
         const dbUser = db.prepare('SELECT token_version FROM users WHERE id = ?').get(userId);
         if (!dbUser) return res.status(401).json({ error: 'User not found' });
         
@@ -390,11 +390,11 @@ router.get('/:id/preview', (req, res) => {
         }
 
         const file = db.prepare(
-            "SELECT * FROM files WHERE id = ? AND user_id = ? AND type = 'image'"
+            "SELECT * FROM files WHERE id = ? AND user_id = ? AND type != 'folder'"
         ).get(fileId, userId);
 
         if (!file) {
-            return res.status(404).json({ error: 'Image not found' });
+            return res.status(404).json({ error: 'File not found' });
         }
 
         const filePath = path.join(STORAGE_DIR, String(userId), file.path);
@@ -403,9 +403,15 @@ router.get('/:id/preview', (req, res) => {
             return res.status(404).json({ error: 'File not found on disk' });
         }
 
-        // Set content type and cache headers
-        res.set('Content-Type', file.mime_type);
-        res.set('Cache-Control', 'public, max-age=86400'); // Cache for 24 hours
+        // When raw=1 is set, serve as application/octet-stream to bypass
+        // download managers (IDM) that intercept PDF content types
+        const contentType = req.query.raw === '1'
+            ? 'application/octet-stream'
+            : (file.mime_type || 'application/octet-stream');
+
+        res.set('Content-Type', contentType);
+        res.set('Content-Disposition', `inline; filename="${encodeURIComponent(file.name)}"`);
+        res.set('Cache-Control', 'public, max-age=86400');
         res.sendFile(filePath);
     } catch (error) {
         if (error.name === 'JsonWebTokenError' || error.name === 'TokenExpiredError') {

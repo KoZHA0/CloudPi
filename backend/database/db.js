@@ -27,15 +27,17 @@ db.pragma('foreign_keys = ON');
  * - password will store a HASHED password (never store plain text!)
  * - is_admin: 1 for admin users, 0 for regular users
  * - token_version: Incremented to invalidate all existing tokens for a user
+ * - backup_code: Hashed one-time recovery code (super admin only)
  */
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT UNIQUE NOT NULL,
-    email TEXT UNIQUE NOT NULL,
+    email TEXT DEFAULT NULL,
     password TEXT NOT NULL,
     is_admin INTEGER DEFAULT 0,
     token_version INTEGER DEFAULT 1,
+    backup_code TEXT DEFAULT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )
 `);
@@ -50,6 +52,13 @@ try {
 // Add token_version column if it doesn't exist (for existing databases)
 try {
   db.exec(`ALTER TABLE users ADD COLUMN token_version INTEGER DEFAULT 1`);
+} catch (e) {
+  // Column already exists, ignore error
+}
+
+// Add backup_code column if it doesn't exist (for existing databases)
+try {
+  db.exec(`ALTER TABLE users ADD COLUMN backup_code TEXT DEFAULT NULL`);
 } catch (e) {
   // Column already exists, ignore error
 }

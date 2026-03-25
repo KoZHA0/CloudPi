@@ -56,6 +56,7 @@ import {
     Link2,
     Users,
     Check,
+    CheckSquare,
     AlertCircle,
     Eye,
     X,
@@ -129,6 +130,7 @@ export function FilesContent() {
     const [breadcrumbs, setBreadcrumbs] = useState<Breadcrumb[]>([])
     const [currentFolderId, setCurrentFolderId] = useState<number | null>(null)
     const [selectedFiles, setSelectedFiles] = useState<number[]>([])
+    const [isSelecting, setIsSelecting] = useState(false)
     const [searchQuery, setSearchQuery] = useState("")
     const [isLoading, setIsLoading] = useState(true)
     const [error, setError] = useState<string | null>(null)
@@ -191,6 +193,7 @@ export function FilesContent() {
     function navigateToFolder(folderId: number | null) {
         setCurrentFolderId(folderId)
         setSelectedFiles([])
+        setIsSelecting(false)
     }
 
     function handleFileClick(file: FileItem) {
@@ -583,6 +586,17 @@ export function FilesContent() {
                         )}
                         Upload
                     </Button>
+                    <Button
+                        variant={isSelecting ? "default" : "outline"}
+                        size="icon"
+                        onClick={() => {
+                            setIsSelecting(!isSelecting)
+                            if (isSelecting) setSelectedFiles([])
+                        }}
+                        title={isSelecting ? "Cancel selection" : "Select files"}
+                    >
+                        <CheckSquare className="h-4 w-4" />
+                    </Button>
                     <div className="flex items-center border border-border rounded-lg">
                         <Button
                             variant="ghost"
@@ -642,21 +656,48 @@ export function FilesContent() {
             )}
 
             {/* Selected Actions */}
-            {selectedFiles.length > 0 && (
+            {isSelecting && (
                 <Card className="bg-secondary border-border">
                     <CardContent className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 py-3">
-                        <span className="text-sm text-secondary-foreground">
-                            {selectedFiles.length} item(s) selected
-                        </span>
-                        <div className="flex items-center gap-2 flex-wrap">
+                        <div className="flex items-center gap-3">
+                            <span className="text-sm text-secondary-foreground">
+                                {selectedFiles.length} item(s) selected
+                            </span>
                             <Button
                                 variant="ghost"
                                 size="sm"
-                                className="gap-2 text-destructive"
-                                onClick={handleBulkDelete}
+                                className="gap-2"
+                                onClick={() => {
+                                    if (selectedFiles.length === filteredFiles.length) {
+                                        setSelectedFiles([])
+                                    } else {
+                                        setSelectedFiles(filteredFiles.map(f => f.id))
+                                    }
+                                }}
                             >
-                                <Trash2 className="h-4 w-4" />
-                                <span className="hidden xs:inline">Delete</span>
+                                <CheckSquare className="h-4 w-4" />
+                                {selectedFiles.length === filteredFiles.length ? "Deselect All" : "Select All"}
+                            </Button>
+                        </div>
+                        <div className="flex items-center gap-2 flex-wrap">
+                            {selectedFiles.length > 0 && (
+                                <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    className="gap-2 text-destructive"
+                                    onClick={handleBulkDelete}
+                                >
+                                    <Trash2 className="h-4 w-4" />
+                                    <span className="hidden xs:inline">Delete</span>
+                                </Button>
+                            )}
+                            <Button
+                                variant="ghost"
+                                size="sm"
+                                onClick={() => { setIsSelecting(false); setSelectedFiles([]) }}
+                            >
+                                <X className="h-4 w-4" />
+                                <span className="hidden xs:inline">Cancel</span>
                             </Button>
                         </div>
                     </CardContent>
@@ -699,20 +740,11 @@ export function FilesContent() {
                                 key={file.id}
                                 className={cn(
                                     "group relative cursor-pointer transition-colors hover:bg-secondary",
-                                    selectedFiles.includes(file.id) && "ring-2 ring-primary"
+                                    selectedFiles.includes(file.id) && "ring-2 ring-primary bg-primary/5"
                                 )}
-                                onDoubleClick={() => handleFileClick(file)}
+                                onClick={() => isSelecting ? toggleFileSelection(file.id) : handleFileClick(file)}
                             >
                                 <CardContent className="p-4">
-                                    <div className={cn(
-                                        "absolute left-2 top-2 transition-opacity",
-                                        selectedFiles.includes(file.id) ? "opacity-100" : "opacity-0 group-hover:opacity-100"
-                                    )}>
-                                        <Checkbox
-                                            checked={selectedFiles.includes(file.id)}
-                                            onCheckedChange={() => toggleFileSelection(file.id)}
-                                        />
-                                    </div>
                                     <div className="absolute right-2 top-2 flex items-center gap-1">
                                         {file.starred === 1 && (
                                             <Star className="h-4 w-4 fill-yellow-400 text-yellow-400" />
@@ -824,10 +856,7 @@ export function FilesContent() {
                 <Card className="bg-card border-border overflow-hidden">
                     <CardHeader className="border-b border-border py-3 hidden sm:block">
                         <div className="grid grid-cols-12 gap-4 text-xs font-medium text-muted-foreground">
-                            <div className="col-span-1">
-                                <Checkbox />
-                            </div>
-                            <div className="col-span-6 sm:col-span-5">Name</div>
+                            <div className="col-span-7 sm:col-span-6">Name</div>
                             <div className="col-span-2 hidden sm:block">Size</div>
                             <div className="col-span-3 hidden md:block">Modified</div>
                             <div className="col-span-1" />
@@ -841,19 +870,12 @@ export function FilesContent() {
                                     key={file.id}
                                     className={cn(
                                         "flex sm:grid sm:grid-cols-12 gap-2 sm:gap-4 items-center px-4 sm:px-6 py-3 border-b border-border last:border-0 hover:bg-secondary cursor-pointer",
-                                        selectedFiles.includes(file.id) && "bg-secondary"
+                                        selectedFiles.includes(file.id) && "bg-primary/10"
                                     )}
-                                    onDoubleClick={() => handleFileClick(file)}
+                                    onClick={() => isSelecting ? toggleFileSelection(file.id) : handleFileClick(file)}
                                 >
-                                    <div className="sm:col-span-1 flex-shrink-0">
-                                        <Checkbox
-                                            checked={selectedFiles.includes(file.id)}
-                                            onCheckedChange={() => toggleFileSelection(file.id)}
-                                        />
-                                    </div>
                                     <div
-                                        className="flex-1 sm:col-span-6 md:col-span-5 flex items-center gap-3 min-w-0"
-                                        onClick={() => file.type === "folder" && handleFileClick(file)}
+                                        className="flex-1 sm:col-span-7 md:col-span-6 flex items-center gap-3 min-w-0"
                                     >
                                         <Icon className={cn("h-5 w-5 flex-shrink-0", getFileColor(file.type))} />
                                         <div className="min-w-0 flex-1">

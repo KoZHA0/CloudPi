@@ -56,6 +56,7 @@ export interface User {
     id: number;
     username: string;
     is_admin?: number;
+    default_storage_id?: string;
 }
 
 export interface AuthResponse {
@@ -181,6 +182,16 @@ export async function adminResetPassword(
     });
 }
 
+export async function updateUserStorage(
+    userId: number,
+    storageId: string
+): Promise<{ message: string }> {
+    return apiRequest<{ message: string }>(`/admin/users/${userId}/storage`, {
+        method: 'PUT',
+        body: JSON.stringify({ default_storage_id: storageId }),
+    });
+}
+
 // ============================================
 // FILES API
 // ============================================
@@ -208,10 +219,20 @@ export interface FilesResponse {
     breadcrumbs: Breadcrumb[];
 }
 
+export interface StorageStats {
+    totalBytes: number;
+    usedBytes: number;
+}
+
 // List files in a folder
 export async function getFiles(parentId: number | null = null): Promise<FilesResponse> {
     const query = parentId ? `?parent_id=${parentId}` : '';
     return apiRequest<FilesResponse>(`/files${query}`);
+}
+
+// Get system storage stats
+export async function getStorageStats(): Promise<StorageStats> {
+    return apiRequest<StorageStats>('/files/storage-stats');
 }
 
 // List starred files
@@ -424,3 +445,129 @@ export async function getDashboardStats(): Promise<DashboardStats> {
 export async function getSystemHealth(): Promise<SystemHealth> {
     return apiRequest<SystemHealth>('/dashboard/health');
 }
+
+// ============= ADMIN SETTINGS =============
+
+export interface RateLimitSettings {
+    [key: string]: {
+        value: string;
+        description: string;
+    };
+}
+
+export async function getRateLimitSettings(): Promise<{ settings: RateLimitSettings }> {
+    return apiRequest<{ settings: RateLimitSettings }>('/admin/settings');
+}
+
+export async function updateRateLimitSettings(
+    settings: Record<string, string | number>
+): Promise<{ message: string; updated: string[] }> {
+    return apiRequest<{ message: string; updated: string[] }>('/admin/settings', {
+        method: 'PUT',
+        body: JSON.stringify({ settings }),
+    });
+}
+
+// ============= STORAGE SOURCES =============
+
+export interface StorageSource {
+    id: string;
+    label: string;
+    path: string;
+    type: 'internal' | 'external';
+    is_active: number;
+    is_accessible: boolean;
+    total_bytes: number;
+    used_bytes: number;
+    free_bytes: number;
+    file_count: number;
+    created_at: string;
+}
+
+export async function getStorageSources(): Promise<{ sources: StorageSource[] }> {
+    return apiRequest<{ sources: StorageSource[] }>('/admin/storage');
+}
+
+export async function addStorageSource(
+    drivePath: string,
+    label: string
+): Promise<{ message: string; source: StorageSource }> {
+    return apiRequest<{ message: string; source: StorageSource }>('/admin/storage', {
+        method: 'POST',
+        body: JSON.stringify({ path: drivePath, label }),
+    });
+}
+
+export async function updateStorageSource(
+    id: string,
+    updates: { label?: string; is_active?: number }
+): Promise<{ message: string; source: StorageSource }> {
+    return apiRequest<{ message: string; source: StorageSource }>(`/admin/storage/${id}`, {
+        method: 'PUT',
+        body: JSON.stringify(updates),
+    });
+}
+
+export async function removeStorageSource(
+    id: string
+): Promise<{ message: string }> {
+    return apiRequest<{ message: string }>(`/admin/storage/${id}`, {
+        method: 'DELETE',
+    });
+}
+
+// ============= DRIVE MANAGEMENT =============
+
+export interface DetectedDrive {
+    device: string;
+    name: string;
+    size: string;
+    fstype: string | null;
+    mountpoint: string | null;
+    label: string | null;
+    model: string;
+    uuid: string | null;
+    isMounted: boolean;
+    isRegistered: boolean;
+    registeredId: string | null;
+    fsWarning: string | null;
+}
+
+export interface RegisteredSource {
+    id: string;
+    label: string;
+    path: string;
+    type: string;
+    is_active: number;
+    status: 'online' | 'detected' | 'offline';
+}
+
+export interface DrivesScanResponse {
+    drives: DetectedDrive[];
+    registeredSources: RegisteredSource[];
+    platform: string;
+    message?: string;
+}
+
+export async function scanDrives(): Promise<DrivesScanResponse> {
+    return apiRequest<DrivesScanResponse>('/admin/drives');
+}
+
+export async function mountDrive(
+    device: string
+): Promise<{ message: string; mountpoint: string; device: string; label: string | null; uuid: string | null; fstype: string | null }> {
+    return apiRequest('/admin/drives/mount', {
+        method: 'POST',
+        body: JSON.stringify({ device }),
+    });
+}
+
+export async function unmountDrive(
+    device: string
+): Promise<{ message: string }> {
+    return apiRequest<{ message: string }>('/admin/drives/unmount', {
+        method: 'POST',
+        body: JSON.stringify({ device }),
+    });
+}
+

@@ -32,6 +32,16 @@ import {
 import { Button } from "@/components/ui/button"
 import { Progress } from "@/components/ui/progress"
 import { useAuth } from "@/contexts/auth-context"
+import { getStorageStats } from "@/lib/api"
+
+function formatBytes(bytes: number, decimals = 1) {
+    if (bytes === 0) return '0 Bytes';
+    const k = 1024;
+    const dm = decimals < 0 ? 0 : decimals;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+}
 
 // Sidebar context for mobile toggle
 type SidebarContextType = {
@@ -110,6 +120,16 @@ export function Sidebar() {
     const location = useLocation()
     const { isOpen, close } = useSidebar()
     const { user, isAuthenticated, logout } = useAuth()
+    
+    const [storageStats, setStorageStats] = useState<{ totalBytes: number, usedBytes: number } | null>(null)
+
+    // Fetch storage stats when authenticated
+    useEffect(() => {
+        if (isAuthenticated) {
+            getStorageStats().then(setStorageStats).catch(console.error);
+        }
+    }, [isAuthenticated, location.pathname]) // Refresh on navigation
+
 
     return (
         <>
@@ -225,8 +245,19 @@ export function Sidebar() {
                         <HardDrive className="h-4 w-4 text-muted-foreground" />
                         <span>Storage</span>
                     </div>
-                    <Progress value={53} className="mt-2 h-2" />
-                    <p className="mt-2 text-xs text-muted-foreground">68.4 GB of 128 GB used</p>
+                    {storageStats ? (
+                        <>
+                            <Progress value={storageStats.totalBytes > 0 ? (storageStats.usedBytes / storageStats.totalBytes) * 100 : 0} className="mt-2 h-2" />
+                            <p className="mt-2 text-xs text-muted-foreground">
+                                {formatBytes(storageStats.usedBytes)} of {formatBytes(storageStats.totalBytes)} used
+                            </p>
+                        </>
+                    ) : (
+                        <>
+                            <Progress value={0} className="mt-2 h-2 opacity-50" />
+                            <p className="mt-2 text-xs text-muted-foreground animate-pulse">Calculating space...</p>
+                        </>
+                    )}
                 </div>
 
                 {/* User Menu */}

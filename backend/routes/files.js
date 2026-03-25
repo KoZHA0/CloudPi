@@ -25,24 +25,75 @@ const fs = require('fs');
 const jwt = require('jsonwebtoken');
 const db = require('../database/db');
 const { v4: uuidv4 } = require('uuid');
+const rateLimit = require('express-rate-limit'); // kept for reference but upload uses custom limiter
+const fastq = require('fastq');
 
 const router = express.Router();
 
 const JWT_SECRET = 'cloudpi-secret-key-change-this-in-production';
 
-// Storage directory for uploaded files
-const STORAGE_DIR = path.join(__dirname, '..', 'storage');
+// Default storage directory for internal storage (backward compatible)
+const DEFAULT_STORAGE_DIR = path.join(__dirname, '..', 'storage');
 
-// Ensure storage directory exists
-if (!fs.existsSync(STORAGE_DIR)) {
-    fs.mkdirSync(STORAGE_DIR, { recursive: true });
+// Ensure internal storage directory exists
+if (!fs.existsSync(DEFAULT_STORAGE_DIR)) {
+    fs.mkdirSync(DEFAULT_STORAGE_DIR, { recursive: true });
 }
 
-// Configure multer for file uploads
-const storage = multer.diskStorage({
+/**
+ * STORAGE PATH RESOLUTION
+ * -----------------------
+ * Resolves the base directory for a storage source:
+ *   - Internal: backend/storage/{userId}/
+ *   - External: {drivePath}/cloudpi-data/{userId}/
+ */
+function getStorageBasePath(storageSourceId, userId) {
+    if (!storageSourceId || storageSourceId === 'internal') {
+        return path.join(DEFAULT_STORAGE_DIR, String(userId));
+    }
+    const source = db.prepare('SELECT path, is_active FROM storage_sources WHERE id = ?').get(storageSourceId);
+    if (!source) return path.join(DEFAULT_STORAGE_DIR, String(userId)); // fallback
+    return path.join(source.path, 'cloudpi-data', String(userId));
+}
+
+/**
+ * Resolve the full disk path for a file record from the DB.
+ * Looks up the storage source and builds: {sourceBasePath}/{userId}/{file.path}
+ */
+function resolveFilePath(file) {
+    const basePath = getStorageBasePath(file.storage_source_id, file.user_id);
+    return path.join(basePath, file.path);
+}
+
+/**
+ * Get the user's default storage source ID.
+ * Falls back to 'internal' if not set.
+ */
+function getUserStorageId(userId) {
+    const user = db.prepare('SELECT default_storage_id FROM users WHERE id = ?').get(userId);
+    return (user && user.default_storage_id) || 'internal';
+}
+
+// Configure multer for file uploads — saves to the user's assigned storage
+const multerStorage = multer.diskStorage({
     destination: (req, file, cb) => {
-        // Create user-specific directory
-        const userDir = path.join(STORAGE_DIR, String(req.user.userId));
+        const userId = req.user.userId;
+        const storageId = getUserStorageId(userId);
+
+        // Check storage source is active
+        if (storageId !== 'internal') {
+            const source = db.prepare('SELECT is_active, path FROM storage_sources WHERE id = ?').get(storageId);
+            if (!source || !source.is_active || !fs.existsSync(source.path)) {
+                // Fallback to internal if external drive unavailable
+                req._storageSourceId = 'internal';
+                const userDir = path.join(DEFAULT_STORAGE_DIR, String(userId));
+                if (!fs.existsSync(userDir)) fs.mkdirSync(userDir, { recursive: true });
+                return cb(null, userDir);
+            }
+        }
+
+        req._storageSourceId = storageId;
+        const userDir = getStorageBasePath(storageId, userId);
         if (!fs.existsSync(userDir)) {
             fs.mkdirSync(userDir, { recursive: true });
         }
@@ -56,11 +107,115 @@ const storage = multer.diskStorage({
 });
 
 const upload = multer({
-    storage,
+    storage: multerStorage,
     limits: {
         fileSize: 100 * 1024 * 1024 // 100MB limit
     }
 });
+
+/**
+ * UPLOAD RATE LIMITER (fully dynamic — admin-configurable)
+ * -------------------
+ * Custom rate limiter for uploads that reads BOTH max and window from DB.
+ * Same approach as the global limiters in server.js.
+ */
+function getUploadSetting(key, fallback) {
+    const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
+    return row ? parseInt(row.value, 10) : fallback;
+}
+
+const uploadHits = new Map(); // IP -> [timestamp, ...]
+const uploadLimiter = (req, res, next) => {
+    // Skip CORS preflight
+    if (req.method === 'OPTIONS') return next();
+
+    const max = getUploadSetting('rate_limit_upload_max', 10);
+    const windowMinutes = getUploadSetting('rate_limit_upload_window', 15);
+    const windowMs = windowMinutes * 60 * 1000;
+    const ip = req.ip;
+    const now = Date.now();
+
+    const timestamps = (uploadHits.get(ip) || []).filter(t => now - t < windowMs);
+
+    if (timestamps.length >= max) {
+        uploadHits.set(ip, timestamps);
+    
+        // Drain the request body before responding — if we respond 429 before the
+        // browser finishes sending file data, the browser sees a connection error
+        // ("Failed to fetch") instead of our JSON error message.
+        const sendError = () => {
+            res.status(429).json({
+                error: `Too many uploads. You've hit the limit of ${max} uploads. Please wait ${windowMinutes} minute(s) before uploading again.`
+            });
+        };
+
+        req.on('data', () => {}); // consume and discard incoming data
+        req.on('end', sendError);
+        // Safety timeout in case 'end' never fires (e.g., client disconnected)
+        setTimeout(() => {
+            if (!res.headersSent) sendError();
+        }, 5000);
+        return;
+    }
+
+    timestamps.push(now);
+    uploadHits.set(ip, timestamps);
+    next();
+};
+
+/**
+ * PRIORITY UPLOAD QUEUE
+ * ---------------------
+ * Processes file uploads one at a time (concurrency: 1) to:
+ *   1. Prevent SQLite write contention (only one write at a time)
+ *   2. Prevent the Pi's disk/CPU from being overwhelmed
+ *   3. Allow admin uploads to be processed before regular user uploads
+ *
+ * HOW PRIORITY WORKS (using fastq's unshift/push):
+ *   - Admin uploads use queue.unshift() → added to the FRONT of the queue (VIP)
+ *   - Regular user uploads use queue.push() → added to the BACK of the queue
+ *   - This means: if 3 regular uploads are waiting and an admin upload arrives,
+ *     the admin upload jumps to the front and gets processed next
+ *
+ * The upload request waits in the queue until it's processed,
+ * then returns the result — so the frontend needs NO changes.
+ */
+function uploadWorker(task, callback) {
+    // This function is called by fastq when it's this task's turn
+    // We process the upload and call the callback with the result
+    try {
+        const { userId, parentId, files, storageSourceId } = task;
+        const uploadedFiles = [];
+
+        for (const file of files) {
+            const fileType = getFileType(file.mimetype);
+
+            const result = db.prepare(`
+                INSERT INTO files (user_id, name, path, type, size, mime_type, parent_id, storage_source_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            `).run(
+                userId,
+                file.originalname,
+                file.filename,
+                fileType,
+                file.size,
+                file.mimetype,
+                parentId,
+                storageSourceId || 'internal'
+            );
+
+            const uploaded = db.prepare('SELECT * FROM files WHERE id = ?').get(result.lastInsertRowid);
+            uploadedFiles.push(uploaded);
+        }
+
+        callback(null, uploadedFiles);
+    } catch (error) {
+        callback(error);
+    }
+}
+
+// Create the queue: concurrency = 1 (one upload processed at a time)
+const uploadQueue = fastq(uploadWorker, 1);
 
 /**
  * AUTH MIDDLEWARE
@@ -77,8 +232,8 @@ function requireAuth(req, res, next) {
         const token = authHeader.split(' ')[1];
         const decoded = jwt.verify(token, JWT_SECRET);
 
-        // Validate token_version against database
-        const user = db.prepare('SELECT token_version FROM users WHERE id = ?').get(decoded.userId);
+        // Validate token_version against database and fetch admin status
+        const user = db.prepare('SELECT token_version, is_admin FROM users WHERE id = ?').get(decoded.userId);
         
         if (!user) {
             return res.status(401).json({ error: 'User not found' });
@@ -91,7 +246,8 @@ function requireAuth(req, res, next) {
             return res.status(401).json({ error: 'Token expired or invalidated' });
         }
 
-        req.user = decoded;
+        // Attach user info including admin status (used by priority queue)
+        req.user = { ...decoded, is_admin: user.is_admin };
         next();
     } catch (error) {
         if (error.name === 'JsonWebTokenError') {
@@ -283,12 +439,23 @@ router.post('/folder', requireAuth, (req, res) => {
 
 /**
  * POST /api/files/upload
- * Upload one or more files
+ * Upload one or more files — processed through priority queue
+ *
+ * HOW IT WORKS:
+ * 1. Multer saves the file to disk (temp storage)
+ * 2. We add a task to the priority queue
+ * 3. The queue processes it when it's this task's turn
+ * 4. We return the result to the frontend
+ *
+ * PRIORITY:
+ * - Admin uploads → priority 1 (processed first)
+ * - Regular user  → priority 10 (processed after admins)
  */
-router.post('/upload', requireAuth, upload.array('files', 10), (req, res) => {
+router.post('/upload', uploadLimiter, requireAuth, upload.array('files', 10), async (req, res) => {
     try {
         const userId = req.user.userId;
         const parentId = req.body.parent_id || null;
+        const isAdmin = req.user.is_admin === 1;
 
         if (!req.files || req.files.length === 0) {
             return res.status(400).json({ error: 'No files uploaded' });
@@ -304,27 +471,25 @@ router.post('/upload', requireAuth, upload.array('files', 10), (req, res) => {
             }
         }
 
-        const uploadedFiles = [];
+        // Determine upload priority and add to queue
+        // Admin uploads go to the FRONT (unshift), regular users go to the BACK (push)
+        const queueMethod = isAdmin ? 'unshift' : 'push';
 
-        for (const file of req.files) {
-            const fileType = getFileType(file.mimetype);
-            
-            const result = db.prepare(`
-                INSERT INTO files (user_id, name, path, type, size, mime_type, parent_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            `).run(
-                userId,
-                file.originalname,
-                file.filename, // UUID filename
-                fileType,
-                file.size,
-                file.mimetype,
-                parentId
+        console.log(`📋 Upload queued: ${req.files.length} file(s) from ${req.user.username} (position: ${isAdmin ? 'FRONT (admin)' : 'BACK (regular)'})`);
+
+        // Add to priority queue and WAIT for the result
+        // The request stays open until the queue processes this task
+        const uploadedFiles = await new Promise((resolve, reject) => {
+            uploadQueue[queueMethod](
+                { userId, parentId, files: req.files, storageSourceId: req._storageSourceId },
+                (err, result) => {
+                    if (err) reject(err);
+                    else resolve(result);
+                }
             );
+        });
 
-            const uploaded = db.prepare('SELECT * FROM files WHERE id = ?').get(result.lastInsertRowid);
-            uploadedFiles.push(uploaded);
-        }
+        console.log(`✅ Upload complete: ${uploadedFiles.length} file(s) from ${req.user.username}`);
 
         res.status(201).json({
             message: `${uploadedFiles.length} file(s) uploaded successfully`,
@@ -333,7 +498,7 @@ router.post('/upload', requireAuth, upload.array('files', 10), (req, res) => {
     } catch (error) {
         console.error('Upload error:', error);
 
-        // CLEANUP - delete uploaded files if DB insert failed
+        // CLEANUP - delete uploaded files if processing failed
         if (req.files) {
             req.files.forEach(file => {
                 if (file.path && fs.existsSync(file.path)) {
@@ -397,7 +562,7 @@ router.get('/:id/preview', (req, res) => {
             return res.status(404).json({ error: 'File not found' });
         }
 
-        const filePath = path.join(STORAGE_DIR, String(userId), file.path);
+        const filePath = resolveFilePath(file);
 
         if (!fs.existsSync(filePath)) {
             return res.status(404).json({ error: 'File not found on disk' });
@@ -439,7 +604,7 @@ router.get('/:id/download', requireAuth, (req, res) => {
             return res.status(404).json({ error: 'File not found' });
         }
 
-        const filePath = path.join(STORAGE_DIR, String(userId), file.path);
+        const filePath = resolveFilePath(file);
 
         if (!fs.existsSync(filePath)) {
             return res.status(404).json({ error: 'File not found on disk' });
@@ -692,7 +857,7 @@ router.delete('/:id/permanent', requireAuth, (req, res) => {
 
         // Delete physical file if it's not a folder
         if (file.type !== 'folder' && file.path) {
-            const filePath = path.join(STORAGE_DIR, String(userId), file.path);
+            const filePath = resolveFilePath(file);
             if (fs.existsSync(filePath)) {
                 fs.unlinkSync(filePath);
             }
@@ -701,12 +866,12 @@ router.delete('/:id/permanent', requireAuth, (req, res) => {
         // If folder, delete all children first
         if (file.type === 'folder') {
             const deleteChildren = (parentId) => {
-                const children = db.prepare('SELECT id, type, path FROM files WHERE parent_id = ?').all(parentId);
+                const children = db.prepare('SELECT id, type, path, storage_source_id FROM files WHERE parent_id = ?').all(parentId);
                 for (const child of children) {
                     if (child.type === 'folder') {
                         deleteChildren(child.id);
                     } else if (child.path) {
-                        const childPath = path.join(STORAGE_DIR, String(userId), child.path);
+                        const childPath = resolveFilePath({ ...child, user_id: userId, storage_source_id: child.storage_source_id });
                         if (fs.existsSync(childPath)) {
                             fs.unlinkSync(childPath);
                         }
@@ -723,6 +888,66 @@ router.delete('/:id/permanent', requireAuth, (req, res) => {
         res.json({ message: 'Permanently deleted' });
     } catch (error) {
         console.error('Permanent delete error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+/**
+ * GET /api/files/storage-stats
+ * Returns aggregate storage statistics (total bytes, used bytes) across all active storage sources.
+ */
+router.get('/storage-stats', requireAuth, (req, res) => {
+    try {
+        const sources = db.prepare('SELECT id, path, type, total_bytes FROM storage_sources WHERE is_active = 1').all();
+        
+        let totalSystemBytes = 0;
+        let freeSystemBytes = 0;
+
+        for (const source of sources) {
+            let is_accessible = false;
+            try {
+                is_accessible = fs.existsSync(source.path);
+            } catch (e) {
+                is_accessible = false;
+            }
+
+            if (is_accessible) {
+                try {
+                    const stats = fs.statfsSync(source.path);
+                    const total = stats.bsize * stats.blocks;
+                    const free = stats.bsize * stats.bavail;
+                    totalSystemBytes += total;
+                    freeSystemBytes += free;
+                } catch (e) {
+                    // Fallback to database totals if statfs fails
+                    // Get DB used bytes
+                    const dbUsed = db.prepare('SELECT COALESCE(SUM(size), 0) as used FROM files WHERE storage_source_id = ? AND type != \'folder\'').get(source.id).used;
+                    totalSystemBytes += source.total_bytes || 0;
+                    freeSystemBytes += Math.max(0, (source.total_bytes || 0) - dbUsed);
+                }
+            }
+        }
+
+        // If for some reason we missed internal storage (e.g. not in DB yet), handle it:
+        if (sources.length === 0) {
+            try {
+                const stats = fs.statfsSync(DEFAULT_STORAGE_DIR);
+                totalSystemBytes = stats.bsize * stats.blocks;
+                freeSystemBytes = stats.bsize * stats.bavail;
+            } catch (e) {
+                // Ignore
+            }
+        }
+
+        const usedSystemBytes = totalSystemBytes - freeSystemBytes;
+        
+        res.json({
+            totalBytes: totalSystemBytes,
+            usedBytes: usedSystemBytes > 0 ? usedSystemBytes : 0
+        });
+
+    } catch (error) {
+        console.error('Storage stats error:', error);
         res.status(500).json({ error: 'Server error' });
     }
 });

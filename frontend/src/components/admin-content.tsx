@@ -17,6 +17,13 @@ import {
     Check,
     X,
     KeyRound,
+    HardDrive,
+    Usb,
+    RefreshCw,
+    Plug,
+    Unplug,
+    AlertTriangle,
+    CircleDot,
 } from "lucide-react"
 import {
     Dialog,
@@ -37,13 +44,36 @@ import {
     AlertDialogTitle,
     AlertDialogTrigger,
 } from "@/components/ui/alert-dialog"
+import {
+    Select,
+    SelectContent,
+    SelectItem,
+    SelectTrigger,
+    SelectValue,
+} from "@/components/ui/select"
 import { Checkbox } from "@/components/ui/checkbox"
 import { useAuth } from "@/contexts/auth-context"
-import { getUsers, createUser, deleteUser, adminResetPassword, type User } from "@/lib/api"
+import { 
+    getUsers, 
+    createUser, 
+    deleteUser, 
+    adminResetPassword,
+    getStorageSources,
+    updateUserStorage,
+    scanDrives,
+    mountDrive,
+    unmountDrive,
+    addStorageSource,
+    type User,
+    type StorageSource,
+    type DetectedDrive,
+    type RegisteredSource,
+} from "@/lib/api"
 
 export function AdminContent() {
     const { user: currentUser } = useAuth()
     const [users, setUsers] = useState<User[]>([])
+    const [storageSources, setStorageSources] = useState<StorageSource[]>([])
     const [isLoading, setIsLoading] = useState(true)
     const [error, setError] = useState<string | null>(null)
     
@@ -64,11 +94,25 @@ export function AdminContent() {
     const [isResetting, setIsResetting] = useState(false)
     const [resetMessage, setResetMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null)
 
+    // Drive management state
+    const [detectedDrives, setDetectedDrives] = useState<DetectedDrive[]>([])
+    const [registeredDriveSources, setRegisteredDriveSources] = useState<RegisteredSource[]>([])
+    const [isScanning, setIsScanning] = useState(false)
+    const [mountingDevice, setMountingDevice] = useState<string | null>(null)
+    const [unmountingDevice, setUnmountingDevice] = useState<string | null>(null)
+    const [driveMessage, setDriveMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null)
+    const [platformMessage, setPlatformMessage] = useState<string | null>(null)
+    const [registeringDevice, setRegisteringDevice] = useState<string | null>(null)
+
     const loadUsers = async () => {
         try {
             setIsLoading(true)
-            const response = await getUsers()
-            setUsers(response.users)
+            const [usersRes, storageRes] = await Promise.all([
+                getUsers(),
+                getStorageSources().catch(() => ({ sources: [] }))
+            ])
+            setUsers(usersRes.users)
+            setStorageSources(storageRes.sources)
             setError(null)
         } catch (err) {
             setError(err instanceof Error ? err.message : "Failed to load users")
@@ -108,6 +152,16 @@ export function AdminContent() {
             loadUsers()
         } catch (err) {
             setError(err instanceof Error ? err.message : "Failed to delete user")
+        }
+    }
+
+    const handleStorageChange = async (userId: number, storageId: string) => {
+        try {
+            await updateUserStorage(userId, storageId)
+            // Optionally could show a success toast here
+            setUsers(users.map(u => u.id === userId ? { ...u, default_storage_id: storageId } : u))
+        } catch (err) {
+            setError(err instanceof Error ? err.message : "Failed to assign storage")
         }
     }
 
@@ -157,6 +211,76 @@ export function AdminContent() {
         if (currentUser.id !== 1) return false // Only super admin
         if (user.id === currentUser.id) return false // Use profile page instead
         return true
+    }
+
+    // ===== Drive Management Handlers =====
+
+    const handleScanDrives = async () => {
+        setIsScanning(true)
+        setDriveMessage(null)
+        setPlatformMessage(null)
+        try {
+            const result = await scanDrives()
+            setDetectedDrives(result.drives)
+            setRegisteredDriveSources(result.registeredSources)
+            if (result.message) {
+                setPlatformMessage(result.message)
+            }
+            if (result.drives.length === 0 && !result.message) {
+                setDriveMessage({ type: 'success', text: 'Scan complete. No removable drives detected.' })
+            }
+        } catch (err) {
+            setDriveMessage({ type: 'error', text: err instanceof Error ? err.message : 'Failed to scan drives' })
+        } finally {
+            setIsScanning(false)
+        }
+    }
+
+    const handleMount = async (device: string) => {
+        setMountingDevice(device)
+        setDriveMessage(null)
+        try {
+            const result = await mountDrive(device)
+            setDriveMessage({ type: 'success', text: result.message })
+            // Rescan to refresh the state
+            await handleScanDrives()
+        } catch (err) {
+            setDriveMessage({ type: 'error', text: err instanceof Error ? err.message : 'Failed to mount drive' })
+        } finally {
+            setMountingDevice(null)
+        }
+    }
+
+    const handleUnmount = async (device: string) => {
+        setUnmountingDevice(device)
+        setDriveMessage(null)
+        try {
+            const result = await unmountDrive(device)
+            setDriveMessage({ type: 'success', text: result.message })
+            // Rescan to refresh the state
+            await handleScanDrives()
+        } catch (err) {
+            setDriveMessage({ type: 'error', text: err instanceof Error ? err.message : 'Failed to unmount drive' })
+        } finally {
+            setUnmountingDevice(null)
+        }
+    }
+
+    const handleRegister = async (drive: DetectedDrive) => {
+        if (!drive.mountpoint) return
+        setRegisteringDevice(drive.device)
+        setDriveMessage(null)
+        try {
+            const label = drive.label || drive.model || `USB Drive (${drive.name})`
+            await addStorageSource(drive.mountpoint, label)
+            setDriveMessage({ type: 'success', text: `"${label}" registered as storage source!` })
+            // Rescan drives + reload storage sources
+            await Promise.all([handleScanDrives(), loadUsers()])
+        } catch (err) {
+            setDriveMessage({ type: 'error', text: err instanceof Error ? err.message : 'Failed to register drive' })
+        } finally {
+            setRegisteringDevice(null)
+        }
     }
 
     if (!currentUser?.is_admin) {
@@ -307,7 +431,30 @@ export function AdminContent() {
                                             </div>
                                         </div>
                                     </div>
-                                    <div className="flex items-center gap-1">
+                                    <div className="flex items-center gap-4">
+                                        <div className="w-[140px] hidden sm:block">
+                                            <Select 
+                                                value={user.default_storage_id || 'internal'} 
+                                                onValueChange={(val) => handleStorageChange(user.id, val)}
+                                            >
+                                                <SelectTrigger className="h-8 text-xs">
+                                                    <SelectValue placeholder="Select storage" />
+                                                </SelectTrigger>
+                                                <SelectContent>
+                                                    {storageSources.map(source => (
+                                                        <SelectItem key={source.id} value={source.id} className="text-xs">
+                                                            {source.label}
+                                                        </SelectItem>
+                                                    ))}
+                                                    {storageSources.length === 0 && (
+                                                        <SelectItem value={user.default_storage_id || 'internal'} className="text-xs">
+                                                            Internal Storage
+                                                        </SelectItem>
+                                                    )}
+                                                </SelectContent>
+                                            </Select>
+                                        </div>
+                                        <div className="flex items-center gap-1">
                                         {canResetPassword(user) && (
                                             <Button 
                                                 variant="ghost" 
@@ -346,6 +493,7 @@ export function AdminContent() {
                                                 </AlertDialogContent>
                                             </AlertDialog>
                                         )}
+                                        </div>
                                     </div>
                                 </div>
                             ))}
@@ -353,6 +501,211 @@ export function AdminContent() {
                     )}
                 </CardContent>
             </Card>
+
+            {/* Storage Manager — Super Admin only */}
+            {currentUser?.id === 1 && (
+                <Card>
+                    <CardHeader>
+                        <div className="flex items-center justify-between">
+                            <div>
+                                <CardTitle className="flex items-center gap-2">
+                                    <HardDrive className="h-5 w-5" />
+                                    Storage Manager
+                                </CardTitle>
+                                <CardDescription>Detect, mount, and manage USB drives</CardDescription>
+                            </div>
+                            <Button
+                                variant="outline"
+                                className="gap-2"
+                                onClick={handleScanDrives}
+                                disabled={isScanning}
+                            >
+                                {isScanning ? (
+                                    <Loader2 className="h-4 w-4 animate-spin" />
+                                ) : (
+                                    <RefreshCw className="h-4 w-4" />
+                                )}
+                                Scan Drives
+                            </Button>
+                        </div>
+                    </CardHeader>
+                    <CardContent className="space-y-4">
+                        {/* Drive message */}
+                        {driveMessage && (
+                            <div className={`p-3 rounded-lg flex items-center gap-2 text-sm ${
+                                driveMessage.type === 'success'
+                                    ? 'bg-green-500/10 border border-green-500/50 text-green-400'
+                                    : 'bg-destructive/10 border border-destructive/50 text-destructive'
+                            }`}>
+                                {driveMessage.type === 'success' ? <Check className="h-4 w-4" /> : <X className="h-4 w-4" />}
+                                {driveMessage.text}
+                            </div>
+                        )}
+
+                        {/* Platform message */}
+                        {platformMessage && (
+                            <div className="p-3 rounded-lg bg-amber-500/10 border border-amber-500/50 text-amber-400 flex items-center gap-2 text-sm">
+                                <AlertTriangle className="h-4 w-4" />
+                                {platformMessage}
+                            </div>
+                        )}
+
+                        {/* Detected Drives */}
+                        {detectedDrives.length > 0 && (
+                            <div className="space-y-3">
+                                <h4 className="text-sm font-medium text-muted-foreground">Detected USB Drives</h4>
+                                {detectedDrives.map((drive) => (
+                                    <div
+                                        key={drive.device}
+                                        className="p-4 rounded-lg bg-secondary flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+                                    >
+                                        <div className="flex items-center gap-3">
+                                            <div className="p-2 rounded-lg bg-primary/10">
+                                                <Usb className="h-5 w-5 text-primary" />
+                                            </div>
+                                            <div>
+                                                <div className="flex items-center gap-2 flex-wrap">
+                                                    <p className="font-medium text-sm">{drive.label || drive.model}</p>
+                                                    <Badge variant="outline" className="text-xs">{drive.device}</Badge>
+                                                    {drive.fstype && (
+                                                        <Badge
+                                                            variant="outline"
+                                                            className={`text-xs ${
+                                                                drive.fstype === 'ntfs' || drive.fstype === 'ntfs3'
+                                                                    ? 'border-amber-500/50 text-amber-400'
+                                                                    : drive.fstype === 'ext4'
+                                                                    ? 'border-green-500/50 text-green-400'
+                                                                    : ''
+                                                            }`}
+                                                        >
+                                                            {drive.fstype}
+                                                        </Badge>
+                                                    )}
+                                                    {drive.isMounted && (
+                                                        <Badge className="bg-green-500/20 text-green-400 text-xs">
+                                                            <CircleDot className="h-3 w-3 mr-1" />Mounted
+                                                        </Badge>
+                                                    )}
+                                                    {drive.isRegistered && (
+                                                        <Badge className="bg-primary/20 text-primary text-xs">
+                                                            <Check className="h-3 w-3 mr-1" />Registered
+                                                        </Badge>
+                                                    )}
+                                                </div>
+                                                <p className="text-xs text-muted-foreground mt-1">
+                                                    {drive.size} • {drive.model}
+                                                    {drive.mountpoint && ` • ${drive.mountpoint}`}
+                                                </p>
+                                                {drive.fsWarning && (
+                                                    <p className="text-xs text-amber-400 mt-1 flex items-center gap-1">
+                                                        <AlertTriangle className="h-3 w-3" />
+                                                        {drive.fsWarning}
+                                                    </p>
+                                                )}
+                                            </div>
+                                        </div>
+                                        <div className="flex items-center gap-2">
+                                            {!drive.isMounted ? (
+                                                <Button
+                                                    size="sm"
+                                                    className="gap-1"
+                                                    onClick={() => handleMount(drive.device)}
+                                                    disabled={mountingDevice === drive.device}
+                                                >
+                                                    {mountingDevice === drive.device ? (
+                                                        <Loader2 className="h-3 w-3 animate-spin" />
+                                                    ) : (
+                                                        <Plug className="h-3 w-3" />
+                                                    )}
+                                                    Mount
+                                                </Button>
+                                            ) : (
+                                                <>
+                                                    {!drive.isRegistered && drive.mountpoint && (
+                                                        <Button
+                                                            size="sm"
+                                                            variant="outline"
+                                                            className="gap-1"
+                                                            onClick={() => handleRegister(drive)}
+                                                            disabled={registeringDevice === drive.device}
+                                                        >
+                                                            {registeringDevice === drive.device ? (
+                                                                <Loader2 className="h-3 w-3 animate-spin" />
+                                                            ) : (
+                                                                <HardDrive className="h-3 w-3" />
+                                                            )}
+                                                            Register
+                                                        </Button>
+                                                    )}
+                                                    <Button
+                                                        size="sm"
+                                                        variant="destructive"
+                                                        className="gap-1"
+                                                        onClick={() => handleUnmount(drive.device)}
+                                                        disabled={unmountingDevice === drive.device}
+                                                    >
+                                                        {unmountingDevice === drive.device ? (
+                                                            <Loader2 className="h-3 w-3 animate-spin" />
+                                                        ) : (
+                                                            <Unplug className="h-3 w-3" />
+                                                        )}
+                                                        Eject
+                                                    </Button>
+                                                </>
+                                            )}
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+
+                        {/* Registered Sources */}
+                        {registeredDriveSources.length > 0 && (
+                            <div className="space-y-3">
+                                <h4 className="text-sm font-medium text-muted-foreground">Registered Storage Sources</h4>
+                                {registeredDriveSources.map((src) => (
+                                    <div
+                                        key={src.id}
+                                        className="p-3 rounded-lg bg-secondary/50 flex items-center justify-between"
+                                    >
+                                        <div className="flex items-center gap-3">
+                                            <HardDrive className={`h-4 w-4 ${
+                                                src.status === 'online' ? 'text-green-400' :
+                                                src.status === 'offline' ? 'text-destructive' :
+                                                'text-amber-400'
+                                            }`} />
+                                            <div>
+                                                <p className="text-sm font-medium">{src.label}</p>
+                                                <p className="text-xs text-muted-foreground">{src.path}</p>
+                                            </div>
+                                        </div>
+                                        <Badge
+                                            variant="outline"
+                                            className={`text-xs ${
+                                                src.status === 'online' ? 'border-green-500/50 text-green-400' :
+                                                src.status === 'offline' ? 'border-destructive/50 text-destructive' :
+                                                'border-amber-500/50 text-amber-400'
+                                            }`}
+                                        >
+                                            {src.status === 'online' ? 'Online' :
+                                             src.status === 'offline' ? 'Offline (Unplugged)' :
+                                             'Detected'}
+                                        </Badge>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+
+                        {/* Empty state */}
+                        {detectedDrives.length === 0 && registeredDriveSources.length === 0 && !isScanning && !platformMessage && (
+                            <div className="text-center py-8 text-muted-foreground">
+                                <Usb className="h-10 w-10 mx-auto mb-3 opacity-50" />
+                                <p className="text-sm">Click "Scan Drives" to detect USB drives</p>
+                            </div>
+                        )}
+                    </CardContent>
+                </Card>
+            )}
 
             {/* Reset Password Dialog */}
             <Dialog open={resetDialogOpen} onOpenChange={setResetDialogOpen}>

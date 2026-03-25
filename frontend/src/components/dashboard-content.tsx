@@ -9,7 +9,6 @@ import {
     Video,
     Music,
     Archive,
-    Folder,
     Cpu,
     MemoryStick,
     Server,

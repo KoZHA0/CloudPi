@@ -805,6 +805,34 @@ router.post('/drives/mount', requireAdmin, async (req, res) => {
             }
         } catch (e) { /* not critical */ }
 
+        // Automatically reactivate if it was previously registered
+        let reactivated = false;
+        try {
+            // Check by .cloudpi-id file
+            const idFile = path.join(mountpoint, '.cloudpi-id');
+            if (fs.existsSync(idFile)) {
+                const content = fs.readFileSync(idFile, 'utf8');
+                const match = content.match(/drive_id=(.+)/);
+                if (match) {
+                    const driveId = match[1].trim();
+                    db.prepare('UPDATE storage_sources SET is_active = 1, path = ? WHERE id = ?').run(mountpoint, driveId);
+                    console.log(`💾 Auto-reactivated registered drive: ${driveId} at ${mountpoint}`);
+                    reactivated = true;
+                }
+            }
+
+            // Fallback: check by matching the mountpoint path
+            if (!reactivated) {
+                const existing = db.prepare('SELECT id FROM storage_sources WHERE path = ?').get(mountpoint);
+                if (existing) {
+                    db.prepare('UPDATE storage_sources SET is_active = 1 WHERE id = ?').run(existing.id);
+                    console.log(`💾 Auto-reactivated registered drive by path: ${existing.id}`);
+                }
+            }
+        } catch (e) {
+            console.error('Failed to auto-reactivate drive:', e.message);
+        }
+
         res.json({
             message: `Drive mounted successfully at ${mountpoint}`,
             mountpoint,

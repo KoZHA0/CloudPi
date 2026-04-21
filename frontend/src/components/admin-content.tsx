@@ -64,6 +64,7 @@ import {
     mountDrive,
     unmountDrive,
     addStorageSource,
+    removeStorageSource,
     type User,
     type StorageSource,
     type DetectedDrive,
@@ -280,6 +281,20 @@ export function AdminContent() {
             setDriveMessage({ type: 'error', text: err instanceof Error ? err.message : 'Failed to register drive' })
         } finally {
             setRegisteringDevice(null)
+        }
+    }
+
+    const handleRemoveStorage = async (id: string, label: string) => {
+        if (!confirm(`Are you sure you want to unregister "${label}"? This will not delete any files on the drive, but it can no longer be used by CloudPi.`)) return
+        
+        setDriveMessage(null)
+        try {
+            const result = await removeStorageSource(id)
+            setDriveMessage({ type: 'success', text: result.message })
+            // Refresh
+            await Promise.all([handleScanDrives(), loadUsers()])
+        } catch (err) {
+            setDriveMessage({ type: 'error', text: err instanceof Error ? err.message : 'Failed to remove storage source' })
         }
     }
 
@@ -679,18 +694,29 @@ export function AdminContent() {
                                                 <p className="text-xs text-muted-foreground">{src.path}</p>
                                             </div>
                                         </div>
-                                        <Badge
-                                            variant="outline"
-                                            className={`text-xs ${
-                                                src.status === 'online' ? 'border-green-500/50 text-green-400' :
-                                                src.status === 'offline' ? 'border-destructive/50 text-destructive' :
-                                                'border-amber-500/50 text-amber-400'
-                                            }`}
-                                        >
-                                            {src.status === 'online' ? 'Online' :
-                                             src.status === 'offline' ? 'Offline (Unplugged)' :
-                                             'Detected'}
-                                        </Badge>
+                                        <div className="flex items-center gap-2">
+                                            <Badge
+                                                variant="outline"
+                                                className={`text-xs ${
+                                                    src.status === 'online' ? 'border-green-500/50 text-green-400' :
+                                                    src.status === 'offline' ? 'border-destructive/50 text-destructive' :
+                                                    'border-amber-500/50 text-amber-400'
+                                                }`}
+                                            >
+                                                {src.status === 'online' ? 'Online' :
+                                                 src.status === 'offline' ? 'Offline (Unplugged)' :
+                                                 'Detected'}
+                                            </Badge>
+                                            <Button 
+                                                variant="ghost" 
+                                                size="sm" 
+                                                className="h-8 w-8 p-0 text-muted-foreground hover:text-destructive"
+                                                onClick={() => handleRemoveStorage(src.id, src.label)}
+                                                title="Unregister storage source"
+                                            >
+                                                <Trash2 className="h-4 w-4" />
+                                            </Button>
+                                        </div>
                                     </div>
                                 ))}
                             </div>

@@ -161,12 +161,16 @@ app.use('/api/shares', shareRoutes);
 const dashboardRoutes = require('./routes/dashboard');
 app.use('/api/dashboard', dashboardRoutes);
 
-// Start server
-const PORT = 3001;
-app.listen(PORT, () => {
-  console.log('');
-  console.log('🚀 CloudPi Backend Server Started!');
-  console.log(`   URL: http://localhost:${PORT}`);
-  console.log(`   Test: http://localhost:${PORT}/api/test`);
-  console.log('');
-});
+// Start server (only when run directly, not when imported by tests)
+if (require.main === module) {
+  const PORT = 3001;
+  app.listen(PORT, () => {
+    console.log('');
+    console.log('🚀 CloudPi Backend Server Started!');
+    console.log(`   URL: http://localhost:${PORT}`);
+    console.log(`   Test: http://localhost:${PORT}/api/test`);
+    console.log('');
+  });
+}
+
+module.exports = { app, getSetting, createDynamicLimiter };

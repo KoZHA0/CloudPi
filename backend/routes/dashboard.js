@@ -11,7 +11,7 @@
 const express = require('express');
 const os = require('os');
 const fs = require('fs');
-const { execSync } = require('child_process');
+const childProcess = require('child_process');
 const jwt = require('jsonwebtoken');
 const db = require('../database/db');
 
@@ -142,7 +142,7 @@ function getDiskUsage() {
     try {
         if (process.platform === 'win32') {
             // Windows: use wmic
-            const output = execSync('wmic logicaldisk where "DeviceID=\'C:\'" get Size,FreeSpace /format:csv', {
+            const output = childProcess.execSync('wmic logicaldisk where "DeviceID=\'C:\'" get Size,FreeSpace /format:csv', {
                 encoding: 'utf8',
                 timeout: 5000
             });
@@ -159,7 +159,7 @@ function getDiskUsage() {
             };
         } else {
             // Linux/Mac: use df
-            const output = execSync("df -B1 / | tail -1", {
+            const output = childProcess.execSync("df -B1 / | tail -1", {
                 encoding: 'utf8',
                 timeout: 5000
             });
@@ -276,3 +276,10 @@ router.get('/health', requireAuth, (req, res) => {
 });
 
 module.exports = router;
+module.exports.__test__ = {
+    getCpuUsage,
+    getDiskUsage,
+    getCpuTemperature,
+    getNetworkInfo,
+    resetCpuBaseline: () => { prevCpuInfo = null; }
+};

@@ -11,7 +11,7 @@ const {
   getCpuTemperature,
   getNetworkInfo,
   resetCpuBaseline
-} = dashboardRoute.__test__;
+} = dashboardRoute.testHelpers;
 
 test('getCpuUsage returns baseline 0 on first call then computes usage', () => {
   const originalCpus = os.cpus;

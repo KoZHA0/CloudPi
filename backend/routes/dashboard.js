@@ -276,7 +276,7 @@ router.get('/health', requireAuth, (req, res) => {
 });
 
 module.exports = router;
-module.exports.__test__ = {
+module.exports.testHelpers = {
     getCpuUsage,
     getDiskUsage,
     getCpuTemperature,

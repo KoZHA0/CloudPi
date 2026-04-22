@@ -88,17 +88,16 @@ test('dynamic limiter allows within limit and blocks above limit', () => {
   const windowKey = 'test_rate_limit_window';
   upsertSetting(maxKey, 2);
   upsertSetting(windowKey, 1);
+  const fixedNow = 1_000_000;
 
   const limiter = createDynamicLimiter({
     maxKey,
     maxDefault: 100,
     windowKey,
     windowDefault: 15,
-    errorPrefix: 'Too many requests.'
+    errorPrefix: 'Too many requests.',
+    nowProvider: () => fixedNow
   });
-
-  const originalNow = Date.now;
-  Date.now = () => 1_000_000;
 
   try {
     const req = { method: 'GET', path: '/api/test', ip: '10.0.0.1' };
@@ -123,7 +122,6 @@ test('dynamic limiter allows within limit and blocks above limit', () => {
     assert.equal(blockedRes.statusCode, 429);
     assert.match(blockedRes.body.error, /hit the limit of 2/);
   } finally {
-    Date.now = originalNow;
     removeSetting(maxKey);
     removeSetting(windowKey);
   }

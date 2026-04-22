@@ -56,7 +56,7 @@ function getSetting(key, fallback) {
 }
 
 // Factory: creates a dynamic rate limiter middleware
-function createDynamicLimiter({ maxKey, maxDefault, windowKey, windowDefault, errorPrefix, skipPaths = [] }) {
+function createDynamicLimiter({ maxKey, maxDefault, windowKey, windowDefault, errorPrefix, skipPaths = [], nowProvider = Date.now }) {
   const hits = new Map(); // IP -> [timestamp, timestamp, ...]
 
   return (req, res, next) => {
@@ -70,7 +70,7 @@ function createDynamicLimiter({ maxKey, maxDefault, windowKey, windowDefault, er
     const windowMinutes = getSetting(windowKey, windowDefault);
     const windowMs = windowMinutes * 60 * 1000;
     const ip = req.ip;
-    const now = Date.now();
+    const now = nowProvider();
 
     // Get existing timestamps and filter out expired ones
     const timestamps = (hits.get(ip) || []).filter(t => now - t < windowMs);

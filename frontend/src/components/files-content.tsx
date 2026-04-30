@@ -316,10 +316,11 @@ export function FilesContent() {
         }
     }
 
-    // Download
+    // Download (supports both files and folders — folders download as ZIP)
     async function handleDownload(file: FileItem) {
         try {
-            await downloadFile(file.id, file.name)
+            const fileName = file.type === 'folder' ? `${file.name}.zip` : file.name
+            await downloadFile(file.id, fileName)
         } catch (err) {
             setError(err instanceof Error ? err.message : "Download failed")
         }
@@ -771,9 +772,16 @@ export function FilesContent() {
                                             </DropdownMenuTrigger>
                                             <DropdownMenuContent align="end">
                                                 {file.type === "folder" ? (
-                                                    <DropdownMenuItem onClick={() => handleFileClick(file)}>
-                                                        Open
-                                                    </DropdownMenuItem>
+                                                    <>
+                                                        <DropdownMenuItem onClick={() => handleFileClick(file)}>
+                                                            <FolderOpen className="h-4 w-4 mr-2" />
+                                                            Open
+                                                        </DropdownMenuItem>
+                                                        <DropdownMenuItem onClick={() => handleDownload(file)}>
+                                                            <Download className="h-4 w-4 mr-2" />
+                                                            Download as ZIP
+                                                        </DropdownMenuItem>
+                                                    </>
                                                 ) : (
                                                     <>
                                                         <DropdownMenuItem onClick={() => openPreview(file)}>
@@ -905,9 +913,16 @@ export function FilesContent() {
                                             </DropdownMenuTrigger>
                                             <DropdownMenuContent align="end">
                                                 {file.type === "folder" ? (
-                                                    <DropdownMenuItem onClick={() => handleFileClick(file)}>
-                                                        Open
-                                                    </DropdownMenuItem>
+                                                    <>
+                                                        <DropdownMenuItem onClick={() => handleFileClick(file)}>
+                                                            <FolderOpen className="h-4 w-4 mr-2" />
+                                                            Open
+                                                        </DropdownMenuItem>
+                                                        <DropdownMenuItem onClick={() => handleDownload(file)}>
+                                                            <Download className="h-4 w-4 mr-2" />
+                                                            Download as ZIP
+                                                        </DropdownMenuItem>
+                                                    </>
                                                 ) : (
                                                     <>
                                                         <DropdownMenuItem onClick={() => openPreview(file)}>

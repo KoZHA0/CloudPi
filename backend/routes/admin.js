@@ -14,9 +14,13 @@
  * POST   /api/admin/storage            - Register external drive
  * PUT    /api/admin/storage/:id        - Update storage source
  * DELETE /api/admin/storage/:id        - Remove storage source
- * GET    /api/admin/drives             - Scan for removable USB drives
- * POST   /api/admin/drives/mount       - Mount a drive (udisksctl)
- * POST   /api/admin/drives/unmount     - Safely unmount/eject a drive
+ * GET    /api/admin/drives             - Detect auto-mounted USB drives
+ *
+ * ARCHITECTURE NOTE:
+ * Drive management follows the Nextcloud pattern (Separation of Concerns).
+ * The host OS handles USB mounting automatically (via udisks2/usbmount).
+ * This backend only reads the filesystem to detect what's already mounted.
+ * No shell commands (lsblk, mount, umount) are executed — no root needed.
  */
 
 const express = require('express');
@@ -26,11 +30,11 @@ const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const db = require('../database/db');
+const { JWT_SECRET, SALT_ROUNDS } = require('../utils/auth-config');
+const cryptoUtils = require('../utils/crypto-utils');
+const { sendEmail } = require('../utils/mailer');
 
 const router = express.Router();
-
-const JWT_SECRET = 'cloudpi-secret-key-change-this-in-production';
-const SALT_ROUNDS = 10;
 
 /**
  * ADMIN MIDDLEWARE
@@ -79,10 +83,18 @@ function requireAdmin(req, res, next) {
 router.get('/users', requireAdmin, (req, res) => {
     try {
         const users = db.prepare(
-            'SELECT id, username, is_admin, default_storage_id, created_at FROM users ORDER BY created_at DESC'
+            'SELECT id, username, email, is_admin, is_disabled, failed_login_attempts, locked_until, default_storage_id, storage_quota, created_at FROM users ORDER BY created_at DESC'
         ).all();
 
-        res.json({ users });
+        // Calculate used bytes for each user
+        const enriched = users.map(user => {
+            const usedRow = db.prepare(
+                "SELECT COALESCE(SUM(size), 0) as used FROM files WHERE user_id = ? AND trashed = 0 AND type != 'folder'"
+            ).get(user.id);
+            return { ...user, used_bytes: usedRow.used || 0 };
+        });
+
+        res.json({ users: enriched });
     } catch (error) {
         console.error('List users error:', error);
         res.status(500).json({ error: 'Server error' });
@@ -95,7 +107,7 @@ router.get('/users', requireAdmin, (req, res) => {
  */
 router.post('/users', requireAdmin, async (req, res) => {
     try {
-        const { username, password, isAdmin = false } = req.body;
+        const { username, password, email, isAdmin = false } = req.body;
 
         // Validate required fields
         if (!username || !password) {
@@ -121,14 +133,15 @@ router.post('/users', requireAdmin, async (req, res) => {
 
         // Insert new user
         const result = db.prepare(
-            'INSERT INTO users (username, password, is_admin) VALUES (?, ?, ?)'
-        ).run(username, hashedPassword, isAdmin ? 1 : 0);
+            'INSERT INTO users (username, password, email, is_admin) VALUES (?, ?, ?, ?)'
+        ).run(username, hashedPassword, email || null, isAdmin ? 1 : 0);
 
         res.status(201).json({
             message: 'User created successfully',
             user: {
                 id: result.lastInsertRowid,
                 username,
+                email: email || null,
                 is_admin: isAdmin ? 1 : 0
             }
         });
@@ -232,6 +245,43 @@ router.put('/users/:id/storage', requireAdmin, (req, res) => {
 });
 
 /**
+ * PUT /api/admin/users/:id/quota
+ * Sets a storage quota for a user (Super Admin only)
+ * Body: { quota_mb: 500 } — quota in MB, or 0/null for unlimited
+ */
+router.put('/users/:id/quota', requireAdmin, (req, res) => {
+    try {
+        const currentUserId = req.user.userId;
+        if (currentUserId !== 1) {
+            return res.status(403).json({ error: 'Only the Super Admin can set quotas' });
+        }
+
+        const userId = parseInt(req.params.id);
+        const { quota_mb } = req.body;
+
+        const user = db.prepare('SELECT id, username FROM users WHERE id = ?').get(userId);
+        if (!user) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        // Convert MB to bytes, or NULL for unlimited
+        const quotaBytes = (quota_mb && quota_mb > 0) ? Math.round(quota_mb * 1024 * 1024) : null;
+
+        db.prepare('UPDATE users SET storage_quota = ? WHERE id = ?').run(quotaBytes, userId);
+
+        console.log(`📊 Set quota for ${user.username}: ${quota_mb ? quota_mb + ' MB' : 'Unlimited'}`);
+
+        res.json({
+            message: `Quota ${quota_mb ? `set to ${quota_mb} MB` : 'removed (unlimited)'} for ${user.username}`,
+            storage_quota: quotaBytes,
+        });
+    } catch (error) {
+        console.error('Set quota error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+/**
  * DELETE /api/admin/users/:id
  * Deletes a user (admin only)
  * 
@@ -284,6 +334,117 @@ router.delete('/users/:id', requireAdmin, (req, res) => {
 });
 
 /**
+ * PUT /api/admin/users/:id/disable
+ * Disable or enable a user account (Super Admin only)
+ * Body: { disabled: true/false }
+ */
+router.put('/users/:id/disable', requireAdmin, (req, res) => {
+    try {
+        const currentUserId = req.user.userId;
+        if (currentUserId !== 1) {
+            return res.status(403).json({ error: 'Only the Super Admin can disable/enable users' });
+        }
+
+        const userId = parseInt(req.params.id);
+        const { disabled } = req.body;
+
+        // Cannot disable yourself or the super admin
+        if (userId === 1) {
+            return res.status(400).json({ error: 'Cannot disable the Super Admin' });
+        }
+        if (userId === currentUserId) {
+            return res.status(400).json({ error: 'Cannot disable your own account' });
+        }
+
+        const user = db.prepare('SELECT id, username FROM users WHERE id = ?').get(userId);
+        if (!user) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        db.prepare('UPDATE users SET is_disabled = ? WHERE id = ?').run(disabled ? 1 : 0, userId);
+
+        // If disabling, also invalidate their tokens
+        if (disabled) {
+            const currentVersion = db.prepare('SELECT token_version FROM users WHERE id = ?').get(userId);
+            db.prepare('UPDATE users SET token_version = ? WHERE id = ?')
+                .run((currentVersion?.token_version || 1) + 1, userId);
+        }
+
+        console.log(`${disabled ? '🚫' : '✅'} User ${user.username} ${disabled ? 'disabled' : 'enabled'} by Super Admin`);
+
+        res.json({
+            message: `User ${user.username} ${disabled ? 'disabled' : 'enabled'} successfully`,
+            is_disabled: disabled ? 1 : 0
+        });
+    } catch (error) {
+        console.error('Disable user error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+/**
+ * PUT /api/admin/users/:id/role
+ * Toggle admin status for a user (Super Admin only)
+ * Body: { is_admin: true/false }
+ */
+router.put('/users/:id/role', requireAdmin, (req, res) => {
+    try {
+        const currentUserId = req.user.userId;
+        if (currentUserId !== 1) {
+            return res.status(403).json({ error: 'Only the Super Admin can change user roles' });
+        }
+
+        const userId = parseInt(req.params.id);
+        const { is_admin } = req.body;
+
+        if (userId === 1) {
+            return res.status(400).json({ error: 'Cannot change the Super Admin role' });
+        }
+
+        const user = db.prepare('SELECT id, username FROM users WHERE id = ?').get(userId);
+        if (!user) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        db.prepare('UPDATE users SET is_admin = ? WHERE id = ?').run(is_admin ? 1 : 0, userId);
+
+        console.log(`🔐 User ${user.username} ${is_admin ? 'promoted to admin' : 'demoted to user'} by Super Admin`);
+
+        res.json({
+            message: `${user.username} is now ${is_admin ? 'an Admin' : 'a regular User'}`,
+            is_admin: is_admin ? 1 : 0
+        });
+    } catch (error) {
+        console.error('Change role error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+/**
+ * PUT /api/admin/users/:id/unlock
+ * Unlock a locked account (Admin only)
+ */
+router.put('/users/:id/unlock', requireAdmin, (req, res) => {
+    try {
+        const userId = parseInt(req.params.id);
+
+        const user = db.prepare('SELECT id, username, locked_until FROM users WHERE id = ?').get(userId);
+        if (!user) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        db.prepare('UPDATE users SET failed_login_attempts = 0, locked_until = NULL WHERE id = ?').run(userId);
+
+        console.log(`🔓 Account ${user.username} unlocked by admin`);
+
+        res.json({ message: `Account ${user.username} unlocked successfully` });
+    } catch (error) {
+        console.error('Unlock user error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+/**
  * GET /api/admin/settings
  * Returns all configurable settings (admin only)
  */
@@ -329,29 +490,68 @@ router.put('/settings', requireAdmin, (req, res) => {
         }
 
         // Allowed setting keys (whitelist to prevent injection)
-        const allowedKeys = [
+        const allowedNumericKeys = [
             'rate_limit_api_max', 'rate_limit_api_window',
             'rate_limit_auth_max', 'rate_limit_auth_window',
             'rate_limit_upload_max', 'rate_limit_upload_window',
+            'encryption_enabled',
+            'password_min_length',
+            'account_lockout_attempts', 'account_lockout_duration',
+        ];
+        
+        const allowedStringKeys = [
+            'smtp_host', 'smtp_port', 'smtp_user', 'smtp_pass', 'smtp_from_email'
         ];
 
         const updateStmt = db.prepare('UPDATE settings SET value = ? WHERE key = ?');
         const updated = [];
 
         for (const [key, value] of Object.entries(settings)) {
-            if (!allowedKeys.includes(key)) {
+            if (!allowedNumericKeys.includes(key) && !allowedStringKeys.includes(key)) {
                 return res.status(400).json({ error: `Unknown setting: ${key}` });
             }
 
-            // Validate numeric values
-            const numValue = parseInt(value, 10);
-            if (isNaN(numValue) || numValue < 1 || numValue > 1000) {
-                return res.status(400).json({ 
-                    error: `Invalid value for ${key}: must be a number between 1 and 1000` 
-                });
+            let finalValue = value;
+
+            if (allowedNumericKeys.includes(key)) {
+                // Validate numeric values
+                const numValue = parseInt(value, 10);
+                if (isNaN(numValue) || numValue < 0 || numValue > 1000) {
+                    return res.status(400).json({ 
+                        error: `Invalid value for ${key}: must be a number between 0 and 1000` 
+                    });
+                }
+                finalValue = String(numValue);
+            } else if (allowedStringKeys.includes(key)) {
+                finalValue = String(value);
+                
+                // If it's the SMTP password and encryption is enabled globally, encrypt it!
+                // Wait, cryptoUtils.encryptFileBuffer takes a buffer. 
+                // We can just use node crypto if we want a simple string encryption.
+                // Let's use cryptoUtils.encryptString if it exists, otherwise manual or plain.
+                // Let's implement manual AES encryption here using the CLOUDPI_ENCRYPTION_KEY to keep it simple.
+            }
+            
+            // Handle smtp_pass encryption
+            if (key === 'smtp_pass' && finalValue.length > 0 && finalValue !== '********') {
+                 const crypto = require('crypto');
+                 const ENCRYPTION_KEY = process.env.CLOUDPI_ENCRYPTION_KEY;
+                 if (ENCRYPTION_KEY && ENCRYPTION_KEY.length === 64) {
+                     const iv = crypto.randomBytes(16);
+                     const cipher = crypto.createCipheriv('aes-256-cbc', Buffer.from(ENCRYPTION_KEY, 'hex'), iv);
+                     let encrypted = cipher.update(finalValue);
+                     encrypted = Buffer.concat([encrypted, cipher.final()]);
+                     finalValue = iv.toString('hex') + ':' + encrypted.toString('hex');
+                 } else {
+                     // Fallback to base64 if no key configured (not great, but better than nothing)
+                     finalValue = Buffer.from(finalValue).toString('base64');
+                 }
+            } else if (key === 'smtp_pass' && finalValue === '********') {
+                // Do not update the password if the UI sent back the mask!
+                continue;
             }
 
-            updateStmt.run(String(numValue), key);
+            updateStmt.run(finalValue, key);
             updated.push(key);
         }
 
@@ -365,6 +565,77 @@ router.put('/settings', requireAdmin, (req, res) => {
     }
 });
 
+/**
+ * POST /api/admin/settings/test-smtp
+ * Test SMTP configuration without saving it
+ */
+router.post('/settings/test-smtp', requireAdmin, async (req, res) => {
+    try {
+        const { smtp_host, smtp_port, smtp_user, smtp_pass, smtp_from_email } = req.body;
+        
+        if (!smtp_host || !smtp_port) {
+            return res.status(400).json({ error: 'SMTP Host and Port are required' });
+        }
+        
+        const nodemailer = require('nodemailer');
+        
+        // If password is masked, fetch the real one from DB
+        let actualPass = smtp_pass;
+        if (actualPass === '********') {
+            const dbPass = db.prepare("SELECT value FROM settings WHERE key = 'smtp_pass'").get();
+            if (dbPass && dbPass.value) {
+                // Decrypt it
+                const val = dbPass.value;
+                if (val.includes(':')) {
+                    const crypto = require('crypto');
+                    const ENCRYPTION_KEY = process.env.CLOUDPI_ENCRYPTION_KEY;
+                    if (ENCRYPTION_KEY && ENCRYPTION_KEY.length === 64) {
+                        const textParts = val.split(':');
+                        const iv = Buffer.from(textParts.shift(), 'hex');
+                        const encryptedText = Buffer.from(textParts.join(':'), 'hex');
+                        const decipher = crypto.createDecipheriv('aes-256-cbc', Buffer.from(ENCRYPTION_KEY, 'hex'), iv);
+                        let decrypted = decipher.update(encryptedText);
+                        decrypted = Buffer.concat([decrypted, decipher.final()]);
+                        actualPass = decrypted.toString();
+                    }
+                } else {
+                    actualPass = Buffer.from(val, 'base64').toString('ascii');
+                }
+            }
+        }
+
+        const transporter = nodemailer.createTransport({
+            host: smtp_host,
+            port: parseInt(smtp_port, 10),
+            secure: parseInt(smtp_port, 10) === 465,
+            auth: smtp_user ? {
+                user: smtp_user,
+                pass: actualPass,
+            } : undefined,
+        });
+        
+        // Get the super admin's email to send the test to
+        const adminUser = db.prepare('SELECT email FROM users WHERE id = ?').get(req.user.userId);
+        const toEmail = adminUser?.email || smtp_user;
+        
+        if (!toEmail) {
+            return res.status(400).json({ error: 'Please set your admin account email first to receive the test' });
+        }
+
+        await transporter.sendMail({
+            from: `"${smtp_from_email || 'CloudPi Test'}" <${smtp_user || 'no-reply@cloudpi'}>`,
+            to: toEmail,
+            subject: 'CloudPi: SMTP Test Successful',
+            text: 'Your SMTP configuration in CloudPi is working perfectly!',
+        });
+
+        res.json({ message: 'Test email sent successfully to ' + toEmail });
+
+    } catch (error) {
+        console.error('SMTP test error:', error);
+        res.status(500).json({ error: 'SMTP Test Failed: ' + error.message });
+    }
+});
 // ============================================
 // STORAGE SOURCE MANAGEMENT (Super Admin only)
 // ============================================
@@ -600,19 +871,25 @@ router.delete('/storage/:id', requireAdmin, (req, res) => {
     }
 });
 
-// DRIVE DETECTION & MANAGEMENT (Super Admin only)
+// DRIVE DETECTION (Super Admin only)
+// ================================================
+// Architecture: Follows the Nextcloud pattern (Separation of Concerns).
+// The host OS handles USB mounting automatically (via udisks2/usbmount).
+// This backend only reads the filesystem to detect what's already mounted.
+// No shell commands (lsblk, mount, umount) are executed — no root needed.
 // ================================================
 
-const { exec } = require('child_process');
-const { promisify } = require('util');
-const execAsync = promisify(exec);
-
-const isLinux = process.platform === 'linux';
+// Path where the host OS auto-mounts USB drives
+// - Raspberry Pi OS (desktop): /media/pi
+// - Headless Pi with usbmount: /media/usb0, /media/usb1, etc.
+// - Docker: set via CLOUDPI_EXTERNAL_DRIVES_PATH env var
+const EXTERNAL_DRIVES_PATH = process.env.CLOUDPI_EXTERNAL_DRIVES_PATH
+    || (process.platform === 'linux' ? '/media/pi' : null);
 
 /**
  * GET /api/admin/drives
- * Scans the system for removable drives using lsblk.
- * Returns detected drives with mount status, UUID, model, label, and filesystem.
+ * Scans the external drives directory for auto-mounted USB drives.
+ * No shell commands — just reads the filesystem.
  * Cross-references with storage_sources to show registered status.
  * Also detects "dirty unplug" — registered drives that are no longer present.
  */
@@ -623,107 +900,96 @@ router.get('/drives', requireAdmin, async (req, res) => {
             return res.status(403).json({ error: 'Only the Super Admin can manage drives' });
         }
 
-        if (!isLinux) {
+        // Get all registered storage sources from DB
+        const registeredSources = db.prepare(
+            "SELECT id, label, path, type, is_active FROM storage_sources WHERE type = 'external'"
+        ).all();
+
+        // If no external drives path configured (e.g., Windows dev)
+        if (!EXTERNAL_DRIVES_PATH) {
             return res.json({
                 drives: [],
-                registeredSources: [],
+                registeredSources: registeredSources.map(s => ({
+                    ...s,
+                    status: fs.existsSync(s.path) ? 'online' : 'offline'
+                })),
                 platform: process.platform,
                 message: 'Drive detection is only available on Linux (Raspberry Pi)'
             });
         }
 
-        // Get block devices with full info including UUID
-        const { stdout } = await execAsync(
-            'lsblk -J -o NAME,SIZE,FSTYPE,MOUNTPOINT,RM,TYPE,LABEL,MODEL,UUID,HOTPLUG',
-            { timeout: 10000 } // 10s timeout for slow VPN connections
-        );
-
-        const lsblkData = JSON.parse(stdout);
         const drives = [];
 
-        // Get all registered storage sources from DB
-        const registeredSources = db.prepare(
-            'SELECT id, label, path, type, is_active FROM storage_sources WHERE type = \'external\''
-        ).all();
+        // Scan the external drives directory for auto-mounted USB drives
+        let entries = [];
+        try {
+            entries = fs.readdirSync(EXTERNAL_DRIVES_PATH, { withFileTypes: true });
+        } catch (e) {
+            // Directory doesn't exist or isn't accessible
+            return res.json({
+                drives: [],
+                registeredSources: registeredSources.map(s => ({
+                    ...s,
+                    status: fs.existsSync(s.path) ? 'online' : 'offline'
+                })),
+                platform: process.platform,
+                message: `External drives path not accessible: ${EXTERNAL_DRIVES_PATH}`
+            });
+        }
 
-        // Parse lsblk output — find removable devices (RM=1 or HOTPLUG=1)
-        for (const device of lsblkData.blockdevices || []) {
-            // Only look at disks that are removable
-            if (device.type === 'disk' && (device.rm === true || device.rm === '1' || device.hotplug === true || device.hotplug === '1')) {
-                // Get partitions (children)
-                const partitions = device.children || [];
+        for (const entry of entries) {
+            if (!entry.isDirectory()) continue;
 
-                if (partitions.length === 0) {
-                    // Unpartitioned drive
-                    drives.push({
-                        device: `/dev/${device.name}`,
-                        name: device.name,
-                        size: device.size,
-                        fstype: device.fstype || null,
-                        mountpoint: device.mountpoint || null,
-                        label: device.label || null,
-                        model: device.model || 'Unknown Device',
-                        uuid: device.uuid || null,
-                        isMounted: !!device.mountpoint,
-                        isRegistered: false,
-                        registeredId: null,
-                        fsWarning: null,
-                    });
-                } else {
-                    for (const part of partitions) {
-                        // Check if this partition is registered in our DB (by UUID or mountpoint)
-                        let isRegistered = false;
-                        let registeredId = null;
+            const drivePath = path.join(EXTERNAL_DRIVES_PATH, entry.name);
 
-                        for (const src of registeredSources) {
-                            // Check if the mountpoint matches the registered path
-                            if (part.mountpoint && src.path === part.mountpoint) {
-                                isRegistered = true;
-                                registeredId = src.id;
-                                break;
-                            }
-                            // Also check by reading .cloudpi-id from the mountpoint
-                            if (part.mountpoint) {
-                                try {
-                                    const idFile = path.join(part.mountpoint, '.cloudpi-id');
-                                    if (fs.existsSync(idFile)) {
-                                        const content = fs.readFileSync(idFile, 'utf8');
-                                        const match = content.match(/drive_id=(.+)/);
-                                        if (match && match[1].trim() === src.id) {
-                                            isRegistered = true;
-                                            registeredId = src.id;
-                                            break;
-                                        }
-                                    }
-                                } catch (e) { /* ignore */ }
-                            }
+            // Check if registered in our DB
+            let isRegistered = false;
+            let registeredId = null;
+
+            // Check by .cloudpi-id file first
+            try {
+                const idFile = path.join(drivePath, '.cloudpi-id');
+                if (fs.existsSync(idFile)) {
+                    const content = fs.readFileSync(idFile, 'utf8');
+                    const match = content.match(/drive_id=(.+)/);
+                    if (match) {
+                        const driveId = match[1].trim();
+                        const src = registeredSources.find(s => s.id === driveId);
+                        if (src) {
+                            isRegistered = true;
+                            registeredId = driveId;
                         }
-
-                        // NTFS warning
-                        let fsWarning = null;
-                        if (part.fstype === 'ntfs' || part.fstype === 'ntfs3') {
-                            fsWarning = 'NTFS may have lower performance on Linux. ext4 is recommended.';
-                        } else if (part.fstype === 'exfat') {
-                            fsWarning = 'exFAT works but lacks Linux permission support.';
-                        }
-
-                        drives.push({
-                            device: `/dev/${part.name}`,
-                            name: part.name,
-                            size: part.size || device.size,
-                            fstype: part.fstype || null,
-                            mountpoint: part.mountpoint || null,
-                            label: part.label || null,
-                            model: device.model || 'Unknown Device',
-                            uuid: part.uuid || null,
-                            isMounted: !!part.mountpoint,
-                            isRegistered,
-                            registeredId,
-                            fsWarning,
-                        });
                     }
                 }
+            } catch (e) { /* ignore */ }
+
+            // Fallback: check by path match
+            if (!isRegistered) {
+                const src = registeredSources.find(s => s.path === drivePath);
+                if (src) {
+                    isRegistered = true;
+                    registeredId = src.id;
+                }
             }
+
+            // Get disk space info
+            let totalBytes = 0, freeBytes = 0;
+            try {
+                const stats = fs.statfsSync(drivePath);
+                totalBytes = stats.bsize * stats.blocks;
+                freeBytes = stats.bsize * stats.bavail;
+            } catch (e) { /* not critical */ }
+
+            drives.push({
+                name: entry.name,
+                path: drivePath,
+                size: totalBytes,
+                freeBytes,
+                label: entry.name,
+                isMounted: true,  // It's in the directory, so it's auto-mounted
+                isRegistered,
+                registeredId,
+            });
         }
 
         // Dirty unplug detection: check registered sources that aren't in the detected drives
@@ -735,6 +1001,15 @@ router.get('/drives', requireAdmin, async (req, res) => {
                 status: isAccessible ? 'online' : (isPresent ? 'detected' : 'offline'),
             };
         });
+
+        // Auto-reactivate registered drives that reappeared
+        for (const drive of drives) {
+            if (drive.isRegistered && drive.registeredId) {
+                db.prepare(
+                    'UPDATE storage_sources SET is_active = 1, path = ? WHERE id = ? AND is_active = 0'
+                ).run(drive.path, drive.registeredId);
+            }
+        }
 
         res.json({
             drives,
@@ -748,174 +1023,4 @@ router.get('/drives', requireAdmin, async (req, res) => {
     }
 });
 
-/**
- * POST /api/admin/drives/mount
- * Mounts a drive using udisksctl (non-root, async).
- * Body: { device: "/dev/sda1" }
- * Optionally auto-registers the drive in storage_sources.
- */
-router.post('/drives/mount', requireAdmin, async (req, res) => {
-    try {
-        const currentUserId = req.user.userId;
-        if (currentUserId !== 1) {
-            return res.status(403).json({ error: 'Only the Super Admin can mount drives' });
-        }
-
-        if (!isLinux) {
-            return res.status(400).json({ error: 'Drive mounting is only available on Linux' });
-        }
-
-        const { device } = req.body;
-        if (!device || !device.startsWith('/dev/')) {
-            return res.status(400).json({ error: 'Invalid device path' });
-        }
-
-        // Safety: only allow mounting removable devices (sd*, mmcblk partitions)
-        const deviceName = path.basename(device);
-        if (!deviceName.match(/^(sd[a-z]\d*|mmcblk\d+p\d+)$/)) {
-            return res.status(400).json({ error: 'Only removable storage devices can be mounted' });
-        }
-
-        console.log(`💾 Mounting ${device}...`);
-
-        // Use udisksctl for non-root mounting
-        const { stdout } = await execAsync(`udisksctl mount -b ${device}`, { timeout: 30000 });
-
-        // Parse the mountpoint from udisksctl output
-        // Output format: "Mounted /dev/sda1 at /media/root/DRIVE_LABEL."
-        const mountMatch = stdout.match(/at (.+?)\.?\s*$/);
-        const mountpoint = mountMatch ? mountMatch[1].trim() : null;
-
-        if (!mountpoint) {
-            return res.status(500).json({ error: 'Drive mounted but could not determine mount point', raw: stdout });
-        }
-
-        console.log(`💾 Mounted ${device} at ${mountpoint}`);
-
-        // Get drive info for the response
-        let driveInfo = {};
-        try {
-            const { stdout: lsblkOut } = await execAsync(
-                `lsblk -J -o NAME,SIZE,FSTYPE,LABEL,UUID -n ${device}`,
-                { timeout: 5000 }
-            );
-            const parsed = JSON.parse(lsblkOut);
-            if (parsed.blockdevices && parsed.blockdevices[0]) {
-                driveInfo = parsed.blockdevices[0];
-            }
-        } catch (e) { /* not critical */ }
-
-        // Automatically reactivate if it was previously registered
-        let reactivated = false;
-        try {
-            // Check by .cloudpi-id file
-            const idFile = path.join(mountpoint, '.cloudpi-id');
-            if (fs.existsSync(idFile)) {
-                const content = fs.readFileSync(idFile, 'utf8');
-                const match = content.match(/drive_id=(.+)/);
-                if (match) {
-                    const driveId = match[1].trim();
-                    db.prepare('UPDATE storage_sources SET is_active = 1, path = ? WHERE id = ?').run(mountpoint, driveId);
-                    console.log(`💾 Auto-reactivated registered drive: ${driveId} at ${mountpoint}`);
-                    reactivated = true;
-                }
-            }
-
-            // Fallback: check by matching the mountpoint path
-            if (!reactivated) {
-                const existing = db.prepare('SELECT id FROM storage_sources WHERE path = ?').get(mountpoint);
-                if (existing) {
-                    db.prepare('UPDATE storage_sources SET is_active = 1 WHERE id = ?').run(existing.id);
-                    console.log(`💾 Auto-reactivated registered drive by path: ${existing.id}`);
-                }
-            }
-        } catch (e) {
-            console.error('Failed to auto-reactivate drive:', e.message);
-        }
-
-        res.json({
-            message: `Drive mounted successfully at ${mountpoint}`,
-            mountpoint,
-            device,
-            label: driveInfo.label || null,
-            uuid: driveInfo.uuid || null,
-            fstype: driveInfo.fstype || null,
-        });
-
-    } catch (error) {
-        console.error('Mount error:', error);
-        // Parse udisksctl error messages
-        const errMsg = error.stderr || error.message;
-        if (errMsg.includes('already mounted')) {
-            return res.status(400).json({ error: 'Drive is already mounted' });
-        }
-        if (errMsg.includes('not authorized') || errMsg.includes('Not authorized')) {
-            return res.status(403).json({
-                error: 'Permission denied. Run: sudo usermod -aG disk $USER && sudo reboot'
-            });
-        }
-        res.status(500).json({ error: `Failed to mount: ${errMsg}` });
-    }
-});
-
-/**
- * POST /api/admin/drives/unmount
- * Safely unmounts a drive using udisksctl.
- * Body: { device: "/dev/sda1" }
- * Marks the storage source as inactive if registered.
- */
-router.post('/drives/unmount', requireAdmin, async (req, res) => {
-    try {
-        const currentUserId = req.user.userId;
-        if (currentUserId !== 1) {
-            return res.status(403).json({ error: 'Only the Super Admin can unmount drives' });
-        }
-
-        if (!isLinux) {
-            return res.status(400).json({ error: 'Drive unmounting is only available on Linux' });
-        }
-
-        const { device } = req.body;
-        if (!device || !device.startsWith('/dev/')) {
-            return res.status(400).json({ error: 'Invalid device path' });
-        }
-
-        console.log(`💾 Unmounting ${device}...`);
-
-        // Use udisksctl for safe unmount
-        await execAsync(`udisksctl unmount -b ${device}`, { timeout: 30000 });
-
-        console.log(`💾 Unmounted ${device} safely`);
-
-        // Check if this drive was registered and mark it inactive
-        // Find by looking at storage sources whose paths are now inaccessible
-        const sources = db.prepare(
-            'SELECT id, path FROM storage_sources WHERE type = \'external\' AND is_active = 1'
-        ).all();
-
-        for (const src of sources) {
-            if (!fs.existsSync(src.path)) {
-                db.prepare('UPDATE storage_sources SET is_active = 0 WHERE id = ?').run(src.id);
-                console.log(`💾 Marked storage ${src.id} as inactive (unmounted)`);
-            }
-        }
-
-        res.json({ message: `Drive ${device} unmounted safely. You can remove it now.` });
-
-    } catch (error) {
-        console.error('Unmount error:', error);
-        const errMsg = error.stderr || error.message;
-        if (errMsg.includes('not mounted')) {
-            return res.status(400).json({ error: 'Drive is not currently mounted' });
-        }
-        if (errMsg.includes('target is busy')) {
-            return res.status(400).json({
-                error: 'Drive is busy. Close any open files from this drive and try again.'
-            });
-        }
-        res.status(500).json({ error: `Failed to unmount: ${errMsg}` });
-    }
-});
-
 module.exports = router;
-

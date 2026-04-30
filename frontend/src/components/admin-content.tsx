@@ -24,6 +24,11 @@ import {
     Unplug,
     AlertTriangle,
     CircleDot,
+    Ban,
+    Lock,
+    Unlock,
+    ShieldCheck,
+    ShieldOff,
 } from "lucide-react"
 import {
     Dialog,
@@ -61,10 +66,12 @@ import {
     getStorageSources,
     updateUserStorage,
     scanDrives,
-    mountDrive,
-    unmountDrive,
     addStorageSource,
     removeStorageSource,
+    setUserQuota,
+    disableUser,
+    toggleUserRole,
+    unlockUser,
     type User,
     type StorageSource,
     type DetectedDrive,
@@ -84,6 +91,7 @@ export function AdminContent() {
     const [createMessage, setCreateMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null)
     const [newUser, setNewUser] = useState({
         username: "",
+        email: "",
         password: "",
         isAdmin: false,
     })
@@ -99,11 +107,13 @@ export function AdminContent() {
     const [detectedDrives, setDetectedDrives] = useState<DetectedDrive[]>([])
     const [registeredDriveSources, setRegisteredDriveSources] = useState<RegisteredSource[]>([])
     const [isScanning, setIsScanning] = useState(false)
-    const [mountingDevice, setMountingDevice] = useState<string | null>(null)
-    const [unmountingDevice, setUnmountingDevice] = useState<string | null>(null)
     const [driveMessage, setDriveMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null)
     const [platformMessage, setPlatformMessage] = useState<string | null>(null)
     const [registeringDevice, setRegisteringDevice] = useState<string | null>(null)
+
+    // Quota editing state
+    const [editingQuotaUserId, setEditingQuotaUserId] = useState<number | null>(null)
+    const [quotaInput, setQuotaInput] = useState("")
 
     const loadUsers = async () => {
         try {
@@ -129,12 +139,16 @@ export function AdminContent() {
     const handleCreateUser = async (e: React.FormEvent) => {
         e.preventDefault()
         setIsCreating(true)
-        setCreateMessage(null)
+        if (!newUser.username || !newUser.password) {
+            setCreateMessage({ type: 'error', text: 'Username and password are required' })
+            setIsCreating(false)
+            return
+        }
 
         try {
-            await createUser(newUser.username, newUser.password, newUser.isAdmin)
-            setCreateMessage({ type: 'success', text: 'User created successfully!' })
-            setNewUser({ username: "", password: "", isAdmin: false })
+            await createUser(newUser.username, newUser.password, newUser.email || undefined, newUser.isAdmin)
+            setCreateMessage({ type: 'success', text: 'User created successfully' })
+            setNewUser({ username: "", email: "", password: "", isAdmin: false })
             loadUsers()
             setTimeout(() => setCreateDialogOpen(false), 1500)
         } catch (err) {
@@ -237,43 +251,13 @@ export function AdminContent() {
         }
     }
 
-    const handleMount = async (device: string) => {
-        setMountingDevice(device)
-        setDriveMessage(null)
-        try {
-            const result = await mountDrive(device)
-            setDriveMessage({ type: 'success', text: result.message })
-            // Rescan to refresh the state
-            await handleScanDrives()
-        } catch (err) {
-            setDriveMessage({ type: 'error', text: err instanceof Error ? err.message : 'Failed to mount drive' })
-        } finally {
-            setMountingDevice(null)
-        }
-    }
-
-    const handleUnmount = async (device: string) => {
-        setUnmountingDevice(device)
-        setDriveMessage(null)
-        try {
-            const result = await unmountDrive(device)
-            setDriveMessage({ type: 'success', text: result.message })
-            // Rescan to refresh the state
-            await handleScanDrives()
-        } catch (err) {
-            setDriveMessage({ type: 'error', text: err instanceof Error ? err.message : 'Failed to unmount drive' })
-        } finally {
-            setUnmountingDevice(null)
-        }
-    }
-
     const handleRegister = async (drive: DetectedDrive) => {
-        if (!drive.mountpoint) return
-        setRegisteringDevice(drive.device)
+        if (!drive.path) return
+        setRegisteringDevice(drive.name)
         setDriveMessage(null)
         try {
-            const label = drive.label || drive.model || `USB Drive (${drive.name})`
-            await addStorageSource(drive.mountpoint, label)
+            const label = drive.label || `USB Drive (${drive.name})`
+            await addStorageSource(drive.path, label)
             setDriveMessage({ type: 'success', text: `"${label}" registered as storage source!` })
             // Rescan drives + reload storage sources
             await Promise.all([handleScanDrives(), loadUsers()])
@@ -296,6 +280,30 @@ export function AdminContent() {
         } catch (err) {
             setDriveMessage({ type: 'error', text: err instanceof Error ? err.message : 'Failed to remove storage source' })
         }
+    }
+
+    const handleQuotaChange = async (userId: number) => {
+        try {
+            const quotaMb = quotaInput.trim() === '' || quotaInput.trim() === '0' ? null : parseFloat(quotaInput)
+            await setUserQuota(userId, quotaMb)
+            setEditingQuotaUserId(null)
+            setQuotaInput('')
+            loadUsers()
+        } catch (err) {
+            setError(err instanceof Error ? err.message : 'Failed to set quota')
+        }
+    }
+
+    const formatQuota = (bytes: number | null | undefined) => {
+        if (!bytes) return 'Unlimited'
+        if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`
+        return `${(bytes / (1024 * 1024)).toFixed(0)} MB`
+    }
+
+    const formatUsed = (bytes: number | undefined) => {
+        if (!bytes) return '0 MB'
+        if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`
+        return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
     }
 
     if (!currentUser?.is_admin) {
@@ -354,6 +362,16 @@ export function AdminContent() {
                                             value={newUser.username}
                                             onChange={(e) => setNewUser({ ...newUser, username: e.target.value })}
                                             required
+                                        />
+                                    </div>
+                                    <div className="space-y-2">
+                                        <Label htmlFor="email">Email (Optional)</Label>
+                                        <Input
+                                            id="email"
+                                            type="email"
+                                            placeholder="user@example.com"
+                                            value={newUser.email}
+                                            onChange={(e) => setNewUser({ ...newUser, email: e.target.value })}
                                         />
                                     </div>
                                     <div className="space-y-2">
@@ -444,6 +462,25 @@ export function AdminContent() {
                                                     <Badge variant="secondary">You</Badge>
                                                 )}
                                             </div>
+                                            {user.email && (
+                                                <p className="text-xs text-muted-foreground mt-0.5">{user.email}</p>
+                                            )}
+                                            <div className="flex items-center gap-1 flex-wrap mt-1">
+                                                {/* Disabled badge */}
+                                                {user.is_disabled === 1 && (
+                                                    <Badge variant="outline" className="border-red-500/50 text-red-400 text-xs">
+                                                        <Ban className="h-3 w-3 mr-1" />
+                                                        Disabled
+                                                    </Badge>
+                                                )}
+                                                {/* Locked badge */}
+                                                {user.locked_until && new Date(user.locked_until) > new Date() && (
+                                                    <Badge variant="outline" className="border-amber-500/50 text-amber-400 text-xs">
+                                                        <Lock className="h-3 w-3 mr-1" />
+                                                        Locked
+                                                    </Badge>
+                                                )}
+                                            </div>
                                         </div>
                                     </div>
                                     <div className="flex items-center gap-4">
@@ -469,7 +506,108 @@ export function AdminContent() {
                                                 </SelectContent>
                                             </Select>
                                         </div>
+                                        {/* Quota */}
+                                        {currentUser?.id === 1 && (
+                                            <div className="hidden sm:flex items-center gap-1">
+                                                {editingQuotaUserId === user.id ? (
+                                                    <div className="flex items-center gap-1">
+                                                        <Input
+                                                            className="h-7 w-20 text-xs"
+                                                            placeholder="MB"
+                                                            value={quotaInput}
+                                                            onChange={(e) => setQuotaInput(e.target.value)}
+                                                            onKeyDown={(e) => {
+                                                                if (e.key === 'Enter') handleQuotaChange(user.id)
+                                                                if (e.key === 'Escape') setEditingQuotaUserId(null)
+                                                            }}
+                                                            autoFocus
+                                                        />
+                                                        <span className="text-[10px] text-muted-foreground">MB</span>
+                                                        <Button size="icon" variant="ghost" className="h-6 w-6" onClick={() => handleQuotaChange(user.id)}>
+                                                            <Check className="h-3 w-3" />
+                                                        </Button>
+                                                        <Button size="icon" variant="ghost" className="h-6 w-6" onClick={() => setEditingQuotaUserId(null)}>
+                                                            <X className="h-3 w-3" />
+                                                        </Button>
+                                                    </div>
+                                                ) : (
+                                                    <Button
+                                                        variant="ghost"
+                                                        className="h-7 px-2 text-xs text-muted-foreground hover:text-foreground"
+                                                        onClick={() => {
+                                                            setEditingQuotaUserId(user.id)
+                                                            setQuotaInput(
+                                                                user.storage_quota
+                                                                    ? String(Math.round(user.storage_quota / (1024 * 1024)))
+                                                                    : ''
+                                                            )
+                                                        }}
+                                                        title="Click to set storage quota"
+                                                    >
+                                                        <HardDrive className="h-3 w-3 mr-1" />
+                                                        {formatUsed(user.used_bytes)} / {formatQuota(user.storage_quota)}
+                                                    </Button>
+                                                )}
+                                            </div>
+                                        )}
                                         <div className="flex items-center gap-1">
+                                        {/* Toggle admin role — Super Admin only, not on self or super admin */}
+                                        {currentUser?.id === 1 && user.id !== 1 && user.id !== currentUser?.id && (
+                                            <Button
+                                                variant="ghost"
+                                                size="icon"
+                                                className={user.is_admin ? 'text-primary hover:text-primary/80' : 'text-muted-foreground hover:text-primary'}
+                                                onClick={async () => {
+                                                    try {
+                                                        await toggleUserRole(user.id, !user.is_admin)
+                                                        loadUsers()
+                                                    } catch (err) {
+                                                        setError(err instanceof Error ? err.message : 'Failed to change role')
+                                                    }
+                                                }}
+                                                title={user.is_admin ? 'Demote to User' : 'Promote to Admin'}
+                                            >
+                                                {user.is_admin ? <ShieldOff className="h-4 w-4" /> : <ShieldCheck className="h-4 w-4" />}
+                                            </Button>
+                                        )}
+                                        {/* Disable/Enable user — Super Admin only */}
+                                        {currentUser?.id === 1 && user.id !== 1 && user.id !== currentUser?.id && (
+                                            <Button
+                                                variant="ghost"
+                                                size="icon"
+                                                className={user.is_disabled ? 'text-green-500 hover:text-green-400' : 'text-muted-foreground hover:text-red-400'}
+                                                onClick={async () => {
+                                                    try {
+                                                        await disableUser(user.id, !user.is_disabled)
+                                                        loadUsers()
+                                                    } catch (err) {
+                                                        setError(err instanceof Error ? err.message : 'Failed to toggle user')
+                                                    }
+                                                }}
+                                                title={user.is_disabled ? 'Enable Account' : 'Disable Account'}
+                                            >
+                                                {user.is_disabled ? <Unlock className="h-4 w-4" /> : <Ban className="h-4 w-4" />}
+                                            </Button>
+                                        )}
+                                        {/* Unlock locked account */}
+                                        {user.locked_until && new Date(user.locked_until) > new Date() && (
+                                            <Button
+                                                variant="ghost"
+                                                size="icon"
+                                                className="text-amber-500 hover:text-amber-400"
+                                                onClick={async () => {
+                                                    try {
+                                                        await unlockUser(user.id)
+                                                        loadUsers()
+                                                    } catch (err) {
+                                                        setError(err instanceof Error ? err.message : 'Failed to unlock')
+                                                    }
+                                                }}
+                                                title="Unlock Account"
+                                            >
+                                                <Unlock className="h-4 w-4" />
+                                            </Button>
+                                        )}
                                         {canResetPassword(user) && (
                                             <Button 
                                                 variant="ghost" 
@@ -571,7 +709,7 @@ export function AdminContent() {
                                 <h4 className="text-sm font-medium text-muted-foreground">Detected USB Drives</h4>
                                 {detectedDrives.map((drive) => (
                                     <div
-                                        key={drive.device}
+                                        key={drive.name}
                                         className="p-4 rounded-lg bg-secondary flex flex-col sm:flex-row sm:items-center justify-between gap-3"
                                     >
                                         <div className="flex items-center gap-3">
@@ -580,22 +718,8 @@ export function AdminContent() {
                                             </div>
                                             <div>
                                                 <div className="flex items-center gap-2 flex-wrap">
-                                                    <p className="font-medium text-sm">{drive.label || drive.model}</p>
-                                                    <Badge variant="outline" className="text-xs">{drive.device}</Badge>
-                                                    {drive.fstype && (
-                                                        <Badge
-                                                            variant="outline"
-                                                            className={`text-xs ${
-                                                                drive.fstype === 'ntfs' || drive.fstype === 'ntfs3'
-                                                                    ? 'border-amber-500/50 text-amber-400'
-                                                                    : drive.fstype === 'ext4'
-                                                                    ? 'border-green-500/50 text-green-400'
-                                                                    : ''
-                                                            }`}
-                                                        >
-                                                            {drive.fstype}
-                                                        </Badge>
-                                                    )}
+                                                    <p className="font-medium text-sm">{drive.label}</p>
+                                                    <Badge variant="outline" className="text-xs">{drive.name}</Badge>
                                                     {drive.isMounted && (
                                                         <Badge className="bg-green-500/20 text-green-400 text-xs">
                                                             <CircleDot className="h-3 w-3 mr-1" />Mounted
@@ -608,65 +732,26 @@ export function AdminContent() {
                                                     )}
                                                 </div>
                                                 <p className="text-xs text-muted-foreground mt-1">
-                                                    {drive.size} • {drive.model}
-                                                    {drive.mountpoint && ` • ${drive.mountpoint}`}
+                                                    {formatQuota(drive.size)} • {drive.path}
                                                 </p>
-                                                {drive.fsWarning && (
-                                                    <p className="text-xs text-amber-400 mt-1 flex items-center gap-1">
-                                                        <AlertTriangle className="h-3 w-3" />
-                                                        {drive.fsWarning}
-                                                    </p>
-                                                )}
                                             </div>
                                         </div>
                                         <div className="flex items-center gap-2">
-                                            {!drive.isMounted ? (
+                                            {!drive.isRegistered && (
                                                 <Button
                                                     size="sm"
+                                                    variant="outline"
                                                     className="gap-1"
-                                                    onClick={() => handleMount(drive.device)}
-                                                    disabled={mountingDevice === drive.device}
+                                                    onClick={() => handleRegister(drive)}
+                                                    disabled={registeringDevice === drive.name}
                                                 >
-                                                    {mountingDevice === drive.device ? (
+                                                    {registeringDevice === drive.name ? (
                                                         <Loader2 className="h-3 w-3 animate-spin" />
                                                     ) : (
-                                                        <Plug className="h-3 w-3" />
+                                                        <HardDrive className="h-3 w-3" />
                                                     )}
-                                                    Mount
+                                                    Register
                                                 </Button>
-                                            ) : (
-                                                <>
-                                                    {!drive.isRegistered && drive.mountpoint && (
-                                                        <Button
-                                                            size="sm"
-                                                            variant="outline"
-                                                            className="gap-1"
-                                                            onClick={() => handleRegister(drive)}
-                                                            disabled={registeringDevice === drive.device}
-                                                        >
-                                                            {registeringDevice === drive.device ? (
-                                                                <Loader2 className="h-3 w-3 animate-spin" />
-                                                            ) : (
-                                                                <HardDrive className="h-3 w-3" />
-                                                            )}
-                                                            Register
-                                                        </Button>
-                                                    )}
-                                                    <Button
-                                                        size="sm"
-                                                        variant="destructive"
-                                                        className="gap-1"
-                                                        onClick={() => handleUnmount(drive.device)}
-                                                        disabled={unmountingDevice === drive.device}
-                                                    >
-                                                        {unmountingDevice === drive.device ? (
-                                                            <Loader2 className="h-3 w-3 animate-spin" />
-                                                        ) : (
-                                                            <Unplug className="h-3 w-3" />
-                                                        )}
-                                                        Eject
-                                                    </Button>
-                                                </>
                                             )}
                                         </div>
                                     </div>

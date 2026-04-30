@@ -4,11 +4,15 @@
  * Main entry point for the Express.js API server
  * 
  * WHAT THIS FILE DOES:
- * 1. Sets up Express with middleware (cors, json parsing)
- * 2. Imports the database connection (which creates tables)
- * 3. Mounts route handlers (will add more later)
- * 4. Starts the server on port 3001
+ * 1. Loads environment variables from .env
+ * 2. Sets up Express with middleware (cors, json parsing)
+ * 3. Imports the database connection (which creates tables)
+ * 4. Mounts route handlers
+ * 5. Starts the server on configured port
  */
+
+// Load environment variables from .env file (must be first!)
+require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
@@ -162,11 +166,12 @@ const dashboardRoutes = require('./routes/dashboard');
 app.use('/api/dashboard', dashboardRoutes);
 
 // Start server
-const PORT = 3001;
+const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log('');
   console.log('🚀 CloudPi Backend Server Started!');
   console.log(`   URL: http://localhost:${PORT}`);
   console.log(`   Test: http://localhost:${PORT}/api/test`);
+  console.log(`   Encryption: ${require('./utils/crypto-utils').isEncryptionEnabled(db) ? 'ENABLED 🔒' : 'DISABLED'}`);
   console.log('');
 });

@@ -6,6 +6,8 @@ import { DashboardPage } from '@/pages/dashboard'
 import { LoginPage } from '@/pages/login'
 import { SetupPage } from '@/pages/setup'
 import { RecoverPage } from '@/pages/recover'
+import { ForgotPasswordPage } from '@/pages/forgot-password'
+import { ResetPasswordPage } from '@/pages/reset-password'
 import { FilesPage } from '@/pages/files'
 import { SharedPage } from '@/pages/shared'
 import { StarredPage } from '@/pages/starred'
@@ -14,6 +16,7 @@ import { TrashPage } from '@/pages/trash'
 import { ProfilePage } from '@/pages/profile'
 import { SettingsPage } from '@/pages/settings'
 import AdminPage from '@/pages/admin'
+import { SearchPage } from '@/pages/search'
 import { NotFoundPage } from '@/pages/not-found'
 import { ShareViewPage } from '@/pages/share-view'
 import { getSetupStatus } from '@/lib/api'
@@ -60,6 +63,8 @@ function AppContent() {
             {/* Auth routes - no layout */}
             <Route path="/auth/login" element={<LoginPage />} />
             <Route path="/auth/recover" element={<RecoverPage />} />
+            <Route path="/auth/forgot-password" element={<ForgotPasswordPage />} />
+            <Route path="/reset-password" element={<ResetPasswordPage />} />
             <Route path="/setup" element={<Navigate to="/auth/login" replace />} />
 
             {/* Public share view - no auth needed */}
@@ -73,6 +78,7 @@ function AppContent() {
                 <Route path="starred" element={<StarredPage />} />
                 <Route path="recent" element={<RecentPage />} />
                 <Route path="trash" element={<TrashPage />} />
+                <Route path="search" element={<SearchPage />} />
                 <Route path="profile" element={<ProfilePage />} />
                 <Route path="settings" element={<SettingsPage />} />
                 <Route path="admin" element={<AdminPage />} />

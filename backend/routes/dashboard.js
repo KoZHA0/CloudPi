@@ -14,9 +14,9 @@ const fs = require('fs');
 const { execSync } = require('child_process');
 const jwt = require('jsonwebtoken');
 const db = require('../database/db');
+const { JWT_SECRET } = require('../utils/auth-config');
 
 const router = express.Router();
-const JWT_SECRET = 'cloudpi-secret-key-change-this-in-production';
 
 // Auth middleware
 function requireAuth(req, res, next) {

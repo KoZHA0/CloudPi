@@ -1,0 +1,102 @@
+# ==============================================================
+# CloudPi — Docker Compose Production Stack
+# ==============================================================
+#
+# Usage:
+#   docker compose up -d              # Start everything
+#   docker compose logs -f            # Follow all logs
+#   docker compose logs -f backend    # Follow backend logs only
+#   docker compose down               # Stop everything
+#   docker compose up -d --build      # Rebuild and restart
+#
+# First time setup:
+#   1. Copy backend/.env.example to backend/.env and configure
+#   2. Run: docker compose up -d --build
+#   3. Visit http://<pi-ip> to set up admin account
+#
+# ==============================================================
+
+services:
+  # ── Backend (Node.js + Express + SQLite) ───────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: backend
+    container_name: cloudpi-backend
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    environment:
+      - PORT=3001
+      - NODE_ENV=production
+      - CLOUDPI_DB_PATH=/data/cloudpi.db
+    volumes:
+      # Persist database (survives container rebuilds)
+      - cloudpi-db:/data
+      # Persist user uploads
+      - cloudpi-uploads:/app/backend/uploads
+      # Persist storage (internal file storage)
+      - cloudpi-storage:/app/backend/storage
+      # Access host CPU temperature (Raspberry Pi)
+      - /sys/class/thermal:/sys/class/thermal:ro
+      # USB drive access (for drive management feature)
+      - /mnt:/mnt
+      - /dev:/dev
+    # Privileged access for USB drive management (mount/unmount)
+    # Remove this if you don't use the drive management feature
+    privileged: true
+    networks:
+      - cloudpi-net
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3001/api/test"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.80"
+
+  # ── Nginx (Frontend + Reverse Proxy) ──────────────────────
+  nginx:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: nginx
+    container_name: cloudpi-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      # Mount the nginx config
+      - ./deploy/docker-nginx.conf:/etc/nginx/conf.d/cloudpi.conf:ro
+      # Mount Tailscale certs (if using HTTPS)
+      # Uncomment and replace YOUR_HOSTNAME when ready:
+      # - /etc/ssl/certs/YOUR_HOSTNAME.crt:/etc/ssl/certs/cloudpi.crt:ro
+      # - /etc/ssl/private/YOUR_HOSTNAME.key:/etc/ssl/private/cloudpi.key:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - cloudpi-net
+
+# ── Persistent Volumes ──────────────────────────────────────
+# Docker manages these volumes. Data survives container rebuilds.
+# View: docker volume ls | grep cloudpi
+# Backup: docker run --rm -v cloudpi_cloudpi-uploads:/data -v $(pwd):/bak alpine tar czf /bak/uploads.tar.gz /data
+volumes:
+  cloudpi-db:
+    driver: local
+  cloudpi-uploads:
+    driver: local
+  cloudpi-storage:
+    driver: local
+
+# ── Network ─────────────────────────────────────────────────
+networks:
+  cloudpi-net:
+    driver: bridge

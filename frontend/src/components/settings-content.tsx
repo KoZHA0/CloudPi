@@ -10,8 +10,8 @@ import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog"
-import { Bell, Globe, Palette, HardDrive, Trash2, Server, Database, Loader2, Shield, Save, CheckCircle2, Plus, Usb } from "lucide-react"
-import { getDashboardStats, getSystemHealth, getRateLimitSettings, updateRateLimitSettings, getStorageSources, addStorageSource, removeStorageSource, type DashboardStats, type SystemHealth, type StorageSource } from "@/lib/api"
+import { Bell, Globe, Palette, HardDrive, Trash2, Server, Database, Loader2, Shield, Save, CheckCircle2, Plus, Usb, Mail, Send } from "lucide-react"
+import { getDashboardStats, getSystemHealth, getRateLimitSettings, updateSettings, testSmtpSettings, getStorageSources, addStorageSource, removeStorageSource, type DashboardStats, type SystemHealth, type StorageSource } from "@/lib/api"
 import { useAuth } from "@/contexts/auth-context"
 
 function formatBytes(bytes: number): string {
@@ -48,8 +48,17 @@ export function SettingsContent() {
         rate_limit_upload_max: '10',
         rate_limit_upload_window: '15',
     })
+    const [smtpSettings, setSmtpSettings] = useState({
+        smtp_host: '',
+        smtp_port: '587',
+        smtp_user: '',
+        smtp_pass: '',
+        smtp_from_email: '',
+    })
     const [isSaving, setIsSaving] = useState(false)
     const [saveMessage, setSaveMessage] = useState('')
+    const [isTestingSmtp, setIsTestingSmtp] = useState(false)
+    const [smtpTestMessage, setSmtpTestMessage] = useState('')
 
     // Storage sources (admin only)
     const [storageSources, setStorageSources] = useState<StorageSource[]>([])
@@ -97,6 +106,13 @@ export function SettingsContent() {
                     rate_limit_upload_max: s.rate_limit_upload_max?.value || '10',
                     rate_limit_upload_window: s.rate_limit_upload_window?.value || '15',
                 })
+                setSmtpSettings({
+                    smtp_host: s.smtp_host?.value || '',
+                    smtp_port: s.smtp_port?.value || '587',
+                    smtp_user: s.smtp_user?.value || '',
+                    smtp_pass: s.smtp_pass?.value ? '********' : '',
+                    smtp_from_email: s.smtp_from_email?.value || '',
+                })
             }
             if (isAdmin && results[3]?.sources) {
                 setStorageSources(results[3].sources)
@@ -112,13 +128,40 @@ export function SettingsContent() {
         setIsSaving(true)
         setSaveMessage('')
         try {
-            await updateRateLimitSettings(rateLimits)
+            await updateSettings(rateLimits)
             setSaveMessage('Settings saved successfully!')
             setTimeout(() => setSaveMessage(''), 3000)
         } catch (error: any) {
             setSaveMessage(error.message || 'Failed to save settings')
         } finally {
             setIsSaving(false)
+        }
+    }
+
+    async function handleSaveSmtpSettings() {
+        setIsSaving(true)
+        setSaveMessage('')
+        try {
+            await updateSettings(smtpSettings)
+            setSaveMessage('Email settings saved successfully!')
+            setTimeout(() => setSaveMessage(''), 3000)
+        } catch (error: any) {
+            setSaveMessage(error.message || 'Failed to save email settings')
+        } finally {
+            setIsSaving(false)
+        }
+    }
+
+    async function handleTestSmtp() {
+        setIsTestingSmtp(true)
+        setSmtpTestMessage('')
+        try {
+            const result = await testSmtpSettings(smtpSettings)
+            setSmtpTestMessage(result.message)
+        } catch (error: any) {
+            setSmtpTestMessage(error.message || 'SMTP test failed')
+        } finally {
+            setIsTestingSmtp(false)
         }
     }
 
@@ -551,6 +594,95 @@ export function SettingsContent() {
                                         }`}>
                                             {saveMessage.includes('success') && <CheckCircle2 className="h-4 w-4" />}
                                             {saveMessage}
+                                        </span>
+                                    )}
+                                </div>
+                            </CardContent>
+                        </Card>
+                    )}
+
+                    {/* Email Server Configuration (Admin Only) */}
+                    {isAdmin && (
+                        <Card className="bg-card border-border">
+                            <CardHeader>
+                                <div className="flex items-center gap-2">
+                                    <Mail className="h-5 w-5 text-primary" />
+                                    <CardTitle className="text-card-foreground">Email Server (SMTP)</CardTitle>
+                                </div>
+                                <CardDescription>Configure an email server to allow password recovery and system notifications</CardDescription>
+                            </CardHeader>
+                            <CardContent className="space-y-6">
+                                <div className="p-4 rounded-lg bg-secondary space-y-4">
+                                    <div className="grid gap-4 sm:grid-cols-2">
+                                        <div className="space-y-2">
+                                            <Label className="text-sm font-medium">SMTP Server Host</Label>
+                                            <Input
+                                                placeholder="e.g. smtp.gmail.com"
+                                                value={smtpSettings.smtp_host}
+                                                onChange={(e) => setSmtpSettings({ ...smtpSettings, smtp_host: e.target.value })}
+                                                className="bg-background"
+                                            />
+                                        </div>
+                                        <div className="space-y-2">
+                                            <Label className="text-sm font-medium">SMTP Port</Label>
+                                            <Input
+                                                type="number"
+                                                placeholder="e.g. 587 or 465"
+                                                value={smtpSettings.smtp_port}
+                                                onChange={(e) => setSmtpSettings({ ...smtpSettings, smtp_port: e.target.value })}
+                                                className="bg-background"
+                                            />
+                                        </div>
+                                        <div className="space-y-2">
+                                            <Label className="text-sm font-medium">SMTP Username</Label>
+                                            <Input
+                                                placeholder="e.g. your.email@gmail.com"
+                                                value={smtpSettings.smtp_user}
+                                                onChange={(e) => setSmtpSettings({ ...smtpSettings, smtp_user: e.target.value })}
+                                                className="bg-background"
+                                            />
+                                        </div>
+                                        <div className="space-y-2">
+                                            <Label className="text-sm font-medium">SMTP Password</Label>
+                                            <Input
+                                                type="password"
+                                                placeholder="App password or secret"
+                                                value={smtpSettings.smtp_pass}
+                                                onChange={(e) => setSmtpSettings({ ...smtpSettings, smtp_pass: e.target.value })}
+                                                className="bg-background"
+                                            />
+                                            <p className="text-xs text-muted-foreground">This will be securely encrypted in the database.</p>
+                                        </div>
+                                        <div className="space-y-2 sm:col-span-2">
+                                            <Label className="text-sm font-medium">Sender Email Address</Label>
+                                            <Input
+                                                placeholder="e.g. no-reply@cloudpi.com"
+                                                value={smtpSettings.smtp_from_email}
+                                                onChange={(e) => setSmtpSettings({ ...smtpSettings, smtp_from_email: e.target.value })}
+                                                className="bg-background"
+                                            />
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                                    <div className="flex items-center gap-3">
+                                        <Button onClick={handleSaveSmtpSettings} disabled={isSaving} className="gap-2">
+                                            {isSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                                            Save Settings
+                                        </Button>
+                                        <Button variant="outline" onClick={handleTestSmtp} disabled={isTestingSmtp || !smtpSettings.smtp_host} className="gap-2 border-primary/20 text-primary hover:bg-primary/10">
+                                            {isTestingSmtp ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+                                            Send Test Email
+                                        </Button>
+                                    </div>
+                                    
+                                    {(saveMessage || smtpTestMessage) && (
+                                        <span className={`text-sm flex items-center gap-1 ${
+                                            (saveMessage || smtpTestMessage).includes('success') ? 'text-green-500' : 'text-red-500'
+                                        }`}>
+                                            {(saveMessage || smtpTestMessage).includes('success') && <CheckCircle2 className="h-4 w-4 shrink-0" />}
+                                            {saveMessage || smtpTestMessage}
                                         </span>
                                     )}
                                 </div>

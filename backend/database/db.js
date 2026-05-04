@@ -19,6 +19,10 @@ const db = new Database(dbPath);
 // Enable foreign keys (SQLite has them disabled by default!)
 db.pragma("foreign_keys = ON");
 
+// Enable Write-Ahead Logging (WAL) for massive concurrency improvements
+db.pragma("journal_mode = WAL");
+db.pragma("synchronous = NORMAL");
+
 /**
  * USERS TABLE
  * -----------

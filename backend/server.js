@@ -16,7 +16,6 @@ require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
-const path = require('path');
 
 // Import database - this also initializes all tables!
 const db = require('./database/db');
@@ -24,15 +23,31 @@ const db = require('./database/db');
 // Create Express app
 const app = express();
 
+app.set('trust proxy', 1);
+
 /**
  * MIDDLEWARE SETUP
  * ----------------
  * Middleware are functions that run on every request before your routes
  */
 
-// CORS: Allows your Next.js frontend (port 3000) to call this API (port 3001)
+// CORS: allow same-origin requests, local development, and configured origins.
+const defaultAllowedOrigins = process.env.NODE_ENV === 'production'
+  ? []
+  : ['http://localhost:3000', 'http://127.0.0.1:3000'];
+const allowedOrigins = (process.env.CLOUDPI_ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(origin => origin.trim())
+  .filter(Boolean)
+  .concat(defaultAllowedOrigins);
+
 app.use(cors({
-  origin: true,
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    return callback(null, false);
+  },
   credentials: true
 }));
 
@@ -120,10 +135,6 @@ const authLimiter = createDynamicLimiter({
 });
 app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/recover', authLimiter);
-
-// Serve uploaded files statically
-// Example: GET /uploads/myfile.jpg will serve backend/uploads/myfile.jpg
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 /**
  * TEST ENDPOINT

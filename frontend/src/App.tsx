@@ -26,18 +26,18 @@ function AppContent() {
     const [setupRequired, setSetupRequired] = useState<boolean | null>(null)
 
     useEffect(() => {
+        async function checkSetupStatus() {
+            try {
+                const status = await getSetupStatus()
+                setSetupRequired(status.setupRequired)
+            } catch {
+                // If backend is down, assume no setup required
+                setSetupRequired(false)
+            }
+        }
+
         checkSetupStatus()
     }, [])
-
-    async function checkSetupStatus() {
-        try {
-            const status = await getSetupStatus()
-            setSetupRequired(status.setupRequired)
-        } catch {
-            // If backend is down, assume no setup required
-            setSetupRequired(false)
-        }
-    }
 
     // Show loading while checking setup status
     if (setupRequired === null) {

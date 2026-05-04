@@ -29,8 +29,9 @@ function requireAuth(req, res, next) {
         const token = authHeader.split(' ')[1];
         const decoded = jwt.verify(token, JWT_SECRET);
 
-        const dbUser = db.prepare('SELECT token_version FROM users WHERE id = ?').get(decoded.userId);
+        const dbUser = db.prepare('SELECT token_version, is_disabled FROM users WHERE id = ?').get(decoded.userId);
         if (!dbUser) return res.status(401).json({ error: 'User not found' });
+        if (dbUser.is_disabled) return res.status(403).json({ error: 'Account is disabled' });
         if (decoded.tokenVersion !== undefined) {
             if (decoded.tokenVersion !== (dbUser.token_version || 1)) {
                 return res.status(401).json({ error: 'Token invalidated' });

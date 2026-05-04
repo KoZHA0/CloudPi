@@ -1,8 +1,13 @@
 const nodemailer = require('nodemailer');
 require('dotenv').config();
 
-const { getSetting } = require('./auth-config');
+const db = require('../database/db');
 const crypto = require('crypto');
+
+function getSetting(key, fallback) {
+    const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
+    return row ? row.value : fallback;
+}
 
 /**
  * Creates and returns a nodemailer transport instance based on database settings.

@@ -20,7 +20,7 @@ const crypto = require('crypto');
 const db = require('../database/db');
 const { JWT_SECRET, SALT_ROUNDS } = require('../utils/auth-config');
 const { sendEmail } = require('../utils/mailer');
-const { authenticator } = require('otplib');
+const { generateSecret, generateURI, verify } = require('otplib');
 const qrcode = require('qrcode');
 
 const router = express.Router();
@@ -296,9 +296,9 @@ router.post('/login/2fa', async (req, res) => {
         }
 
         // Verify the code
-        const isValid = authenticator.verify({ token: code, secret: user.two_factor_secret });
+        const result = await verify({ token: code, secret: user.two_factor_secret });
         
-        if (!isValid) {
+        if (!result.valid) {
             return res.status(401).json({ error: 'Invalid 2FA code' });
         }
 
@@ -449,11 +449,15 @@ router.get('/me', (req, res) => {
 
         // Get fresh user data from database
         const user = db.prepare(
-            'SELECT id, username, email, is_admin, token_version, created_at FROM users WHERE id = ?'
+            'SELECT id, username, email, is_admin, is_disabled, token_version, two_factor_enabled, created_at FROM users WHERE id = ?'
         ).get(decoded.userId);
 
         if (!user) {
             return res.status(401).json({ error: 'User not found' });
+        }
+
+        if (user.is_disabled) {
+            return res.status(403).json({ error: 'Account is disabled' });
         }
 
         // Validate token_version
@@ -493,10 +497,18 @@ router.put('/profile', async (req, res) => {
         const token = authHeader.split(' ')[1];
         const decoded = jwt.verify(token, JWT_SECRET);
 
-        const { username, email } = req.body;
+        const { username, email, currentPassword } = req.body;
 
         if (!username) {
             return res.status(400).json({ error: 'Username is required' });
+        }
+
+        const user = db.prepare(
+            'SELECT id, email, password FROM users WHERE id = ?'
+        ).get(decoded.userId);
+
+        if (!user) {
+            return res.status(401).json({ error: 'User not found' });
         }
 
         // Check if new username already exists for another user
@@ -510,6 +522,21 @@ router.put('/profile', async (req, res) => {
         
         // If email provided, check uniqueness
         let finalEmail = email ? email.trim() : null;
+        const existingEmail = user.email || null;
+        const emailChanged = finalEmail !== existingEmail;
+
+        if (emailChanged) {
+            if (!currentPassword) {
+                return res.status(400).json({ error: 'Current password is required to change email' });
+            }
+
+            const passwordMatch = await bcrypt.compare(currentPassword, user.password);
+
+            if (!passwordMatch) {
+                return res.status(401).json({ error: 'Current password is incorrect' });
+            }
+        }
+
         if (finalEmail) {
             const existingEmail = db.prepare(
                 'SELECT id FROM users WHERE email = ? AND id != ?'
@@ -572,7 +599,7 @@ router.get('/2fa/setup', async (req, res) => {
         }
 
         // Generate a new secret
-        const secret = authenticator.generateSecret();
+        const secret = generateSecret();
         
         // Temporarily save the secret (not enabled yet)
         db.prepare('UPDATE users SET two_factor_secret = ? WHERE id = ?').run(secret, decoded.userId);
@@ -580,7 +607,11 @@ router.get('/2fa/setup', async (req, res) => {
         // Create the OTP Auth URL
         const service = 'CloudPi';
         const userIdentifier = user.email || user.username;
-        const otpauth = authenticator.keyuri(userIdentifier, service, secret);
+        const otpauth = generateURI({
+            issuer: service,
+            label: userIdentifier,
+            secret
+        });
 
         // Generate QR code Data URL
         const qrCodeUrl = await qrcode.toDataURL(otpauth);
@@ -632,9 +663,9 @@ router.post('/2fa/verify', async (req, res) => {
         }
 
         // Verify the token
-        const isValid = authenticator.verify({ token: code, secret: user.two_factor_secret });
+        const result = await verify({ token: code, secret: user.two_factor_secret });
         
-        if (!isValid) {
+        if (!result.valid) {
             return res.status(400).json({ error: 'Invalid verification code.' });
         }
 
@@ -676,6 +707,30 @@ router.post('/2fa/disable', async (req, res) => {
 
         const token = authHeader.split(' ')[1];
         const decoded = jwt.verify(token, JWT_SECRET);
+
+        const { currentPassword } = req.body;
+
+        if (!currentPassword) {
+            return res.status(400).json({ error: 'Current password is required to disable 2FA' });
+        }
+
+        const user = db.prepare(
+            'SELECT password, two_factor_enabled FROM users WHERE id = ?'
+        ).get(decoded.userId);
+
+        if (!user) {
+            return res.status(401).json({ error: 'User not found' });
+        }
+
+        if (!user.two_factor_enabled) {
+            return res.status(400).json({ error: '2FA is already disabled.' });
+        }
+
+        const passwordMatch = await bcrypt.compare(currentPassword, user.password);
+
+        if (!passwordMatch) {
+            return res.status(401).json({ error: 'Current password is incorrect' });
+        }
 
         db.prepare('UPDATE users SET two_factor_enabled = 0, two_factor_secret = NULL WHERE id = ?').run(decoded.userId);
 
@@ -746,7 +801,7 @@ router.put('/password', async (req, res) => {
         const hashedPassword = await bcrypt.hash(newPassword, SALT_ROUNDS);
 
         db.prepare(
-            'UPDATE users SET password = ? WHERE id = ?'
+            'UPDATE users SET password = ?, token_version = token_version + 1 WHERE id = ?'
         ).run(hashedPassword, decoded.userId);
 
         res.json({ message: 'Password changed successfully' });

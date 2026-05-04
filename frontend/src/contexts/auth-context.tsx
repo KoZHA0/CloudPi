@@ -1,7 +1,8 @@
 import { createContext, useContext, useState, useEffect, type ReactNode } from "react";
-import type { User } from "@/lib/api";
+import type { AuthResponse, User } from "@/lib/api";
 import {
     login as apiLogin,
+    loginWith2FA as apiLoginWith2FA,
     getCurrentUser,
     setToken,
     removeToken,
@@ -12,7 +13,8 @@ interface AuthContextType {
     user: User | null;
     isLoading: boolean;
     isAuthenticated: boolean;
-    login: (username: string, password: string) => Promise<void>;
+    login: (username: string, password: string) => Promise<AuthResponse>;
+    complete2FALogin: (tempToken: string, code: string) => Promise<void>;
     logout: () => void;
     updateUser: (user: User) => void;
 }
@@ -47,6 +49,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     async function login(username: string, password: string) {
         const response = await apiLogin(username, password);
+
+        if (response.requires_2fa) {
+            return response;
+        }
+
+        setToken(response.token);
+        setUser(response.user);
+        return response;
+    }
+
+    async function complete2FALogin(tempToken: string, code: string) {
+        const response = await apiLoginWith2FA(tempToken, code);
         setToken(response.token);
         setUser(response.user);
     }
@@ -68,6 +82,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
                 isLoading,
                 isAuthenticated: !!user,
                 login,
+                complete2FALogin,
                 logout,
                 updateUser,
             }}

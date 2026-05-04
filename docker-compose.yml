@@ -31,6 +31,8 @@ services:
       - PORT=3001
       - NODE_ENV=production
       - CLOUDPI_DB_PATH=/data/cloudpi.db
+      # Host path where USB drives are auto-mounted (default: /media/pi)
+      - CLOUDPI_EXTERNAL_DRIVES_PATH=/media/pi
     volumes:
       # Persist database (survives container rebuilds)
       - cloudpi-db:/data
@@ -40,12 +42,11 @@ services:
       - cloudpi-storage:/app/backend/storage
       # Access host CPU temperature (Raspberry Pi)
       - /sys/class/thermal:/sys/class/thermal:ro
-      # USB drive access (for drive management feature)
+      # USB drive access — host OS handles mounting via udisks2/usbmount
+      # Read-write needed: backend stores user files on external drives
+      # SECURITY: privileged mode and /dev access removed — not needed
+      - /media:/media
       - /mnt:/mnt
-      - /dev:/dev
-    # Privileged access for USB drive management (mount/unmount)
-    # Remove this if you don't use the drive management feature
-    privileged: true
     networks:
       - cloudpi-net
     healthcheck:
@@ -74,10 +75,9 @@ services:
     volumes:
       # Mount the nginx config
       - ./deploy/docker-nginx.conf:/etc/nginx/conf.d/cloudpi.conf:ro
-      # Mount Tailscale certs (if using HTTPS)
-      # Uncomment and replace YOUR_HOSTNAME when ready:
-      # - /etc/ssl/certs/YOUR_HOSTNAME.crt:/etc/ssl/certs/cloudpi.crt:ro
-      # - /etc/ssl/private/YOUR_HOSTNAME.key:/etc/ssl/private/cloudpi.key:ro
+      # Mount Tailscale certs
+      - /etc/ssl/certs/pi.taild54945.ts.net.crt:/etc/ssl/certs/cloudpi.crt:ro
+      - /etc/ssl/private/pi.taild54945.ts.net.key:/etc/ssl/private/cloudpi.key:ro
     depends_on:
       backend:
         condition: service_healthy

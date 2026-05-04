@@ -13,14 +13,19 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "archiver": "^7.0.1",
     "bcrypt": "^6.0.0",
     "better-sqlite3": "^12.6.0",
     "cors": "^2.8.5",
+    "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "express-rate-limit": "^8.2.1",
     "fastq": "^1.20.1",
     "jsonwebtoken": "^9.0.3",
     "multer": "^2.0.2",
+    "nodemailer": "^8.0.7",
+    "otplib": "^13.4.0",
+    "qrcode": "^1.5.4",
     "uuid": "^13.0.0"
   }
 }

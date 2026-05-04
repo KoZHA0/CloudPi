@@ -26,9 +26,16 @@ lerna-debug.log*
 *.db
 *.sqlite
 *.sqlite3
+*.db-shm
+*.db-wal
 
-# Uploads folder (user uploaded files - too large for git)
+# Storage and Uploads (user files - too large for git)
 backend/uploads/
+backend/storage/
+.cloudpi-id
+
+# Docker persistent volumes (from local testing)
+docker-data/
 
 # Lock files (optional - can regenerate on Pi with npm install)
 # Uncomment if you want to exclude them:

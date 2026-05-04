@@ -7,9 +7,10 @@
  * GET    /api/files              - List files/folders in directory
  * GET    /api/files/trash        - List trashed items
  * GET    /api/files/recent       - Get recently modified files
+ * GET    /api/files/search       - Global file/folder search
  * POST   /api/files/folder       - Create new folder
  * POST   /api/files/upload       - Upload file(s)
- * GET    /api/files/:id/download - Download file
+ * GET    /api/files/:id/download - Download file or folder (ZIP)
  * PUT    /api/files/:id          - Rename file/folder
  * PUT    /api/files/:id/star     - Toggle star status
  * PUT    /api/files/:id/move     - Move to different folder
@@ -27,10 +28,11 @@ const db = require('../database/db');
 const { v4: uuidv4 } = require('uuid');
 const rateLimit = require('express-rate-limit'); // kept for reference but upload uses custom limiter
 const fastq = require('fastq');
+const archiver = require('archiver');
+const { computeFileHash, verifyFileHash, encryptFile, decryptFileToBuffer, isEncryptionEnabled } = require('../utils/crypto-utils');
+const { JWT_SECRET } = require('../utils/auth-config');
 
 const router = express.Router();
-
-const JWT_SECRET = 'cloudpi-secret-key-change-this-in-production';
 
 // Default storage directory for internal storage (backward compatible)
 const DEFAULT_STORAGE_DIR = path.join(__dirname, '..', 'storage');
@@ -180,19 +182,41 @@ const uploadLimiter = (req, res, next) => {
  * The upload request waits in the queue until it's processed,
  * then returns the result — so the frontend needs NO changes.
  */
-function uploadWorker(task, callback) {
+async function uploadWorker(task, callback) {
     // This function is called by fastq when it's this task's turn
     // We process the upload and call the callback with the result
     try {
         const { userId, parentId, files, storageSourceId } = task;
         const uploadedFiles = [];
+        const encryptionOn = isEncryptionEnabled(db);
 
         for (const file of files) {
             const fileType = getFileType(file.mimetype);
+            const diskPath = file.path;
 
+            // 1. Compute SHA-256 hash of the PLAINTEXT file (before encryption)
+            let sha256Hash = null;
+            try {
+                sha256Hash = await computeFileHash(diskPath);
+            } catch (hashErr) {
+                console.error('Hash computation failed:', hashErr.message);
+            }
+
+            // 2. Encrypt the file in-place if encryption is enabled
+            let isEncrypted = 0;
+            if (encryptionOn) {
+                try {
+                    await encryptFile(diskPath, diskPath);
+                    isEncrypted = 1;
+                } catch (encErr) {
+                    console.error('Encryption failed (storing plaintext):', encErr.message);
+                }
+            }
+
+            // 3. Insert DB record with hash and encryption flag
             const result = db.prepare(`
-                INSERT INTO files (user_id, name, path, type, size, mime_type, parent_id, storage_source_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO files (user_id, name, path, type, size, mime_type, parent_id, storage_source_id, sha256_hash, encrypted)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `).run(
                 userId,
                 file.originalname,
@@ -201,7 +225,9 @@ function uploadWorker(task, callback) {
                 file.size,
                 file.mimetype,
                 parentId,
-                storageSourceId || 'internal'
+                storageSourceId || 'internal',
+                sha256Hash,
+                isEncrypted
             );
 
             const uploaded = db.prepare('SELECT * FROM files WHERE id = ?').get(result.lastInsertRowid);
@@ -378,6 +404,60 @@ router.get('/recent', requireAuth, (req, res) => {
 });
 
 /**
+ * GET /api/files/search
+ * Global search across all user's files and folders
+ * Query: ?q=search_term
+ */
+router.get('/search', requireAuth, (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const query = req.query.q;
+
+        if (!query || String(query).trim().length === 0) {
+            return res.json({ files: [], query: '' });
+        }
+
+        const searchTerm = `%${String(query).trim()}%`;
+
+        const files = db.prepare(`
+            SELECT id, name, type, size, mime_type, parent_id, starred, created_at, modified_at
+            FROM files
+            WHERE user_id = ? AND trashed = 0 AND name LIKE ?
+            ORDER BY 
+                CASE WHEN type = 'folder' THEN 0 ELSE 1 END,
+                modified_at DESC
+            LIMIT 50
+        `).all(userId, searchTerm);
+
+        // Build path breadcrumbs for each result so the user knows WHERE the file is
+        const results = files.map(file => {
+            const pathParts = [];
+            let parentId = file.parent_id;
+            while (parentId) {
+                const parent = db.prepare(
+                    'SELECT id, name, parent_id FROM files WHERE id = ? AND user_id = ?'
+                ).get(parentId, userId);
+                if (parent) {
+                    pathParts.unshift(parent.name);
+                    parentId = parent.parent_id;
+                } else {
+                    break;
+                }
+            }
+            return {
+                ...file,
+                location: pathParts.length > 0 ? pathParts.join(' / ') : 'Root'
+            };
+        });
+
+        res.json({ files: results, query: String(query).trim() });
+    } catch (error) {
+        console.error('Search error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+/**
  * POST /api/files/folder
  * Create a new folder
  */
@@ -461,6 +541,32 @@ router.post('/upload', uploadLimiter, requireAuth, upload.array('files', 10), as
             return res.status(400).json({ error: 'No files uploaded' });
         }
 
+        // --- Storage Quota Check ---
+        const userRow = db.prepare('SELECT storage_quota FROM users WHERE id = ?').get(userId);
+        const quota = userRow?.storage_quota; // NULL = unlimited
+        if (quota && quota > 0) {
+            const usedRow = db.prepare(
+                "SELECT COALESCE(SUM(size), 0) as used FROM files WHERE user_id = ? AND trashed = 0 AND type != 'folder'"
+            ).get(userId);
+            const currentUsed = usedRow.used || 0;
+            const uploadSize = req.files.reduce((sum, f) => sum + f.size, 0);
+
+            if (currentUsed + uploadSize > quota) {
+                // Cleanup uploaded temp files
+                req.files.forEach(f => {
+                    if (f.path && fs.existsSync(f.path)) {
+                        try { fs.unlinkSync(f.path); } catch (e) { /* ignore */ }
+                    }
+                });
+
+                const usedMB = (currentUsed / (1024 * 1024)).toFixed(1);
+                const quotaMB = (quota / (1024 * 1024)).toFixed(1);
+                return res.status(413).json({
+                    error: `Storage quota exceeded. You've used ${usedMB} MB of your ${quotaMB} MB limit.`
+                });
+            }
+        }
+
         // Validate parent folder if specified
         if (parentId) {
             const parentFolder = db.prepare(
@@ -525,7 +631,7 @@ router.post('/upload', uploadLimiter, requireAuth, upload.array('files', 10), as
  * Serve a file for inline preview (images, PDFs, videos, audio, text)
  * Accepts token via query string (needed for <img>, <video>, <audio>, <iframe> tags)
  */
-router.get('/:id/preview', (req, res) => {
+router.get('/:id/preview', async (req, res) => {
     try {
         // Accept token from query string OR Authorization header
         let token = req.query.token ? String(req.query.token) : null;
@@ -577,6 +683,19 @@ router.get('/:id/preview', (req, res) => {
         res.set('Content-Type', contentType);
         res.set('Content-Disposition', `inline; filename="${encodeURIComponent(file.name)}"`);
         res.set('Cache-Control', 'public, max-age=86400');
+
+        // If file is encrypted, decrypt to buffer and send
+        if (file.encrypted === 1) {
+            try {
+                const decryptedBuffer = await decryptFileToBuffer(filePath);
+                res.set('Content-Length', decryptedBuffer.length);
+                return res.send(decryptedBuffer);
+            } catch (decErr) {
+                console.error('Decryption error during preview:', decErr.message);
+                return res.status(500).json({ error: 'Failed to decrypt file for preview' });
+            }
+        }
+
         res.sendFile(filePath);
     } catch (error) {
         if (error.name === 'JsonWebTokenError' || error.name === 'TokenExpiredError') {
@@ -589,31 +708,120 @@ router.get('/:id/preview', (req, res) => {
 
 /**
  * GET /api/files/:id/download
- * Download a file
+ * Download a file OR a folder (as ZIP)
+ * For files: streams the file directly
+ * For folders: recursively collects all files, streams a ZIP archive
  */
-router.get('/:id/download', requireAuth, (req, res) => {
+router.get('/:id/download', requireAuth, async (req, res) => {
     try {
         const userId = req.user.userId;
         const fileId = req.params.id;
 
         const file = db.prepare(
-            "SELECT * FROM files WHERE id = ? AND user_id = ? AND type != 'folder'"
+            'SELECT * FROM files WHERE id = ? AND user_id = ?'
         ).get(fileId, userId);
 
         if (!file) {
             return res.status(404).json({ error: 'File not found' });
         }
 
-        const filePath = resolveFilePath(file);
+        // --- Regular file download ---
+        if (file.type !== 'folder') {
+            const filePath = resolveFilePath(file);
+            if (!fs.existsSync(filePath)) {
+                return res.status(404).json({ error: 'File not found on disk' });
+            }
 
-        if (!fs.existsSync(filePath)) {
-            return res.status(404).json({ error: 'File not found on disk' });
+            // If file is encrypted, decrypt to buffer, verify hash, and send
+            if (file.encrypted === 1) {
+                try {
+                    const decryptedBuffer = await decryptFileToBuffer(filePath);
+
+                    // Verify SHA-256 integrity if hash exists
+                    if (file.sha256_hash) {
+                        const crypto = require('crypto');
+                        const computedHash = crypto.createHash('sha256').update(decryptedBuffer).digest('hex');
+                        if (computedHash !== file.sha256_hash) {
+                            console.warn(`⚠️  Integrity mismatch for file ${file.id} (${file.name})`);
+                            res.set('X-Integrity-Warning', 'hash-mismatch');
+                        }
+                    }
+
+                    res.set('Content-Type', file.mime_type || 'application/octet-stream');
+                    res.set('Content-Disposition', `attachment; filename="${encodeURIComponent(file.name)}"`);
+                    res.set('Content-Length', decryptedBuffer.length);
+                    return res.send(decryptedBuffer);
+                } catch (decErr) {
+                    console.error('Decryption error during download:', decErr.message);
+                    return res.status(500).json({ error: 'Failed to decrypt file' });
+                }
+            }
+
+            // Unencrypted file — verify hash if available, then send
+            if (file.sha256_hash) {
+                try {
+                    const { valid } = await verifyFileHash(filePath, file.sha256_hash);
+                    if (!valid) {
+                        console.warn(`⚠️  Integrity mismatch for file ${file.id} (${file.name})`);
+                        res.set('X-Integrity-Warning', 'hash-mismatch');
+                    }
+                } catch (hashErr) {
+                    console.error('Hash verification error:', hashErr.message);
+                }
+            }
+
+            return res.download(filePath, file.name);
         }
 
-        res.download(filePath, file.name);
+        // --- Folder download as ZIP ---
+        // Recursively collect all files in the folder
+        function collectFiles(folderId, relativePath) {
+            const children = db.prepare(
+                'SELECT * FROM files WHERE parent_id = ? AND user_id = ? AND trashed = 0'
+            ).all(folderId, userId);
+
+            const collected = [];
+            for (const child of children) {
+                const childPath = relativePath ? `${relativePath}/${child.name}` : child.name;
+                if (child.type === 'folder') {
+                    collected.push(...collectFiles(child.id, childPath));
+                } else {
+                    const diskPath = resolveFilePath(child);
+                    if (fs.existsSync(diskPath)) {
+                        collected.push({ diskPath, archivePath: childPath });
+                    }
+                }
+            }
+            return collected;
+        }
+
+        const filesToZip = collectFiles(file.id, '');
+
+        if (filesToZip.length === 0) {
+            return res.status(400).json({ error: 'Folder is empty — nothing to download' });
+        }
+
+        // Stream the ZIP directly to the response (no temp file on disk)
+        const zipName = `${file.name}.zip`;
+        res.set('Content-Type', 'application/zip');
+        res.set('Content-Disposition', `attachment; filename="${encodeURIComponent(zipName)}"`);
+
+        const archive = archiver('zip', { zlib: { level: 5 } }); // level 5 = balanced speed/size
+        archive.on('error', (err) => {
+            console.error('ZIP error:', err);
+            if (!res.headersSent) res.status(500).json({ error: 'ZIP creation failed' });
+        });
+        archive.pipe(res);
+
+        for (const { diskPath, archivePath } of filesToZip) {
+            archive.file(diskPath, { name: archivePath });
+        }
+
+        archive.finalize();
+
     } catch (error) {
         console.error('Download error:', error);
-        res.status(500).json({ error: 'Server error during download' });
+        if (!res.headersSent) res.status(500).json({ error: 'Server error during download' });
     }
 });
 

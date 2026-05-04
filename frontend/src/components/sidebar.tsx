@@ -1,4 +1,4 @@
-import { Link, useLocation } from "react-router-dom"
+import { Link, useLocation, useNavigate } from "react-router-dom"
 import { createContext, useContext, useState, useEffect, type ReactNode } from "react"
 import {
     LayoutDashboard,
@@ -118,10 +118,12 @@ const accountNavItems = [
 
 export function Sidebar() {
     const location = useLocation()
+    const navigate = useNavigate()
     const { isOpen, close } = useSidebar()
     const { user, isAuthenticated, logout } = useAuth()
     
     const [storageStats, setStorageStats] = useState<{ totalBytes: number, usedBytes: number } | null>(null)
+    const [sidebarSearch, setSidebarSearch] = useState("")
 
     // Fetch storage stats when authenticated
     useEffect(() => {
@@ -130,6 +132,13 @@ export function Sidebar() {
         }
     }, [isAuthenticated, location.pathname]) // Refresh on navigation
 
+    const handleSearchKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+        if (e.key === "Enter" && sidebarSearch.trim()) {
+            navigate(`/search?q=${encodeURIComponent(sidebarSearch.trim())}`)
+            setSidebarSearch("")
+            close() // Close mobile sidebar
+        }
+    }
 
     return (
         <>
@@ -174,8 +183,11 @@ export function Sidebar() {
                     <div className="relative">
                         <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
                         <Input
-                            placeholder="Search..."
+                            placeholder="Search all files..."
                             className="pl-9 bg-sidebar-accent border-sidebar-border text-sidebar-foreground placeholder:text-muted-foreground"
+                            value={sidebarSearch}
+                            onChange={(e) => setSidebarSearch(e.target.value)}
+                            onKeyDown={handleSearchKeyDown}
                         />
                     </div>
                 </div>
@@ -318,6 +330,8 @@ export function TopBar() {
 
     // Get page title based on current path
     const getPageTitle = () => {
+        if (location.pathname === "/search") return "Search"
+        if (location.pathname === "/admin") return "Admin"
         const allNavItems = [...mainNavItems, ...accountNavItems]
         const currentItem = allNavItems.find(item => item.href === location.pathname)
         return currentItem?.name || "Dashboard"

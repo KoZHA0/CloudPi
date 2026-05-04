@@ -19,10 +19,11 @@ const fs = require('fs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const db = require('../database/db');
+const { decryptFileToBuffer } = require('../utils/crypto-utils');
+const { JWT_SECRET } = require('../utils/auth-config');
 
 const router = express.Router();
 
-const JWT_SECRET = 'cloudpi-secret-key-change-this-in-production';
 const STORAGE_DIR = path.join(__dirname, '..', 'storage');
 
 // Auth middleware
@@ -118,6 +119,312 @@ router.get('/shared-with-me', requireAuth, (req, res) => {
         res.json({ shares });
     } catch (error) {
         console.error('Shared with me error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+/**
+ * GET /api/shares/shared-folder/:shareId/files
+ * Browse inside a shared folder
+ * Query: ?parent_id=<folderId>  (optional, defaults to the shared root folder)
+ */
+router.get('/shared-folder/:shareId/files', requireAuth, (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const shareId = req.params.shareId;
+
+        // Verify this share belongs to the requesting user
+        const share = db.prepare(`
+            SELECT s.*, f.type as file_type, f.user_id as owner_id
+            FROM shares s
+            JOIN files f ON s.file_id = f.id
+            WHERE s.id = ? AND s.shared_with = ? AND f.type = 'folder'
+        `).get(shareId, userId);
+
+        if (!share) {
+            return res.status(404).json({ error: 'Shared folder not found' });
+        }
+
+        const parentId = req.query.parent_id || share.file_id;
+
+        // Verify the requested parent_id is within the shared folder tree
+        if (String(parentId) !== String(share.file_id)) {
+            let currentId = parentId;
+            let isDescendant = false;
+            while (currentId) {
+                if (String(currentId) === String(share.file_id)) {
+                    isDescendant = true;
+                    break;
+                }
+                const parent = db.prepare(
+                    'SELECT parent_id FROM files WHERE id = ? AND user_id = ?'
+                ).get(currentId, share.owner_id);
+                if (!parent) break;
+                currentId = parent.parent_id;
+            }
+            if (!isDescendant) {
+                return res.status(403).json({ error: 'Access denied — folder is outside the shared scope' });
+            }
+        }
+
+        // List children of the folder
+        const files = db.prepare(`
+            SELECT id, name, type, size, mime_type, parent_id, created_at, modified_at
+            FROM files
+            WHERE parent_id = ? AND user_id = ? AND trashed = 0
+            ORDER BY CASE WHEN type = 'folder' THEN 0 ELSE 1 END, name ASC
+        `).all(parentId, share.owner_id);
+
+        // Build breadcrumbs from parentId up to the shared root
+        const breadcrumbs = [];
+        let crumbId = parentId;
+        while (crumbId && String(crumbId) !== String(share.file_id)) {
+            const folder = db.prepare(
+                'SELECT id, name, parent_id FROM files WHERE id = ? AND user_id = ?'
+            ).get(crumbId, share.owner_id);
+            if (folder) {
+                breadcrumbs.unshift({ id: folder.id, name: folder.name });
+                crumbId = folder.parent_id;
+            } else {
+                break;
+            }
+        }
+        // Add the shared root folder itself
+        const rootFolder = db.prepare('SELECT id, name FROM files WHERE id = ?').get(share.file_id);
+        if (rootFolder) {
+            breadcrumbs.unshift({ id: rootFolder.id, name: rootFolder.name });
+        }
+
+        res.json({ files, breadcrumbs, shareId: Number(shareId), rootFolderId: share.file_id });
+    } catch (error) {
+        console.error('Browse shared folder error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+/**
+ * GET /api/shares/shared-folder/:shareId/download/:fileId
+ * Download a file from inside a shared folder
+ */
+router.get('/shared-folder/:shareId/download/:fileId', requireAuth, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const shareId = req.params.shareId;
+        const fileId = req.params.fileId;
+
+        // Verify the share
+        const share = db.prepare(`
+            SELECT s.*, f.type as file_type, f.user_id as owner_id
+            FROM shares s
+            JOIN files f ON s.file_id = f.id
+            WHERE s.id = ? AND s.shared_with = ?
+        `).get(shareId, userId);
+
+        if (!share) {
+            return res.status(404).json({ error: 'Share not found' });
+        }
+
+        // Get the file
+        const file = db.prepare(
+            'SELECT * FROM files WHERE id = ? AND user_id = ? AND trashed = 0'
+        ).get(fileId, share.owner_id);
+
+        if (!file) {
+            return res.status(404).json({ error: 'File not found' });
+        }
+
+        // Verify the file is inside the shared folder (walk up)
+        if (String(file.id) !== String(share.file_id)) {
+            let currentId = file.parent_id;
+            let isDescendant = false;
+            while (currentId) {
+                if (String(currentId) === String(share.file_id)) {
+                    isDescendant = true;
+                    break;
+                }
+                const parent = db.prepare(
+                    'SELECT parent_id FROM files WHERE id = ? AND user_id = ?'
+                ).get(currentId, share.owner_id);
+                if (!parent) break;
+                currentId = parent.parent_id;
+            }
+            if (!isDescendant) {
+                return res.status(403).json({ error: 'File is outside the shared scope' });
+            }
+        }
+
+        // Resolve file path
+        const storageDir = path.join(__dirname, '..', 'storage');
+        let filePath;
+        if (file.storage_source_id && file.storage_source_id !== 'internal') {
+            const source = db.prepare('SELECT path FROM storage_sources WHERE id = ?').get(file.storage_source_id);
+            if (source) {
+                filePath = path.join(source.path, 'cloudpi-data', String(file.user_id), file.path);
+            } else {
+                filePath = path.join(storageDir, String(file.user_id), file.path);
+            }
+        } else {
+            filePath = path.join(storageDir, String(file.user_id), file.path);
+        }
+
+        if (file.type !== 'folder') {
+            if (!fs.existsSync(filePath)) {
+                return res.status(404).json({ error: 'File not found on disk' });
+            }
+
+            // Decrypt if file is encrypted
+            if (file.encrypted === 1) {
+                try {
+                    const decryptedBuffer = await decryptFileToBuffer(filePath);
+                    res.set('Content-Type', file.mime_type || 'application/octet-stream');
+                    res.set('Content-Disposition', `attachment; filename="${encodeURIComponent(file.name)}"`);
+                    res.set('Content-Length', decryptedBuffer.length);
+                    return res.send(decryptedBuffer);
+                } catch (decErr) {
+                    console.error('Decryption error (shared download):', decErr.message);
+                    return res.status(500).json({ error: 'Failed to decrypt file' });
+                }
+            }
+
+            return res.download(filePath, file.name);
+        }
+
+        // ZIP download for subfolders
+        const archiver = require('archiver');
+
+        function collectFiles(folderId, relativePath) {
+            const children = db.prepare(
+                'SELECT * FROM files WHERE parent_id = ? AND user_id = ? AND trashed = 0'
+            ).all(folderId, share.owner_id);
+            const collected = [];
+            for (const child of children) {
+                const childPath = relativePath ? `${relativePath}/${child.name}` : child.name;
+                if (child.type === 'folder') {
+                    collected.push(...collectFiles(child.id, childPath));
+                } else {
+                    let diskPath;
+                    if (child.storage_source_id && child.storage_source_id !== 'internal') {
+                        const src = db.prepare('SELECT path FROM storage_sources WHERE id = ?').get(child.storage_source_id);
+                        diskPath = src
+                            ? path.join(src.path, 'cloudpi-data', String(child.user_id), child.path)
+                            : path.join(storageDir, String(child.user_id), child.path);
+                    } else {
+                        diskPath = path.join(storageDir, String(child.user_id), child.path);
+                    }
+                    if (fs.existsSync(diskPath)) {
+                        collected.push({ diskPath, archivePath: childPath });
+                    }
+                }
+            }
+            return collected;
+        }
+
+        const filesToZip = collectFiles(file.id, '');
+        if (filesToZip.length === 0) {
+            return res.status(400).json({ error: 'Folder is empty' });
+        }
+
+        const zipName = `${file.name}.zip`;
+        res.set('Content-Type', 'application/zip');
+        res.set('Content-Disposition', `attachment; filename="${encodeURIComponent(zipName)}"`);
+
+        const archive = archiver('zip', { zlib: { level: 5 } });
+        archive.on('error', (err) => {
+            console.error('ZIP error:', err);
+            if (!res.headersSent) res.status(500).json({ error: 'ZIP creation failed' });
+        });
+        archive.pipe(res);
+        for (const { diskPath, archivePath } of filesToZip) {
+            archive.file(diskPath, { name: archivePath });
+        }
+        archive.finalize();
+    } catch (error) {
+        console.error('Download shared file error:', error);
+        if (!res.headersSent) res.status(500).json({ error: 'Server error' });
+    }
+});
+
+/**
+ * GET /api/shares/shared-folder/:shareId/preview/:fileId
+ * Preview a file from inside a shared folder (inline)
+ */
+router.get('/shared-folder/:shareId/preview/:fileId', requireAuth, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const shareId = req.params.shareId;
+        const fileId = req.params.fileId;
+
+        const share = db.prepare(`
+            SELECT s.*, f.user_id as owner_id
+            FROM shares s
+            JOIN files f ON s.file_id = f.id
+            WHERE s.id = ? AND s.shared_with = ?
+        `).get(shareId, userId);
+
+        if (!share) {
+            return res.status(404).json({ error: 'Share not found' });
+        }
+
+        const file = db.prepare(
+            "SELECT * FROM files WHERE id = ? AND user_id = ? AND type != 'folder' AND trashed = 0"
+        ).get(fileId, share.owner_id);
+
+        if (!file) {
+            return res.status(404).json({ error: 'File not found' });
+        }
+
+        // Verify scope
+        let currentId = file.parent_id;
+        let isDescendant = String(file.id) === String(share.file_id);
+        while (currentId && !isDescendant) {
+            if (String(currentId) === String(share.file_id)) {
+                isDescendant = true;
+                break;
+            }
+            const parent = db.prepare(
+                'SELECT parent_id FROM files WHERE id = ? AND user_id = ?'
+            ).get(currentId, share.owner_id);
+            if (!parent) break;
+            currentId = parent.parent_id;
+        }
+        if (!isDescendant) {
+            return res.status(403).json({ error: 'Access denied' });
+        }
+
+        const storageDir = path.join(__dirname, '..', 'storage');
+        let filePath;
+        if (file.storage_source_id && file.storage_source_id !== 'internal') {
+            const source = db.prepare('SELECT path FROM storage_sources WHERE id = ?').get(file.storage_source_id);
+            filePath = source
+                ? path.join(source.path, 'cloudpi-data', String(file.user_id), file.path)
+                : path.join(storageDir, String(file.user_id), file.path);
+        } else {
+            filePath = path.join(storageDir, String(file.user_id), file.path);
+        }
+
+        if (!fs.existsSync(filePath)) {
+            return res.status(404).json({ error: 'File not found on disk' });
+        }
+
+        res.set('Content-Type', file.mime_type || 'application/octet-stream');
+        res.set('Content-Disposition', `inline; filename="${encodeURIComponent(file.name)}"`);
+        res.set('Cache-Control', 'public, max-age=86400');
+
+        // Decrypt if file is encrypted
+        if (file.encrypted === 1) {
+            try {
+                const decryptedBuffer = await decryptFileToBuffer(filePath);
+                res.set('Content-Length', decryptedBuffer.length);
+                return res.send(decryptedBuffer);
+            } catch (decErr) {
+                console.error('Decryption error (shared preview):', decErr.message);
+                return res.status(500).json({ error: 'Failed to decrypt file for preview' });
+            }
+        }
+
+        res.sendFile(filePath);
+    } catch (error) {
+        console.error('Preview shared file error:', error);
         res.status(500).json({ error: 'Server error' });
     }
 });
@@ -219,13 +526,13 @@ router.delete('/:id', requireAuth, (req, res) => {
  * GET /api/shares/public/:link/download
  * Download a shared file (NO auth required)
  */
-router.get('/public/:link/download', (req, res) => {
+router.get('/public/:link/download', async (req, res) => {
     try {
         const shareLink = req.params.link;
 
         const share = db.prepare(`
             SELECT s.*, f.name as file_name, f.type as file_type, 
-                   f.path as file_path, f.mime_type, s.shared_by
+                   f.path as file_path, f.mime_type, f.encrypted, s.shared_by
             FROM shares s
             JOIN files f ON s.file_id = f.id
             WHERE s.share_link = ? AND f.type != 'folder'
@@ -241,6 +548,20 @@ router.get('/public/:link/download', (req, res) => {
             return res.status(404).json({ error: 'File not found on disk' });
         }
 
+        // Decrypt if file is encrypted
+        if (share.encrypted === 1) {
+            try {
+                const decryptedBuffer = await decryptFileToBuffer(filePath);
+                res.set('Content-Type', share.mime_type || 'application/octet-stream');
+                res.set('Content-Disposition', `attachment; filename="${share.file_name}"`);
+                res.set('Content-Length', decryptedBuffer.length);
+                return res.send(decryptedBuffer);
+            } catch (decErr) {
+                console.error('Decryption error (public download):', decErr.message);
+                return res.status(500).json({ error: 'Failed to decrypt file' });
+            }
+        }
+
         res.set('Content-Type', share.mime_type || 'application/octet-stream');
         res.set('Content-Disposition', `attachment; filename="${share.file_name}"`);
         res.sendFile(filePath);
@@ -254,13 +575,13 @@ router.get('/public/:link/download', (req, res) => {
  * GET /api/shares/public/:link/preview
  * View a shared file inline in the browser (NO auth required)
  */
-router.get('/public/:link/preview', (req, res) => {
+router.get('/public/:link/preview', async (req, res) => {
     try {
         const shareLink = req.params.link;
 
         const share = db.prepare(`
             SELECT s.*, f.name as file_name, f.type as file_type, 
-                   f.path as file_path, f.mime_type, s.shared_by
+                   f.path as file_path, f.mime_type, f.encrypted, s.shared_by
             FROM shares s
             JOIN files f ON s.file_id = f.id
             WHERE s.share_link = ? AND f.type != 'folder'
@@ -279,6 +600,19 @@ router.get('/public/:link/preview', (req, res) => {
         res.set('Content-Type', share.mime_type || 'application/octet-stream');
         res.set('Content-Disposition', `inline; filename="${share.file_name}"`);
         res.set('Cache-Control', 'public, max-age=86400');
+
+        // Decrypt if file is encrypted
+        if (share.encrypted === 1) {
+            try {
+                const decryptedBuffer = await decryptFileToBuffer(filePath);
+                res.set('Content-Length', decryptedBuffer.length);
+                return res.send(decryptedBuffer);
+            } catch (decErr) {
+                console.error('Decryption error (public preview):', decErr.message);
+                return res.status(500).json({ error: 'Failed to decrypt file for preview' });
+            }
+        }
+
         res.sendFile(filePath);
     } catch (error) {
         console.error('Public preview error:', error);

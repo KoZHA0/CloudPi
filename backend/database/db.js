@@ -12,9 +12,8 @@
 const Database = require("better-sqlite3");
 const path = require("path");
 
-// Create database file in the backend folder
-// path.join ensures it works on Windows, Mac, and Linux
-const dbPath = path.join(__dirname, "..", "cloudpi.db");
+// Database path: configurable via env var (for Docker), falls back to backend root
+const dbPath = process.env.CLOUDPI_DB_PATH || path.join(__dirname, "..", "cloudpi.db");
 const db = new Database(dbPath);
 
 // Enable foreign keys (SQLite has them disabled by default!)
@@ -62,6 +61,59 @@ try {
 } catch (e) {
   // Column already exists, ignore error
 }
+
+// Add 2FA columns
+try {
+  db.exec(`ALTER TABLE users ADD COLUMN two_factor_secret TEXT DEFAULT NULL`);
+  db.exec(`ALTER TABLE users ADD COLUMN two_factor_enabled INTEGER DEFAULT 0`);
+} catch (e) {
+  // Column already exists, ignore error
+}
+
+// Add is_disabled column (disable user without deleting)
+try {
+  db.exec(`ALTER TABLE users ADD COLUMN is_disabled INTEGER DEFAULT 0`);
+} catch (e) {
+  // Column already exists, ignore error
+}
+
+// Add failed_login_attempts counter (for account lockout)
+try {
+  db.exec(`ALTER TABLE users ADD COLUMN failed_login_attempts INTEGER DEFAULT 0`);
+} catch (e) {
+  // Column already exists, ignore error
+}
+
+// Add locked_until timestamp (NULL = not locked)
+try {
+  db.exec(`ALTER TABLE users ADD COLUMN locked_until DATETIME DEFAULT NULL`);
+} catch (e) {
+  // Column already exists, ignore error
+}
+
+// Add email field (optional, for notifications and future password reset)
+try {
+  db.exec(`ALTER TABLE users ADD COLUMN email TEXT DEFAULT NULL`);
+} catch (e) {
+  // Column already exists, ignore error
+}
+
+/**
+ * PASSWORD RESET TOKENS
+ * ---------------------
+ * Stores one-time use tokens for password recovery.
+ */
+db.exec(`
+  CREATE TABLE IF NOT EXISTS password_reset_tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    token_hash TEXT NOT NULL,
+    expires_at DATETIME NOT NULL,
+    used INTEGER DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+  )
+`);
 
 /**
  * FILES TABLE
@@ -187,6 +239,15 @@ const defaultSettings = [
   ["rate_limit_auth_window", "15", "Auth rate limit window in minutes"],
   ["rate_limit_upload_max", "10", "Max file uploads per 15 minutes per IP"],
   ["rate_limit_upload_window", "15", "Upload rate limit window in minutes"],
+  ["encryption_enabled", "1", "Enable AES-256-GCM file encryption at rest (1 = on, 0 = off)"],
+  ["password_min_length", "8", "Minimum password length"],
+  ["account_lockout_attempts", "5", "Failed login attempts before account lockout"],
+  ["account_lockout_duration", "15", "Account lockout duration in minutes"],
+  ["smtp_host", "", "SMTP server hostname"],
+  ["smtp_port", "587", "SMTP server port"],
+  ["smtp_user", "", "SMTP authentication username"],
+  ["smtp_pass", "", "SMTP authentication password (encrypted)"],
+  ["smtp_from_email", "", "Sender email address"],
 ];
 
 const insertSetting = db.prepare(
@@ -220,6 +281,27 @@ try {
   db.exec(
     `ALTER TABLE shares ADD COLUMN shared_with INTEGER REFERENCES users(id) ON DELETE CASCADE`,
   );
+} catch (e) {
+  // Column already exists, ignore
+}
+
+// Add storage_quota column if it doesn't exist (NULL = unlimited, value in bytes)
+try {
+  db.exec(`ALTER TABLE users ADD COLUMN storage_quota INTEGER DEFAULT NULL`);
+} catch (e) {
+  // Column already exists, ignore
+}
+
+// Add sha256_hash column for file integrity verification
+try {
+  db.exec(`ALTER TABLE files ADD COLUMN sha256_hash TEXT DEFAULT NULL`);
+} catch (e) {
+  // Column already exists, ignore
+}
+
+// Add encrypted flag to track which files are encrypted at rest
+try {
+  db.exec(`ALTER TABLE files ADD COLUMN encrypted INTEGER DEFAULT 0`);
 } catch (e) {
   // Column already exists, ignore
 }

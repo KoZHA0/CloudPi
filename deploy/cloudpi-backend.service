@@ -1,0 +1,53 @@
+# ==============================================================
+# CloudPi Backend — systemd Service File
+# ==============================================================
+# Install:
+#   sudo cp cloudpi-backend.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable cloudpi-backend
+#   sudo systemctl start cloudpi-backend
+#
+# Logs:
+#   journalctl -u cloudpi-backend -f
+#
+# NOTE: Adjust User/Group and paths if your Pi user isn't "pi"
+#       or if CloudPi is installed elsewhere.
+# ==============================================================
+
+[Unit]
+Description=CloudPi Backend API Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/cloudpi/backend
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=5
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# Load environment from .env
+EnvironmentFile=/home/pi/cloudpi/backend/.env
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/pi/cloudpi/backend/uploads /home/pi/cloudpi/backend/storage /home/pi/cloudpi/backend
+
+# Resource limits (adjust for your Pi model)
+# Pi 4 (4GB+): safe to increase MemoryMax to 1G
+# Pi 3/Zero: keep at 256M–512M
+MemoryMax=512M
+CPUQuota=80%
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cloudpi-backend
+
+[Install]
+WantedBy=multi-user.target

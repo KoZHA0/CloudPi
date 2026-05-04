@@ -29,13 +29,20 @@ import {
     ArrowDownLeft,
     Download,
     ExternalLink,
+    ChevronRight,
+    ArrowLeft,
+    FolderOpen,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import {
     getMyShares,
     getSharedWithMe,
     revokeShare,
+    getSharedFolderFiles,
+    downloadSharedFile,
     type ShareItem,
+    type FileItem,
+    type Breadcrumb,
 } from "@/lib/api"
 
 const API_BASE = `http://${window.location.hostname}:3001/api`
@@ -96,6 +103,15 @@ export function SharedContent() {
     const [error, setError] = useState<string | null>(null)
     const [revokeTarget, setRevokeTarget] = useState<ShareItem | null>(null)
 
+    // Shared folder browsing state
+    const [browsingShare, setBrowsingShare] = useState<ShareItem | null>(null)
+    const [browsingShareId, setBrowsingShareId] = useState<number | null>(null)
+    const [folderFiles, setFolderFiles] = useState<FileItem[]>([])
+    const [folderBreadcrumbs, setFolderBreadcrumbs] = useState<Breadcrumb[]>([])
+    const [rootFolderId, setRootFolderId] = useState<number | null>(null)
+    const [folderLoading, setFolderLoading] = useState(false)
+    const [currentParentId, setCurrentParentId] = useState<number | undefined>(undefined)
+
     useEffect(() => {
         loadShares()
     }, [])
@@ -129,8 +145,92 @@ export function SharedContent() {
     }
 
     async function handleDownloadShared(share: ShareItem) {
-        // Download via public share link (since user doesn't own the file)
-        window.open(`${API_BASE}/shares/public/${share.share_link}/download`, '_blank')
+        if (share.file_type === "folder") {
+            // Download the whole shared folder as ZIP
+            try {
+                await downloadSharedFile(share.id, share.file_id, `${share.file_name}.zip`)
+            } catch {
+                window.open(`${API_BASE}/shares/public/${share.share_link}/download`, '_blank')
+            }
+        } else {
+            window.open(`${API_BASE}/shares/public/${share.share_link}/download`, '_blank')
+        }
+    }
+
+    // Open a shared folder for browsing
+    async function openSharedFolder(share: ShareItem) {
+        setBrowsingShare(share)
+        setBrowsingShareId(share.id)
+        setFolderLoading(true)
+        setError(null)
+        setCurrentParentId(undefined)
+        try {
+            const data = await getSharedFolderFiles(share.id)
+            setFolderFiles(data.files)
+            setFolderBreadcrumbs(data.breadcrumbs)
+            setRootFolderId(data.rootFolderId)
+        } catch (err) {
+            setError(err instanceof Error ? err.message : "Failed to open shared folder")
+        } finally {
+            setFolderLoading(false)
+        }
+    }
+
+    // Navigate inside the shared folder
+    async function navigateToSubfolder(folderId: number) {
+        if (!browsingShareId) return
+        setFolderLoading(true)
+        setCurrentParentId(folderId)
+        try {
+            const data = await getSharedFolderFiles(browsingShareId, folderId)
+            setFolderFiles(data.files)
+            setFolderBreadcrumbs(data.breadcrumbs)
+        } catch (err) {
+            setError(err instanceof Error ? err.message : "Failed to load folder")
+        } finally {
+            setFolderLoading(false)
+        }
+    }
+
+    // Navigate via breadcrumb (or root)
+    async function navigateToBreadcrumb(folderId: number) {
+        if (!browsingShareId) return
+        if (folderId === rootFolderId) {
+            setCurrentParentId(undefined)
+            setFolderLoading(true)
+            try {
+                const data = await getSharedFolderFiles(browsingShareId)
+                setFolderFiles(data.files)
+                setFolderBreadcrumbs(data.breadcrumbs)
+            } catch (err) {
+                setError(err instanceof Error ? err.message : "Failed to load folder")
+            } finally {
+                setFolderLoading(false)
+            }
+        } else {
+            navigateToSubfolder(folderId)
+        }
+    }
+
+    // Download a file from inside the shared folder
+    async function handleDownloadFolderFile(file: FileItem) {
+        if (!browsingShareId) return
+        try {
+            const fileName = file.type === 'folder' ? `${file.name}.zip` : file.name
+            await downloadSharedFile(browsingShareId, file.id, fileName)
+        } catch (err) {
+            setError(err instanceof Error ? err.message : "Download failed")
+        }
+    }
+
+    // Go back to share list
+    function closeFolderBrowser() {
+        setBrowsingShare(null)
+        setBrowsingShareId(null)
+        setFolderFiles([])
+        setFolderBreadcrumbs([])
+        setRootFolderId(null)
+        setCurrentParentId(undefined)
     }
 
     const currentList = tab === "my-shares" ? myShares : sharedWithMe
@@ -143,6 +243,139 @@ export function SharedContent() {
         )
     }
 
+    // ==========================================
+    // SHARED FOLDER BROWSER VIEW
+    // ==========================================
+    if (browsingShare && browsingShareId) {
+        return (
+            <div className="space-y-6">
+                {/* Header */}
+                <div className="flex items-center gap-3">
+                    <Button variant="ghost" size="icon" onClick={closeFolderBrowser}>
+                        <ArrowLeft className="h-5 w-5" />
+                    </Button>
+                    <div>
+                        <h1 className="text-2xl font-bold text-foreground flex items-center gap-2">
+                            <Folder className="h-6 w-6 text-blue-400" />
+                            {browsingShare.file_name}
+                        </h1>
+                        <p className="text-sm text-muted-foreground">
+                            Shared by {browsingShare.shared_by_name}
+                        </p>
+                    </div>
+                </div>
+
+                {/* Breadcrumbs */}
+                {folderBreadcrumbs.length > 0 && (
+                    <div className="flex items-center gap-1 text-sm overflow-x-auto pb-2">
+                        {folderBreadcrumbs.map((crumb, i) => (
+                            <div key={crumb.id} className="flex items-center gap-1 flex-shrink-0">
+                                {i > 0 && <ChevronRight className="h-4 w-4 text-muted-foreground" />}
+                                <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    onClick={() => navigateToBreadcrumb(crumb.id)}
+                                    className="truncate max-w-[150px]"
+                                >
+                                    {i === 0 ? <><FolderOpen className="h-4 w-4 mr-1" />{crumb.name}</> : crumb.name}
+                                </Button>
+                            </div>
+                        ))}
+                    </div>
+                )}
+
+                {error && (
+                    <div className="bg-destructive/10 text-destructive px-4 py-3 rounded-lg text-sm">
+                        {error}
+                    </div>
+                )}
+
+                {folderLoading ? (
+                    <div className="flex items-center justify-center h-32">
+                        <Loader2 className="h-6 w-6 animate-spin text-primary" />
+                    </div>
+                ) : folderFiles.length === 0 ? (
+                    <Card className="bg-card border-border">
+                        <CardContent className="flex flex-col items-center justify-center py-16 text-center">
+                            <FolderOpen className="h-12 w-12 text-muted-foreground mb-4" />
+                            <h3 className="text-lg font-medium text-card-foreground">This folder is empty</h3>
+                        </CardContent>
+                    </Card>
+                ) : (
+                    <div className="grid gap-3">
+                        {folderFiles.map((file) => {
+                            const Icon = getFileIcon(file.type)
+                            return (
+                                <Card
+                                    key={file.id}
+                                    className={cn(
+                                        "bg-card border-border cursor-pointer transition-colors hover:bg-secondary",
+                                        file.type === "folder" && "hover:border-blue-500/30"
+                                    )}
+                                    onClick={() => {
+                                        if (file.type === "folder") {
+                                            navigateToSubfolder(file.id)
+                                        }
+                                    }}
+                                >
+                                    <CardContent className="p-4">
+                                        <div className="flex items-center gap-3">
+                                            <div className="rounded-lg bg-secondary p-2.5 shrink-0">
+                                                <Icon className={cn("h-5 w-5", getFileColor(file.type))} />
+                                            </div>
+                                            <div className="min-w-0 flex-1">
+                                                <p className="font-medium text-card-foreground truncate">
+                                                    {file.name}
+                                                </p>
+                                                <p className="text-xs text-muted-foreground">
+                                                    {formatFileSize(file.size)}
+                                                    {file.modified_at && <> · {formatDate(file.modified_at)}</>}
+                                                </p>
+                                            </div>
+                                            <div className="flex items-center gap-2">
+                                                {file.type !== "folder" && (
+                                                    <Button
+                                                        variant="outline"
+                                                        size="sm"
+                                                        className="gap-1.5"
+                                                        onClick={(e) => {
+                                                            e.stopPropagation()
+                                                            handleDownloadFolderFile(file)
+                                                        }}
+                                                    >
+                                                        <Download className="h-3.5 w-3.5" />
+                                                        <span className="hidden sm:inline">Download</span>
+                                                    </Button>
+                                                )}
+                                                {file.type === "folder" && (
+                                                    <Button
+                                                        variant="outline"
+                                                        size="sm"
+                                                        className="gap-1.5"
+                                                        onClick={(e) => {
+                                                            e.stopPropagation()
+                                                            handleDownloadFolderFile(file)
+                                                        }}
+                                                    >
+                                                        <Download className="h-3.5 w-3.5" />
+                                                        <span className="hidden sm:inline">ZIP</span>
+                                                    </Button>
+                                                )}
+                                            </div>
+                                        </div>
+                                    </CardContent>
+                                </Card>
+                            )
+                        })}
+                    </div>
+                )}
+            </div>
+        )
+    }
+
+    // ==========================================
+    // MAIN SHARES LIST VIEW
+    // ==========================================
     return (
         <div className="space-y-6">
             <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
@@ -245,26 +478,51 @@ export function SharedContent() {
                                                 {share.permission}
                                             </Badge>
 
-                                            {tab === "shared-with-me" && share.file_type !== "folder" && (
+                                            {tab === "shared-with-me" && (
                                                 <>
-                                                    <Button
-                                                        variant="outline"
-                                                        size="sm"
-                                                        className="gap-1.5"
-                                                        onClick={() => window.open(`${API_BASE}/shares/public/${share.share_link}/preview`, '_blank')}
-                                                    >
-                                                        <ExternalLink className="h-3.5 w-3.5" />
-                                                        <span className="hidden sm:inline">View</span>
-                                                    </Button>
-                                                    <Button
-                                                        variant="outline"
-                                                        size="sm"
-                                                        className="gap-1.5"
-                                                        onClick={() => handleDownloadShared(share)}
-                                                    >
-                                                        <Download className="h-3.5 w-3.5" />
-                                                        <span className="hidden sm:inline">Download</span>
-                                                    </Button>
+                                                    {share.file_type === "folder" ? (
+                                                        <>
+                                                            <Button
+                                                                variant="outline"
+                                                                size="sm"
+                                                                className="gap-1.5"
+                                                                onClick={() => openSharedFolder(share)}
+                                                            >
+                                                                <FolderOpen className="h-3.5 w-3.5" />
+                                                                <span className="hidden sm:inline">Open</span>
+                                                            </Button>
+                                                            <Button
+                                                                variant="outline"
+                                                                size="sm"
+                                                                className="gap-1.5"
+                                                                onClick={() => handleDownloadShared(share)}
+                                                            >
+                                                                <Download className="h-3.5 w-3.5" />
+                                                                <span className="hidden sm:inline">ZIP</span>
+                                                            </Button>
+                                                        </>
+                                                    ) : (
+                                                        <>
+                                                            <Button
+                                                                variant="outline"
+                                                                size="sm"
+                                                                className="gap-1.5"
+                                                                onClick={() => window.open(`${API_BASE}/shares/public/${share.share_link}/preview`, '_blank')}
+                                                            >
+                                                                <ExternalLink className="h-3.5 w-3.5" />
+                                                                <span className="hidden sm:inline">View</span>
+                                                            </Button>
+                                                            <Button
+                                                                variant="outline"
+                                                                size="sm"
+                                                                className="gap-1.5"
+                                                                onClick={() => handleDownloadShared(share)}
+                                                            >
+                                                                <Download className="h-3.5 w-3.5" />
+                                                                <span className="hidden sm:inline">Download</span>
+                                                            </Button>
+                                                        </>
+                                                    )}
                                                 </>
                                             )}
 

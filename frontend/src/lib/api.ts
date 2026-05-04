@@ -55,14 +55,23 @@ async function apiRequest<T>(
 export interface User {
     id: number;
     username: string;
+    email?: string | null;
     is_admin?: number;
+    is_disabled?: number;
+    failed_login_attempts?: number;
+    locked_until?: string | null;
     default_storage_id?: string;
+    storage_quota?: number | null;
+    used_bytes?: number;
+    two_factor_enabled?: number;
 }
 
 export interface AuthResponse {
     message: string;
-    token: string;
-    user: User;
+    token?: string;
+    user?: User;
+    requires_2fa?: boolean;
+    temp_token?: string;
 }
 
 export interface SetupResponse extends AuthResponse {
@@ -129,11 +138,45 @@ export interface ProfileUpdateResponse {
 }
 
 export async function updateProfile(
-    username: string
+    username: string,
+    email?: string
 ): Promise<ProfileUpdateResponse> {
     return apiRequest<ProfileUpdateResponse>('/auth/profile', {
         method: 'PUT',
-        body: JSON.stringify({ username }),
+        body: JSON.stringify({ username, email }),
+    });
+}
+
+// ============================================
+// TWO-FACTOR AUTH (2FA) API
+// ============================================
+
+export async function loginWith2FA(
+    tempToken: string,
+    code: string
+): Promise<AuthResponse> {
+    return apiRequest<AuthResponse>('/auth/login/2fa', {
+        method: 'POST',
+        body: JSON.stringify({ temp_token: tempToken, code }),
+    });
+}
+
+export async function setup2FA(): Promise<{ secret: string, qrCodeUrl: string }> {
+    return apiRequest<{ secret: string, qrCodeUrl: string }>('/auth/2fa/setup', {
+        method: 'GET',
+    });
+}
+
+export async function verify2FA(code: string): Promise<{ message: string, user: User }> {
+    return apiRequest<{ message: string, user: User }>('/auth/2fa/verify', {
+        method: 'POST',
+        body: JSON.stringify({ code }),
+    });
+}
+
+export async function disable2FA(): Promise<{ message: string, user: User }> {
+    return apiRequest<{ message: string, user: User }>('/auth/2fa/disable', {
+        method: 'POST',
     });
 }
 
@@ -144,6 +187,24 @@ export async function changePassword(
     return apiRequest<{ message: string }>('/auth/password', {
         method: 'PUT',
         body: JSON.stringify({ currentPassword, newPassword }),
+    });
+}
+
+export async function requestPasswordReset(email: string): Promise<{ message: string }> {
+    return apiRequest<{ message: string }>('/auth/forgot-password', {
+        method: 'POST',
+        body: JSON.stringify({ email }),
+    });
+}
+
+export async function resetPasswordWithToken(
+    email: string,
+    token: string,
+    newPassword: string
+): Promise<{ message: string }> {
+    return apiRequest<{ message: string }>('/auth/reset-password', {
+        method: 'POST',
+        body: JSON.stringify({ email, token, newPassword }),
     });
 }
 
@@ -158,11 +219,12 @@ export async function getUsers(): Promise<{ users: User[] }> {
 export async function createUser(
     username: string,
     password: string,
+    email?: string,
     isAdmin: boolean = false
 ): Promise<{ message: string; user: User }> {
     return apiRequest<{ message: string; user: User }>('/admin/users', {
         method: 'POST',
-        body: JSON.stringify({ username, password, isAdmin }),
+        body: JSON.stringify({ username, password, email, isAdmin }),
     });
 }
 
@@ -189,6 +251,44 @@ export async function updateUserStorage(
     return apiRequest<{ message: string }>(`/admin/users/${userId}/storage`, {
         method: 'PUT',
         body: JSON.stringify({ default_storage_id: storageId }),
+    });
+}
+
+export async function setUserQuota(
+    userId: number,
+    quotaMb: number | null
+): Promise<{ message: string; storage_quota: number | null }> {
+    return apiRequest<{ message: string; storage_quota: number | null }>(`/admin/users/${userId}/quota`, {
+        method: 'PUT',
+        body: JSON.stringify({ quota_mb: quotaMb }),
+    });
+}
+
+export async function disableUser(
+    userId: number,
+    disabled: boolean
+): Promise<{ message: string; is_disabled: number }> {
+    return apiRequest<{ message: string; is_disabled: number }>(`/admin/users/${userId}/disable`, {
+        method: 'PUT',
+        body: JSON.stringify({ disabled }),
+    });
+}
+
+export async function toggleUserRole(
+    userId: number,
+    isAdmin: boolean
+): Promise<{ message: string; is_admin: number }> {
+    return apiRequest<{ message: string; is_admin: number }>(`/admin/users/${userId}/role`, {
+        method: 'PUT',
+        body: JSON.stringify({ is_admin: isAdmin }),
+    });
+}
+
+export async function unlockUser(
+    userId: number
+): Promise<{ message: string }> {
+    return apiRequest<{ message: string }>(`/admin/users/${userId}/unlock`, {
+        method: 'PUT',
     });
 }
 
@@ -248,6 +348,15 @@ export async function getRecentFiles(): Promise<{ files: FileItem[] }> {
 // List trash
 export async function getTrash(): Promise<{ files: FileItem[] }> {
     return apiRequest<{ files: FileItem[] }>('/files/trash');
+}
+
+// Search across all files
+export interface SearchResult extends FileItem {
+    location: string; // breadcrumb path like "Documents / Work"
+}
+
+export async function searchFiles(query: string): Promise<{ files: SearchResult[]; query: string }> {
+    return apiRequest<{ files: SearchResult[]; query: string }>(`/files/search?q=${encodeURIComponent(query)}`);
 }
 
 // Create folder
@@ -409,6 +518,47 @@ export async function revokeShare(shareId: number): Promise<{ message: string }>
     });
 }
 
+// Browse inside a shared folder
+export interface SharedFolderResponse {
+    files: FileItem[];
+    breadcrumbs: Breadcrumb[];
+    shareId: number;
+    rootFolderId: number;
+}
+
+export async function getSharedFolderFiles(shareId: number, parentId?: number): Promise<SharedFolderResponse> {
+    const query = parentId ? `?parent_id=${parentId}` : '';
+    return apiRequest<SharedFolderResponse>(`/shares/shared-folder/${shareId}/files${query}`);
+}
+
+// Download a file from a shared folder
+export async function downloadSharedFile(shareId: number, fileId: number, fileName: string): Promise<void> {
+    const token = getToken();
+    const response = await fetch(`${API_BASE}/shares/shared-folder/${shareId}/download/${fileId}`, {
+        headers: {
+            'Authorization': `Bearer ${token}`,
+        },
+    });
+
+    if (!response.ok) throw new Error('Download failed');
+
+    const blob = await response.blob();
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    window.URL.revokeObjectURL(url);
+    a.remove();
+}
+
+// Get preview URL for a file inside a shared folder
+export function getSharedFilePreviewUrl(shareId: number, fileId: number): string {
+    const token = getToken();
+    return `${API_BASE}/shares/shared-folder/${shareId}/preview/${fileId}?token=${token}`;
+}
+
 // ============= DASHBOARD =============
 
 export interface DashboardStats {
@@ -459,12 +609,21 @@ export async function getRateLimitSettings(): Promise<{ settings: RateLimitSetti
     return apiRequest<{ settings: RateLimitSettings }>('/admin/settings');
 }
 
-export async function updateRateLimitSettings(
-    settings: Record<string, string | number>
+export async function updateSettings(
+    settings: Record<string, string>
 ): Promise<{ message: string; updated: string[] }> {
     return apiRequest<{ message: string; updated: string[] }>('/admin/settings', {
         method: 'PUT',
         body: JSON.stringify({ settings }),
+    });
+}
+
+export async function testSmtpSettings(
+    settings: Record<string, string>
+): Promise<{ message: string }> {
+    return apiRequest<{ message: string }>('/admin/settings/test-smtp', {
+        method: 'POST',
+        body: JSON.stringify(settings),
     });
 }
 
@@ -519,18 +678,14 @@ export async function removeStorageSource(
 // ============= DRIVE MANAGEMENT =============
 
 export interface DetectedDrive {
-    device: string;
     name: string;
-    size: string;
-    fstype: string | null;
-    mountpoint: string | null;
-    label: string | null;
-    model: string;
-    uuid: string | null;
+    path: string;
+    size: number;
+    freeBytes: number;
+    label: string;
     isMounted: boolean;
     isRegistered: boolean;
     registeredId: string | null;
-    fsWarning: string | null;
 }
 
 export interface RegisteredSource {
@@ -551,23 +706,5 @@ export interface DrivesScanResponse {
 
 export async function scanDrives(): Promise<DrivesScanResponse> {
     return apiRequest<DrivesScanResponse>('/admin/drives');
-}
-
-export async function mountDrive(
-    device: string
-): Promise<{ message: string; mountpoint: string; device: string; label: string | null; uuid: string | null; fstype: string | null }> {
-    return apiRequest('/admin/drives/mount', {
-        method: 'POST',
-        body: JSON.stringify({ device }),
-    });
-}
-
-export async function unmountDrive(
-    device: string
-): Promise<{ message: string }> {
-    return apiRequest<{ message: string }>('/admin/drives/unmount', {
-        method: 'POST',
-        body: JSON.stringify({ device }),
-    });
 }
 

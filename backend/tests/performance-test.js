@@ -43,10 +43,10 @@ const path = require('path');
 // CONFIGURATION — UPDATE THESE BEFORE RUNNING
 // ============================================================
 const CONFIG = {
-    host: 'localhost',
+    host: 'pi.taild54945.ts.net',
     port: 3001,
-    username: 'admin',       // ← Change to your username
-    password: 'admin123',    // ← Change to your password
+    username: 'Admin',       // ← Change to your username
+    password: '123456',    // ← Change to your password
 };
 
 // Test parameters
@@ -365,6 +365,22 @@ async function runPerformanceTests(token) {
     const totalTests = FILE_SIZES.length * COMPRESSION_LEVELS.length;
     let testNum = 0;
 
+    // Warmup request — eliminates cold start skewing the first result
+    process.stdout.write('\n🔥 Warming up server (1 dummy upload)...');
+    try {
+        const warmupBuffer = crypto.randomBytes(1024);
+        const warmupFile = path.join(TEMP_DIR, 'warmup.bin');
+        fs.writeFileSync(warmupFile, warmupBuffer);
+        const { fileId } = await uploadFile(token, warmupFile, 'warmup.bin');
+        await downloadFile(token, fileId);
+        await deleteFile(token, fileId);
+        fs.unlinkSync(warmupFile);
+        console.log(' ✅ Ready');
+    } catch (e) {
+        console.log(' ⚠️ Warmup failed (continuing anyway)');
+    }
+    await sleep(500);
+
     for (const size of FILE_SIZES) {
         for (const compression of COMPRESSION_LEVELS) {
             testNum++;
@@ -609,10 +625,10 @@ function printSummaryTable(results) {
     console.log('─'.repeat(100));
 
     const categories = [
-        { label: 'Small (50KB)',     size: '50 KB',  testCase: 'Random data' },
-        { label: 'Medium (1MB)',     size: '1 MB',   testCase: 'Mixed data' },
-        { label: 'Standard (5MB)',   size: '5 MB',   testCase: 'Mixed data' },
-        { label: 'Large (25MB)',     size: '25 MB',  testCase: 'Repetitive data' },
+        { label: 'Small (50KB)',     size: '50 KB',  sizeMB: 50 / 1024,  testCase: 'Random data' },
+        { label: 'Medium (1MB)',     size: '1 MB',   sizeMB: 1,          testCase: 'Mixed data' },
+        { label: 'Standard (5MB)',   size: '5 MB',   sizeMB: 5,          testCase: 'Mixed data' },
+        { label: 'Large (25MB)',     size: '25 MB',  sizeMB: 25,         testCase: 'Repetitive data' },
     ];
 
     const header = [
@@ -632,20 +648,19 @@ function printSummaryTable(results) {
         const matching = results.filter(r => r.fileSize === cat.size);
         if (matching.length === 0) continue;
 
-        const avgUpload = matching.reduce((s, r) => s + parseFloat(r.uploadTime), 0) / matching.length;
-        const avgDownload = matching.reduce((s, r) => s + parseFloat(r.downloadTime), 0) / matching.length;
+        const avgUploadSpeed = matching.reduce((s, r) => s + (cat.sizeMB / parseFloat(r.uploadTime)), 0) / matching.length;
+        const avgDownloadSpeed = matching.reduce((s, r) => s + (cat.sizeMB / parseFloat(r.downloadTime)), 0) / matching.length;
         const avgCpu = Math.round(matching.reduce((s, r) => s + r.cpuUsage, 0) / matching.length);
         const maxMem = Math.max(...matching.map(r => r.memoryUsage));
 
         // Estimate hash verification time based on file size
-        const fileMB = parseFloat(cat.size);
-        const hashTimeMs = fileMB <= 0.1 ? '<5ms' : fileMB <= 1 ? '~15ms' : fileMB <= 5 ? '~45ms' : '~180ms';
+        const hashTimeMs = cat.sizeMB <= 0.1 ? '<5ms' : cat.sizeMB <= 1 ? '~15ms' : cat.sizeMB <= 5 ? '~45ms' : '~180ms';
 
         const row = [
             cat.label.padEnd(18),
             cat.testCase.padEnd(18),
-            (avgUpload.toFixed(2) + ' MB/s').padEnd(14),
-            (avgDownload.toFixed(2) + ' MB/s').padEnd(14),
+            (avgUploadSpeed.toFixed(2) + ' MB/s').padEnd(14),
+            (avgDownloadSpeed.toFixed(2) + ' MB/s').padEnd(14),
             (avgCpu + '%').padEnd(9),
             (maxMem + '').padEnd(10),
             hashTimeMs.padEnd(10),
@@ -715,21 +730,20 @@ function saveMarkdown(perfResults, concurrentResults) {
     md += '|-------------------|-----------|--------------------------|----------------------------|---------------|----------------|----------------------------|\n';
 
     const summaryData = [
-        { label: 'Small (50KB)',   size: '50 KB',  testCase: 'Random data' },
-        { label: 'Medium (1MB)',   size: '1 MB',   testCase: 'Mixed data' },
-        { label: 'Standard (5MB)', size: '5 MB',   testCase: 'Mixed data' },
-        { label: 'Large (25MB)',   size: '25 MB',  testCase: 'Repetitive data' },
+        { label: 'Small (50KB)',   size: '50 KB',  sizeMB: 50 / 1024,  testCase: 'Random data' },
+        { label: 'Medium (1MB)',   size: '1 MB',   sizeMB: 1,          testCase: 'Mixed data' },
+        { label: 'Standard (5MB)', size: '5 MB',   sizeMB: 5,          testCase: 'Mixed data' },
+        { label: 'Large (25MB)',   size: '25 MB',  sizeMB: 25,         testCase: 'Repetitive data' },
     ];
 
     for (const cat of summaryData) {
         const matching = perfResults.filter(r => r.fileSize === cat.size);
         if (matching.length === 0) continue;
-        const fileSizeMB = parseFloat(cat.size) || (parseInt(cat.size) / 1024);
-        const avgUploadSpeed = matching.reduce((s, r) => s + (fileSizeMB / parseFloat(r.uploadTime)), 0) / matching.length;
-        const avgDownloadSpeed = matching.reduce((s, r) => s + (fileSizeMB / parseFloat(r.downloadTime)), 0) / matching.length;
+        const avgUploadSpeed = matching.reduce((s, r) => s + (cat.sizeMB / parseFloat(r.uploadTime)), 0) / matching.length;
+        const avgDownloadSpeed = matching.reduce((s, r) => s + (cat.sizeMB / parseFloat(r.downloadTime)), 0) / matching.length;
         const avgCpu = Math.round(matching.reduce((s, r) => s + r.cpuUsage, 0) / matching.length);
         const maxMem = Math.max(...matching.map(r => r.memoryUsage));
-        const hashTime = fileSizeMB <= 0.1 ? '<5' : fileSizeMB <= 1 ? '15' : fileSizeMB <= 5 ? '45' : '180';
+        const hashTime = cat.sizeMB <= 0.1 ? '<5' : cat.sizeMB <= 1 ? '15' : cat.sizeMB <= 5 ? '45' : '180';
 
         md += `| ${cat.label} | ${cat.testCase} | ${avgUploadSpeed.toFixed(1)} | ${avgDownloadSpeed.toFixed(1)} | ${avgCpu}% | ${maxMem}MB | ${hashTime}ms |\n`;
     }

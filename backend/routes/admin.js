@@ -14,6 +14,7 @@
  * POST   /api/admin/storage            - Register external drive
  * PUT    /api/admin/storage/:id        - Update storage source
  * DELETE /api/admin/storage/:id        - Remove storage source
+ * POST   /api/admin/storage/:id/reactivate - Reactivate a returning drive (explicit admin action)
  * GET    /api/admin/drives             - Detect auto-mounted USB drives
  *
  * ARCHITECTURE NOTE:
@@ -51,13 +52,23 @@ function requireAdmin(req, res, next) {
         const token = authHeader.split(' ')[1];
         const decoded = jwt.verify(token, JWT_SECRET);
 
-        // Get user from database to check admin status
+        // Get user from database to check admin status and token validity
         const user = db.prepare(
-            'SELECT id, is_admin FROM users WHERE id = ?'
+            'SELECT id, is_admin, is_disabled, token_version FROM users WHERE id = ?'
         ).get(decoded.userId);
 
         if (!user) {
             return res.status(401).json({ error: 'User not found' });
+        }
+
+        if (user.is_disabled) {
+            return res.status(403).json({ error: 'Account is disabled' });
+        }
+
+        const tokenVersion = decoded.tokenVersion || 0;
+        const dbTokenVersion = user.token_version || 1;
+        if (tokenVersion !== dbTokenVersion) {
+            return res.status(401).json({ error: 'Token expired or invalidated' });
         }
 
         if (!user.is_admin) {
@@ -186,7 +197,7 @@ router.put('/users/:id/password', requireAdmin, async (req, res) => {
 
         // Check if target user exists
         const targetUser = db.prepare(
-            'SELECT id, username, is_admin FROM users WHERE id = ?'
+            'SELECT id, username, is_admin, token_version FROM users WHERE id = ?'
         ).get(userId);
 
         if (!targetUser) {
@@ -775,7 +786,7 @@ router.post('/storage', requireAdmin, (req, res) => {
             VALUES (?, ?, ?, 'external', 1, ?)
         `).run(driveId, label, drivePath, totalBytes);
 
-        console.log(`💾 Registered storage: ${label} at ${drivePath} (${driveId})`);
+        console.log(`💾 [AUDIT] Drive registered by admin (user_id=${currentUserId}): ${label} at ${drivePath} (${driveId})`);
 
         const source = db.prepare('SELECT * FROM storage_sources WHERE id = ?').get(driveId);
         res.status(201).json({ message: 'Storage source registered!', source });
@@ -861,7 +872,7 @@ router.delete('/storage/:id', requireAdmin, (req, res) => {
         }
 
         db.prepare('DELETE FROM storage_sources WHERE id = ?').run(sourceId);
-        console.log(`💾 Removed storage: ${source.label} (${sourceId})`);
+        console.log(`💾 [AUDIT] Drive removed by admin (user_id=${currentUserId}): ${source.label} (${sourceId})`);
 
         res.json({ message: 'Storage source removed' });
 
@@ -1002,13 +1013,25 @@ router.get('/drives', requireAdmin, async (req, res) => {
             };
         });
 
-        // Auto-reactivate registered drives that reappeared
+        // SECURITY: Do NOT auto-reactivate drives silently.
+        // A crafted .cloudpi-id on a rogue USB could spoof a trusted drive.
+        // Instead, flag drives that need reactivation — admin must click to confirm.
         for (const drive of drives) {
             if (drive.isRegistered && drive.registeredId) {
-                db.prepare(
-                    'UPDATE storage_sources SET is_active = 1, path = ? WHERE id = ? AND is_active = 0'
-                ).run(drive.path, drive.registeredId);
+                const src = enrichedSources.find(s => s.id === drive.registeredId);
+                if (src && !src.is_active) {
+                    drive.needs_reactivation = true;
+                }
             }
+        }
+
+        // Audit log: record scan event
+        console.log(`🔍 [AUDIT] Drive scan by admin (user_id=${currentUserId}): found ${drives.length} drive(s), ${enrichedSources.length} registered source(s)`);
+
+        // Log unknown drives (not in allow-list)
+        const unknownDrives = drives.filter(d => !d.isRegistered);
+        if (unknownDrives.length > 0) {
+            console.warn(`⚠️ [AUDIT] Unknown drive(s) detected: ${unknownDrives.map(d => d.path).join(', ')}`);
         }
 
         res.json({
@@ -1020,6 +1043,53 @@ router.get('/drives', requireAdmin, async (req, res) => {
     } catch (error) {
         console.error('Drive scan error:', error);
         res.status(500).json({ error: `Failed to scan drives: ${error.message}` });
+    }
+});
+
+/**
+ * POST /api/admin/storage/:id/reactivate
+ * Explicitly reactivate a previously registered drive that has reappeared.
+ * Replaces the old silent auto-reactivation for security.
+ * Body: { path: "/media/pi/MyDrive" }
+ */
+router.post('/storage/:id/reactivate', requireAdmin, (req, res) => {
+    try {
+        const currentUserId = req.user.userId;
+        if (currentUserId !== 1) {
+            return res.status(403).json({ error: 'Only the Super Admin can reactivate drives' });
+        }
+
+        const sourceId = req.params.id;
+        const { path: drivePath } = req.body;
+
+        // Verify the storage source exists in our DB
+        const source = db.prepare('SELECT * FROM storage_sources WHERE id = ?').get(sourceId);
+        if (!source) {
+            return res.status(404).json({ error: 'Storage source not found in registry' });
+        }
+
+        if (source.is_active) {
+            return res.status(400).json({ error: 'Storage source is already active' });
+        }
+
+        // Verify the drive path is accessible
+        const targetPath = drivePath || source.path;
+        if (!fs.existsSync(targetPath)) {
+            return res.status(400).json({ error: `Drive path not accessible: ${targetPath}` });
+        }
+
+        // Reactivate
+        db.prepare('UPDATE storage_sources SET is_active = 1, path = ? WHERE id = ?')
+            .run(targetPath, sourceId);
+
+        console.log(`✅ [AUDIT] Drive reactivated by admin (user_id=${currentUserId}): ${source.label} (${sourceId}) at ${targetPath}`);
+
+        const updated = db.prepare('SELECT * FROM storage_sources WHERE id = ?').get(sourceId);
+        res.json({ message: `Drive "${source.label}" reactivated successfully`, source: updated });
+
+    } catch (error) {
+        console.error('Reactivate storage error:', error);
+        res.status(500).json({ error: 'Server error' });
     }
 });
 

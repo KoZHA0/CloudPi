@@ -11,8 +11,12 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog"
 import { Bell, Globe, Palette, HardDrive, Trash2, Server, Database, Loader2, Shield, Save, CheckCircle2, Plus, Usb, Mail, Send } from "lucide-react"
-import { getDashboardStats, getSystemHealth, getRateLimitSettings, updateSettings, testSmtpSettings, getStorageSources, addStorageSource, removeStorageSource, type DashboardStats, type SystemHealth, type StorageSource } from "@/lib/api"
+import { getDashboardStats, getSystemHealth, getRateLimitSettings, updateSettings, testSmtpSettings, getStorageSources, addStorageSource, removeStorageSource, type DashboardStats, type RateLimitSettings, type SystemHealth, type StorageSource } from "@/lib/api"
 import { useAuth } from "@/contexts/auth-context"
+
+function getErrorMessage(error: unknown, fallback: string): string {
+    return error instanceof Error ? error.message : fallback
+}
 
 function formatBytes(bytes: number): string {
     if (bytes === 0) return "0 B"
@@ -80,24 +84,21 @@ export function SettingsContent() {
 
     async function loadData() {
         try {
-            const promises: Promise<any>[] = [
+            const [statsData, healthData] = await Promise.all([
                 getDashboardStats(),
                 getSystemHealth(),
-            ]
+            ])
 
-            // Only load admin settings if admin
-            if (isAdmin) {
-                promises.push(getRateLimitSettings())
-                promises.push(getStorageSources())
-            }
-
-            const results = await Promise.all(promises)
-            setStats(results[0])
-            setHealth(results[1])
+            setStats(statsData)
+            setHealth(healthData)
 
             // Set rate limit settings if admin
-            if (isAdmin && results[2]?.settings) {
-                const s = results[2].settings
+            if (isAdmin) {
+                const [settingsData, storageData] = await Promise.all([
+                    getRateLimitSettings(),
+                    getStorageSources(),
+                ])
+                const s: RateLimitSettings = settingsData.settings
                 setRateLimits({
                     rate_limit_api_max: s.rate_limit_api_max?.value || '100',
                     rate_limit_api_window: s.rate_limit_api_window?.value || '15',
@@ -113,9 +114,7 @@ export function SettingsContent() {
                     smtp_pass: s.smtp_pass?.value ? '********' : '',
                     smtp_from_email: s.smtp_from_email?.value || '',
                 })
-            }
-            if (isAdmin && results[3]?.sources) {
-                setStorageSources(results[3].sources)
+                setStorageSources(storageData.sources)
             }
         } catch (error) {
             console.error("Failed to load settings data", error)
@@ -131,8 +130,8 @@ export function SettingsContent() {
             await updateSettings(rateLimits)
             setSaveMessage('Settings saved successfully!')
             setTimeout(() => setSaveMessage(''), 3000)
-        } catch (error: any) {
-            setSaveMessage(error.message || 'Failed to save settings')
+        } catch (error: unknown) {
+            setSaveMessage(getErrorMessage(error, 'Failed to save settings'))
         } finally {
             setIsSaving(false)
         }
@@ -145,8 +144,8 @@ export function SettingsContent() {
             await updateSettings(smtpSettings)
             setSaveMessage('Email settings saved successfully!')
             setTimeout(() => setSaveMessage(''), 3000)
-        } catch (error: any) {
-            setSaveMessage(error.message || 'Failed to save email settings')
+        } catch (error: unknown) {
+            setSaveMessage(getErrorMessage(error, 'Failed to save email settings'))
         } finally {
             setIsSaving(false)
         }
@@ -158,8 +157,8 @@ export function SettingsContent() {
         try {
             const result = await testSmtpSettings(smtpSettings)
             setSmtpTestMessage(result.message)
-        } catch (error: any) {
-            setSmtpTestMessage(error.message || 'SMTP test failed')
+        } catch (error: unknown) {
+            setSmtpTestMessage(getErrorMessage(error, 'SMTP test failed'))
         } finally {
             setIsTestingSmtp(false)
         }
@@ -178,8 +177,8 @@ export function SettingsContent() {
             // Refresh storage sources
             const data = await getStorageSources()
             setStorageSources(data.sources)
-        } catch (error: any) {
-            setStorageMessage(error.message || 'Failed to add storage')
+        } catch (error: unknown) {
+            setStorageMessage(getErrorMessage(error, 'Failed to add storage'))
         } finally {
             setIsAddingStorage(false)
         }
@@ -192,8 +191,8 @@ export function SettingsContent() {
             setStorageSources(data.sources)
             setStorageMessage('Storage source removed')
             setTimeout(() => setStorageMessage(''), 3000)
-        } catch (error: any) {
-            setStorageMessage(error.message || 'Failed to remove storage')
+        } catch (error: unknown) {
+            setStorageMessage(getErrorMessage(error, 'Failed to remove storage'))
         }
     }
 

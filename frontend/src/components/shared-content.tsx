@@ -45,7 +45,7 @@ import {
     type Breadcrumb,
 } from "@/lib/api"
 
-const API_BASE = `http://${window.location.hostname}:3001/api`
+const API_BASE = "/api"
 
 const getFileIcon = (type: string) => {
     const icons: Record<string, typeof FileText> = {
@@ -110,7 +110,6 @@ export function SharedContent() {
     const [folderBreadcrumbs, setFolderBreadcrumbs] = useState<Breadcrumb[]>([])
     const [rootFolderId, setRootFolderId] = useState<number | null>(null)
     const [folderLoading, setFolderLoading] = useState(false)
-    const [currentParentId, setCurrentParentId] = useState<number | undefined>(undefined)
 
     useEffect(() => {
         loadShares()
@@ -163,7 +162,6 @@ export function SharedContent() {
         setBrowsingShareId(share.id)
         setFolderLoading(true)
         setError(null)
-        setCurrentParentId(undefined)
         try {
             const data = await getSharedFolderFiles(share.id)
             setFolderFiles(data.files)
@@ -180,7 +178,6 @@ export function SharedContent() {
     async function navigateToSubfolder(folderId: number) {
         if (!browsingShareId) return
         setFolderLoading(true)
-        setCurrentParentId(folderId)
         try {
             const data = await getSharedFolderFiles(browsingShareId, folderId)
             setFolderFiles(data.files)
@@ -196,7 +193,6 @@ export function SharedContent() {
     async function navigateToBreadcrumb(folderId: number) {
         if (!browsingShareId) return
         if (folderId === rootFolderId) {
-            setCurrentParentId(undefined)
             setFolderLoading(true)
             try {
                 const data = await getSharedFolderFiles(browsingShareId)
@@ -230,7 +226,6 @@ export function SharedContent() {
         setFolderFiles([])
         setFolderBreadcrumbs([])
         setRootFolderId(null)
-        setCurrentParentId(undefined)
     }
 
     const currentList = tab === "my-shares" ? myShares : sharedWithMe

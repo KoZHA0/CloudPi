@@ -9,7 +9,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { recoverWithCode, setToken } from "@/lib/api"
 import { useAuth } from "@/contexts/auth-context"
 
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:3001/api';
+const API_BASE = import.meta.env.VITE_API_URL || '/api';
 
 type Step = 'username' | 'backup-code' | 'not-super-admin' | 'success'
 

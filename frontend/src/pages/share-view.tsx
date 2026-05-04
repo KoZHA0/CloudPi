@@ -17,7 +17,7 @@ import {
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 
-const API_BASE = `http://${window.location.hostname}:3001/api`
+const API_BASE = "/api"
 
 const getFileIcon = (type: string) => {
     const icons: Record<string, typeof FileText> = {

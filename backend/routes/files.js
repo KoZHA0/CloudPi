@@ -259,10 +259,14 @@ function requireAuth(req, res, next) {
         const decoded = jwt.verify(token, JWT_SECRET);
 
         // Validate token_version against database and fetch admin status
-        const user = db.prepare('SELECT token_version, is_admin FROM users WHERE id = ?').get(decoded.userId);
+        const user = db.prepare('SELECT token_version, is_admin, is_disabled FROM users WHERE id = ?').get(decoded.userId);
         
         if (!user) {
             return res.status(401).json({ error: 'User not found' });
+        }
+
+        if (user.is_disabled) {
+            return res.status(403).json({ error: 'Account is disabled' });
         }
 
         const tokenVersion = decoded.tokenVersion || 0;
@@ -651,8 +655,9 @@ router.get('/:id/preview', async (req, res) => {
         const fileId = req.params.id;
 
         // Validate token_version
-        const dbUser = db.prepare('SELECT token_version FROM users WHERE id = ?').get(userId);
+        const dbUser = db.prepare('SELECT token_version, is_disabled FROM users WHERE id = ?').get(userId);
         if (!dbUser) return res.status(401).json({ error: 'User not found' });
+        if (dbUser.is_disabled) return res.status(403).json({ error: 'Account is disabled' });
         
         if (decoded.tokenVersion !== undefined) {
             if (decoded.tokenVersion !== (dbUser.token_version || 1)) {
@@ -788,7 +793,11 @@ router.get('/:id/download', requireAuth, async (req, res) => {
                 } else {
                     const diskPath = resolveFilePath(child);
                     if (fs.existsSync(diskPath)) {
-                        collected.push({ diskPath, archivePath: childPath });
+                        collected.push({
+                            diskPath,
+                            archivePath: childPath,
+                            encrypted: child.encrypted === 1
+                        });
                     }
                 }
             }
@@ -813,8 +822,13 @@ router.get('/:id/download', requireAuth, async (req, res) => {
         });
         archive.pipe(res);
 
-        for (const { diskPath, archivePath } of filesToZip) {
-            archive.file(diskPath, { name: archivePath });
+        for (const { diskPath, archivePath, encrypted } of filesToZip) {
+            if (encrypted) {
+                const decryptedBuffer = await decryptFileToBuffer(diskPath);
+                archive.append(decryptedBuffer, { name: archivePath });
+            } else {
+                archive.file(diskPath, { name: archivePath });
+            }
         }
 
         archive.finalize();

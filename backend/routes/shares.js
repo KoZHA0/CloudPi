@@ -26,6 +26,16 @@ const router = express.Router();
 
 const STORAGE_DIR = path.join(__dirname, '..', 'storage');
 
+function resolveSharedFilePath(file) {
+    if (file.storage_source_id && file.storage_source_id !== 'internal') {
+        const source = db.prepare('SELECT path FROM storage_sources WHERE id = ?').get(file.storage_source_id);
+        if (source) {
+            return path.join(source.path, 'cloudpi-data', String(file.user_id), file.path);
+        }
+    }
+    return path.join(STORAGE_DIR, String(file.user_id), file.path);
+}
+
 // Auth middleware
 function requireAuth(req, res, next) {
     try {
@@ -37,8 +47,9 @@ function requireAuth(req, res, next) {
         const token = authHeader.split(' ')[1];
         const decoded = jwt.verify(token, JWT_SECRET);
 
-        const dbUser = db.prepare('SELECT token_version FROM users WHERE id = ?').get(decoded.userId);
+        const dbUser = db.prepare('SELECT token_version, is_disabled FROM users WHERE id = ?').get(decoded.userId);
         if (!dbUser) return res.status(401).json({ error: 'User not found' });
+        if (dbUser.is_disabled) return res.status(403).json({ error: 'Account is disabled' });
         if (decoded.tokenVersion !== undefined) {
             if (decoded.tokenVersion !== (dbUser.token_version || 1)) {
                 return res.status(401).json({ error: 'Token invalidated' });
@@ -312,7 +323,11 @@ router.get('/shared-folder/:shareId/download/:fileId', requireAuth, async (req, 
                         diskPath = path.join(storageDir, String(child.user_id), child.path);
                     }
                     if (fs.existsSync(diskPath)) {
-                        collected.push({ diskPath, archivePath: childPath });
+                        collected.push({
+                            diskPath,
+                            archivePath: childPath,
+                            encrypted: child.encrypted === 1
+                        });
                     }
                 }
             }
@@ -334,8 +349,13 @@ router.get('/shared-folder/:shareId/download/:fileId', requireAuth, async (req, 
             if (!res.headersSent) res.status(500).json({ error: 'ZIP creation failed' });
         });
         archive.pipe(res);
-        for (const { diskPath, archivePath } of filesToZip) {
-            archive.file(diskPath, { name: archivePath });
+        for (const { diskPath, archivePath, encrypted } of filesToZip) {
+            if (encrypted) {
+                const decryptedBuffer = await decryptFileToBuffer(diskPath);
+                archive.append(decryptedBuffer, { name: archivePath });
+            } else {
+                archive.file(diskPath, { name: archivePath });
+            }
         }
         archive.finalize();
     } catch (error) {
@@ -523,6 +543,45 @@ router.delete('/:id', requireAuth, (req, res) => {
 });
 
 /**
+ * GET /api/shares/public/:link
+ * Return metadata for a public share link (NO auth required)
+ */
+router.get('/public/:link', (req, res) => {
+    try {
+        const shareLink = req.params.link;
+
+        const share = db.prepare(`
+            SELECT s.permission, s.created_at,
+                   f.name, f.type, f.size, f.mime_type,
+                   u.username as shared_by
+            FROM shares s
+            JOIN files f ON s.file_id = f.id
+            JOIN users u ON s.shared_by = u.id
+            WHERE s.share_link = ? AND f.trashed = 0
+        `).get(shareLink);
+
+        if (!share) {
+            return res.status(404).json({ error: 'Share link not found' });
+        }
+
+        res.json({
+            file: {
+                name: share.name,
+                type: share.type,
+                size: share.size,
+                mime_type: share.mime_type,
+                shared_by: share.shared_by,
+                permission: share.permission,
+                created_at: share.created_at
+            }
+        });
+    } catch (error) {
+        console.error('Public share metadata error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+/**
  * GET /api/shares/public/:link/download
  * Download a shared file (NO auth required)
  */
@@ -532,17 +591,21 @@ router.get('/public/:link/download', async (req, res) => {
 
         const share = db.prepare(`
             SELECT s.*, f.name as file_name, f.type as file_type, 
-                   f.path as file_path, f.mime_type, f.encrypted, s.shared_by
+                   f.path as file_path, f.mime_type, f.encrypted, f.storage_source_id, f.user_id, s.shared_by
             FROM shares s
             JOIN files f ON s.file_id = f.id
-            WHERE s.share_link = ? AND f.type != 'folder'
+            WHERE s.share_link = ? AND f.type != 'folder' AND f.trashed = 0
         `).get(shareLink);
 
         if (!share) {
             return res.status(404).json({ error: 'Share link not found' });
         }
 
-        const filePath = path.join(STORAGE_DIR, String(share.shared_by), share.file_path);
+        const filePath = resolveSharedFilePath({
+            user_id: share.user_id || share.shared_by,
+            storage_source_id: share.storage_source_id,
+            path: share.file_path
+        });
 
         if (!fs.existsSync(filePath)) {
             return res.status(404).json({ error: 'File not found on disk' });
@@ -553,7 +616,7 @@ router.get('/public/:link/download', async (req, res) => {
             try {
                 const decryptedBuffer = await decryptFileToBuffer(filePath);
                 res.set('Content-Type', share.mime_type || 'application/octet-stream');
-                res.set('Content-Disposition', `attachment; filename="${share.file_name}"`);
+                res.set('Content-Disposition', `attachment; filename="${encodeURIComponent(share.file_name)}"`);
                 res.set('Content-Length', decryptedBuffer.length);
                 return res.send(decryptedBuffer);
             } catch (decErr) {
@@ -563,7 +626,7 @@ router.get('/public/:link/download', async (req, res) => {
         }
 
         res.set('Content-Type', share.mime_type || 'application/octet-stream');
-        res.set('Content-Disposition', `attachment; filename="${share.file_name}"`);
+        res.set('Content-Disposition', `attachment; filename="${encodeURIComponent(share.file_name)}"`);
         res.sendFile(filePath);
     } catch (error) {
         console.error('Public download error:', error);
@@ -581,24 +644,28 @@ router.get('/public/:link/preview', async (req, res) => {
 
         const share = db.prepare(`
             SELECT s.*, f.name as file_name, f.type as file_type, 
-                   f.path as file_path, f.mime_type, f.encrypted, s.shared_by
+                   f.path as file_path, f.mime_type, f.encrypted, f.storage_source_id, f.user_id, s.shared_by
             FROM shares s
             JOIN files f ON s.file_id = f.id
-            WHERE s.share_link = ? AND f.type != 'folder'
+            WHERE s.share_link = ? AND f.type != 'folder' AND f.trashed = 0
         `).get(shareLink);
 
         if (!share) {
             return res.status(404).json({ error: 'Shared file not found' });
         }
 
-        const filePath = path.join(STORAGE_DIR, String(share.shared_by), share.file_path);
+        const filePath = resolveSharedFilePath({
+            user_id: share.user_id || share.shared_by,
+            storage_source_id: share.storage_source_id,
+            path: share.file_path
+        });
 
         if (!fs.existsSync(filePath)) {
             return res.status(404).json({ error: 'File not found on disk' });
         }
 
         res.set('Content-Type', share.mime_type || 'application/octet-stream');
-        res.set('Content-Disposition', `inline; filename="${share.file_name}"`);
+        res.set('Content-Disposition', `inline; filename="${encodeURIComponent(share.file_name)}"`);
         res.set('Cache-Control', 'public, max-age=86400');
 
         // Decrypt if file is encrypted

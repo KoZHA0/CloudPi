@@ -69,7 +69,7 @@ export function SidebarProvider({ children }: { children: ReactNode }) {
     // Close sidebar on route change
     const location = useLocation()
     useEffect(() => {
-        close()
+        queueMicrotask(() => setIsOpen(false))
     }, [location.pathname])
 
     // Close sidebar on window resize to desktop

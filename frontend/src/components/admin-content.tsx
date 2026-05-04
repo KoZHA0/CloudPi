@@ -20,8 +20,6 @@ import {
     HardDrive,
     Usb,
     RefreshCw,
-    Plug,
-    Unplug,
     AlertTriangle,
     CircleDot,
     Ban,

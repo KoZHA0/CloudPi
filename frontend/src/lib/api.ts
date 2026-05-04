@@ -66,15 +66,22 @@ export interface User {
     two_factor_enabled?: number;
 }
 
-export interface AuthResponse {
+export interface AuthenticatedResponse {
     message: string;
-    token?: string;
-    user?: User;
-    requires_2fa?: boolean;
-    temp_token?: string;
+    token: string;
+    user: User;
+    requires_2fa?: false;
 }
 
-export interface SetupResponse extends AuthResponse {
+export interface TwoFactorRequiredResponse {
+    message: string;
+    requires_2fa: true;
+    temp_token: string;
+}
+
+export type AuthResponse = AuthenticatedResponse | TwoFactorRequiredResponse;
+
+export interface SetupResponse extends AuthenticatedResponse {
     backupCode: string;
 }
 
@@ -139,11 +146,12 @@ export interface ProfileUpdateResponse {
 
 export async function updateProfile(
     username: string,
-    email?: string
+    email?: string,
+    currentPassword?: string
 ): Promise<ProfileUpdateResponse> {
     return apiRequest<ProfileUpdateResponse>('/auth/profile', {
         method: 'PUT',
-        body: JSON.stringify({ username, email }),
+        body: JSON.stringify({ username, email, currentPassword }),
     });
 }
 
@@ -154,8 +162,8 @@ export async function updateProfile(
 export async function loginWith2FA(
     tempToken: string,
     code: string
-): Promise<AuthResponse> {
-    return apiRequest<AuthResponse>('/auth/login/2fa', {
+): Promise<AuthenticatedResponse> {
+    return apiRequest<AuthenticatedResponse>('/auth/login/2fa', {
         method: 'POST',
         body: JSON.stringify({ temp_token: tempToken, code }),
     });
@@ -174,9 +182,10 @@ export async function verify2FA(code: string): Promise<{ message: string, user: 
     });
 }
 
-export async function disable2FA(): Promise<{ message: string, user: User }> {
+export async function disable2FA(currentPassword: string): Promise<{ message: string, user: User }> {
     return apiRequest<{ message: string, user: User }>('/auth/2fa/disable', {
         method: 'POST',
+        body: JSON.stringify({ currentPassword }),
     });
 }
 

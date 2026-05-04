@@ -1,6 +1,6 @@
 import { useState } from "react"
 import { Link, useNavigate } from "react-router-dom"
-import { Cloud, Eye, EyeOff, Loader2 } from "lucide-react"
+import { Cloud, Eye, EyeOff, Loader2, ShieldCheck } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -10,10 +10,12 @@ import { useAuth } from "@/contexts/auth-context"
 
 export function LoginPage() {
     const navigate = useNavigate()
-    const { login } = useAuth()
+    const { login, complete2FALogin } = useAuth()
     const [isLoading, setIsLoading] = useState(false)
     const [error, setError] = useState<string | null>(null)
     const [showPassword, setShowPassword] = useState(false)
+    const [tempToken, setTempToken] = useState<string | null>(null)
+    const [twoFactorCode, setTwoFactorCode] = useState("")
     const [formData, setFormData] = useState({
         username: "",
         password: "",
@@ -26,7 +28,19 @@ export function LoginPage() {
         setError(null)
 
         try {
-            await login(formData.username, formData.password)
+            if (tempToken) {
+                await complete2FALogin(tempToken, twoFactorCode)
+                navigate("/")
+                return
+            }
+
+            const response = await login(formData.username, formData.password)
+            if (response.requires_2fa) {
+                setTempToken(response.temp_token)
+                setTwoFactorCode("")
+                return
+            }
+
             navigate("/")
         } catch (err) {
             setError(err instanceof Error ? err.message : "Login failed")
@@ -61,74 +75,109 @@ export function LoginPage() {
                             </div>
                         )}
                         <form onSubmit={handleSubmit} className="space-y-4">
-                            <div className="space-y-2">
-                                <Label htmlFor="username">Username</Label>
-                                <Input
-                                    id="username"
-                                    type="text"
-                                    placeholder="Enter your username"
-                                    value={formData.username}
-                                    onChange={(e) => setFormData({ ...formData, username: e.target.value })}
-                                    required
-                                />
-                            </div>
+                            {!tempToken ? (
+                                <>
+                                    <div className="space-y-2">
+                                        <Label htmlFor="username">Username</Label>
+                                        <Input
+                                            id="username"
+                                            type="text"
+                                            placeholder="Enter your username"
+                                            value={formData.username}
+                                            onChange={(e) => setFormData({ ...formData, username: e.target.value })}
+                                            required
+                                        />
+                                    </div>
 
-                            <div className="space-y-2">
-                                <div className="flex items-center justify-between">
-                                    <Label htmlFor="password">Password</Label>
-                                    <Link to="/auth/forgot-password" className="text-xs text-primary hover:text-primary/80">
-                                        Forgot password?
-                                    </Link>
-                                </div>
-                                <div className="relative">
-                                    <Input
-                                        id="password"
-                                        type={showPassword ? "text" : "password"}
-                                        placeholder="••••••••"
-                                        value={formData.password}
-                                        onChange={(e) => setFormData({ ...formData, password: e.target.value })}
-                                        className="pr-10"
-                                        required
-                                    />
-                                    <Button
-                                        type="button"
-                                        variant="ghost"
-                                        size="icon"
-                                        className="absolute right-0 top-0 h-full px-3 hover:bg-transparent"
-                                        onClick={() => setShowPassword(!showPassword)}
-                                    >
-                                        {showPassword ? (
-                                            <EyeOff className="h-4 w-4 text-muted-foreground" />
-                                        ) : (
-                                            <Eye className="h-4 w-4 text-muted-foreground" />
-                                        )}
-                                    </Button>
-                                </div>
-                            </div>
+                                    <div className="space-y-2">
+                                        <div className="flex items-center justify-between">
+                                            <Label htmlFor="password">Password</Label>
+                                            <Link to="/auth/forgot-password" className="text-xs text-primary hover:text-primary/80">
+                                                Forgot password?
+                                            </Link>
+                                        </div>
+                                        <div className="relative">
+                                            <Input
+                                                id="password"
+                                                type={showPassword ? "text" : "password"}
+                                                placeholder="••••••••"
+                                                value={formData.password}
+                                                onChange={(e) => setFormData({ ...formData, password: e.target.value })}
+                                                className="pr-10"
+                                                required
+                                            />
+                                            <Button
+                                                type="button"
+                                                variant="ghost"
+                                                size="icon"
+                                                className="absolute right-0 top-0 h-full px-3 hover:bg-transparent"
+                                                onClick={() => setShowPassword(!showPassword)}
+                                            >
+                                                {showPassword ? (
+                                                    <EyeOff className="h-4 w-4 text-muted-foreground" />
+                                                ) : (
+                                                    <Eye className="h-4 w-4 text-muted-foreground" />
+                                                )}
+                                            </Button>
+                                        </div>
+                                    </div>
 
-                            <div className="flex items-center space-x-2">
-                                <Checkbox
-                                    id="remember"
-                                    checked={formData.rememberMe}
-                                    onCheckedChange={(checked) =>
-                                        setFormData({ ...formData, rememberMe: checked as boolean })
-                                    }
-                                />
-                                <Label htmlFor="remember" className="text-sm font-normal text-muted-foreground cursor-pointer">
-                                    Remember me for 30 days
-                                </Label>
-                            </div>
+                                    <div className="flex items-center space-x-2">
+                                        <Checkbox
+                                            id="remember"
+                                            checked={formData.rememberMe}
+                                            onCheckedChange={(checked) =>
+                                                setFormData({ ...formData, rememberMe: checked as boolean })
+                                            }
+                                        />
+                                        <Label htmlFor="remember" className="text-sm font-normal text-muted-foreground cursor-pointer">
+                                            Remember me for 30 days
+                                        </Label>
+                                    </div>
+                                </>
+                            ) : (
+                                <div className="space-y-2">
+                                    <Label htmlFor="twoFactorCode">Authentication code</Label>
+                                    <div className="relative">
+                                        <ShieldCheck className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                                        <Input
+                                            id="twoFactorCode"
+                                            inputMode="numeric"
+                                            autoComplete="one-time-code"
+                                            placeholder="123456"
+                                            value={twoFactorCode}
+                                            onChange={(e) => setTwoFactorCode(e.target.value)}
+                                            className="pl-10"
+                                            required
+                                        />
+                                    </div>
+                                </div>
+                            )}
 
                             <Button type="submit" className="w-full gap-2" disabled={isLoading}>
                                 {isLoading ? (
                                     <>
                                         <Loader2 className="h-4 w-4 animate-spin" />
-                                        Signing in...
+                                        {tempToken ? "Verifying..." : "Signing in..."}
                                     </>
                                 ) : (
-                                    "Sign in"
+                                    tempToken ? "Verify code" : "Sign in"
                                 )}
                             </Button>
+
+                            {tempToken && (
+                                <Button
+                                    type="button"
+                                    variant="ghost"
+                                    className="w-full"
+                                    onClick={() => {
+                                        setTempToken(null)
+                                        setTwoFactorCode("")
+                                    }}
+                                >
+                                    Use another account
+                                </Button>
+                            )}
                         </form>
                     </CardContent>
                 </Card>

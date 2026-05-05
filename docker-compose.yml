@@ -45,9 +45,10 @@ services:
       # USB drive access — host OS handles mounting via udisks2/usbmount
       # Read-write needed: backend stores user files on external drives
       # SECURITY: privileged mode and /dev access removed — not needed
-      # rshared propagation is REQUIRED so the container sees drives mounted after it starts
-      - /media:/media:rshared
-      - /mnt:/mnt:rshared
+      # rslave propagation: host→container only (one-way). The container sees
+      # drives mounted on the host after startup, but cannot propagate mounts
+      # back to the host. Narrowed to /media/pi to limit visibility.
+      - /media/pi:/media/pi:rslave
     networks:
       - cloudpi-net
     healthcheck:

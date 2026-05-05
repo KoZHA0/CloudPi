@@ -717,3 +717,46 @@ export async function scanDrives(): Promise<DrivesScanResponse> {
     return apiRequest<DrivesScanResponse>('/admin/drives');
 }
 
+// ============= DRIVE KEY-WRAPPING (Encryption) =============
+
+export interface KeyStatus {
+    source_id: string;
+    label: string;
+    has_key_blob: boolean;
+    unlocked: boolean;
+    path_accessible: boolean;
+}
+
+export async function getDriveKeyStatus(
+    sourceId: string
+): Promise<KeyStatus> {
+    return apiRequest<KeyStatus>(`/admin/storage/${sourceId}/key-status`);
+}
+
+export async function setupDriveKey(
+    sourceId: string,
+    passphrase: string
+): Promise<{ message: string; source_id: string; key_blob_path: string; migration_note: string }> {
+    return apiRequest(`/admin/storage/${sourceId}/setup-key`, {
+        method: 'POST',
+        body: JSON.stringify({ passphrase }),
+    });
+}
+
+export async function unlockDrive(
+    sourceId: string,
+    passphrase: string
+): Promise<{ message: string; source_id: string; locked: boolean }> {
+    return apiRequest(`/admin/storage/${sourceId}/unlock`, {
+        method: 'POST',
+        body: JSON.stringify({ passphrase }),
+    });
+}
+
+export async function lockDrive(
+    sourceId: string
+): Promise<{ message: string; source_id: string; locked: boolean }> {
+    return apiRequest(`/admin/storage/${sourceId}/lock`, {
+        method: 'POST',
+    });
+}

@@ -47,6 +47,11 @@ RUN rm -rf tests walkthroughs .env .env.example
 # Create directories for persistent data
 RUN mkdir -p uploads storage
 
+# SECURITY: Run as non-root user (limits damage if app is exploited)
+# node:20-alpine already includes a 'node' user with uid 1000
+RUN chown -R node:node /app/backend
+USER node
+
 EXPOSE 3001
 
 CMD ["node", "server.js"]

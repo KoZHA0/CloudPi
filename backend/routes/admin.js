@@ -27,6 +27,7 @@
 const express = require('express');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
@@ -37,6 +38,30 @@ const { sendEmail } = require('../utils/mailer');
 const { createKeyBlob, unwrapDEK, clearDEK, hasKeyBlob, isDriveUnlocked } = require('../utils/key-wrap');
 
 const router = express.Router();
+
+/**
+ * HMAC helper for .cloudpi-id integrity.
+ * Uses the server's CLOUDPI_ENCRYPTION_KEY to sign and verify drive IDs.
+ * Prevents attackers from crafting a fake .cloudpi-id on a rogue USB.
+ */
+function computeDriveHmac(driveId) {
+    const key = process.env.CLOUDPI_ENCRYPTION_KEY;
+    if (!key || key.length !== 64) return null;
+    return crypto.createHmac('sha256', Buffer.from(key, 'hex'))
+        .update(driveId)
+        .digest('hex');
+}
+
+function verifyDriveHmac(driveId, hmac) {
+    const expected = computeDriveHmac(driveId);
+    if (!expected || !hmac) return false;
+    // Constant-time comparison to prevent timing attacks
+    try {
+        return crypto.timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(hmac, 'hex'));
+    } catch {
+        return false;
+    }
+}
 
 /**
  * ADMIN MIDDLEWARE
@@ -733,12 +758,20 @@ router.post('/storage', requireAdmin, (req, res) => {
         let driveId;
 
         if (fs.existsSync(idFilePath)) {
-            // Re-registering an existing drive
+            // Re-registering an existing drive — verify HMAC if present
             try {
                 const content = fs.readFileSync(idFilePath, 'utf8');
                 const match = content.match(/drive_id=(.+)/);
                 if (match) {
                     driveId = match[1].trim();
+
+                    // SECURITY: Verify HMAC to detect forged .cloudpi-id files
+                    const hmacMatch = content.match(/hmac=(.+)/);
+                    const hmacOk = hmacMatch ? verifyDriveHmac(driveId, hmacMatch[1].trim()) : false;
+                    if (!hmacOk) {
+                        console.warn(`⚠️ [SECURITY] .cloudpi-id HMAC verification failed for drive at ${drivePath} (drive_id=${driveId}). File may have been tampered with or created by another server.`);
+                    }
+
                     // Check if this source exists in DB
                     const existing = db.prepare('SELECT * FROM storage_sources WHERE id = ?').get(driveId);
                     if (existing) {
@@ -747,7 +780,12 @@ router.post('/storage', requireAdmin, (req, res) => {
                             .run(drivePath, label, driveId);
                         console.log(`💾 Re-activated storage: ${label} (${driveId})`);
                         const source = db.prepare('SELECT * FROM storage_sources WHERE id = ?').get(driveId);
-                        return res.json({ message: 'Storage source re-activated!', source });
+                        return res.json({
+                            message: 'Storage source re-activated!',
+                            source,
+                            hmac_verified: hmacOk,
+                            ...(!hmacOk && { security_notice: 'Warning: .cloudpi-id HMAC could not be verified. This file may have been modified or created by another server.' })
+                        });
                     }
                 }
             } catch (e) {
@@ -758,8 +796,12 @@ router.post('/storage', requireAdmin, (req, res) => {
         // New drive — generate ID and write .cloudpi-id
         driveId = driveId || uuidv4();
 
-        // Write the .cloudpi-id file
-        const idContent = `drive_id=${driveId}\nregistered=${new Date().toISOString()}\nlabel=${label}\n`;
+        // Write the .cloudpi-id file with HMAC signature for tamper detection
+        const hmac = computeDriveHmac(driveId);
+        let idContent = `drive_id=${driveId}\nregistered=${new Date().toISOString()}\nlabel=${label}\n`;
+        if (hmac) {
+            idContent += `hmac=${hmac}\n`;
+        }
         try {
             fs.writeFileSync(idFilePath, idContent);
         } catch (e) {
@@ -967,7 +1009,8 @@ router.get('/drives', requireAdmin, async (req, res) => {
             let isRegistered = false;
             let registeredId = null;
 
-            // Check by .cloudpi-id file first
+            // Check by .cloudpi-id file first, with HMAC verification
+            let hmacValid = false;
             try {
                 const idFile = path.join(drivePath, '.cloudpi-id');
                 if (fs.existsSync(idFile)) {
@@ -975,6 +1018,11 @@ router.get('/drives', requireAdmin, async (req, res) => {
                     const match = content.match(/drive_id=(.+)/);
                     if (match) {
                         const driveId = match[1].trim();
+                        // Verify HMAC if present
+                        const hmacMatch = content.match(/hmac=(.+)/);
+                        if (hmacMatch) {
+                            hmacValid = verifyDriveHmac(driveId, hmacMatch[1].trim());
+                        }
                         const src = registeredSources.find(s => s.id === driveId);
                         if (src) {
                             isRegistered = true;
@@ -1010,6 +1058,7 @@ router.get('/drives', requireAdmin, async (req, res) => {
                 isMounted: true,  // It's in the directory, so it's auto-mounted
                 isRegistered,
                 registeredId,
+                hmac_verified: hmacValid,  // false if .cloudpi-id has no/bad HMAC
             });
         }
 
@@ -1042,6 +1091,12 @@ router.get('/drives', requireAdmin, async (req, res) => {
         const unknownDrives = drives.filter(d => !d.isRegistered);
         if (unknownDrives.length > 0) {
             console.warn(`⚠️ [AUDIT] Unknown drive(s) detected: ${unknownDrives.map(d => d.path).join(', ')}`);
+        }
+
+        // Log drives with failed/missing HMAC (potential spoofing)
+        const unsignedDrives = drives.filter(d => d.isRegistered && !d.hmac_verified);
+        if (unsignedDrives.length > 0) {
+            console.warn(`⚠️ [SECURITY] Registered drive(s) with unverified HMAC: ${unsignedDrives.map(d => d.path).join(', ')}. These .cloudpi-id files may be unsigned (legacy) or tampered with.`);
         }
 
         res.json({

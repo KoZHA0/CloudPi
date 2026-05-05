@@ -236,14 +236,17 @@ CloudPi/
 
 ## Security Measures
 
-| Feature          | Implementation                         |
-| ---------------- | -------------------------------------- |
-| Password Storage | bcrypt hashing (10 rounds)             |
-| Authentication   | JWT tokens (7-day expiry)              |
-| Route Protection | Frontend redirect + Backend middleware |
-| Admin Protection | `requireAdmin` middleware              |
-| Super Admin      | Cannot be deleted, full control        |
-| CORS             | Configured for localhost development   |
+| Feature              | Implementation                                       |
+| -------------------- | ---------------------------------------------------- |
+| Password Storage     | bcrypt hashing (10 rounds)                           |
+| Authentication       | JWT tokens (7-day expiry)                            |
+| Route Protection     | Frontend redirect + Backend middleware               |
+| Admin Protection     | `requireAdmin` middleware                            |
+| Super Admin          | Cannot be deleted, full control                      |
+| CORS                 | Configured for localhost development                 |
+| File Encryption      | AES-256-GCM at rest (per-file unique IV)             |
+| Drive Key Wrapping   | Per-drive DEK wrapped via scrypt + AES-256-GCM       |
+| Portable Decryption  | key.blob on drive root — unlock on any CloudPi device |
 
 ---
 

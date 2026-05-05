@@ -45,8 +45,9 @@ services:
       # USB drive access — host OS handles mounting via udisks2/usbmount
       # Read-write needed: backend stores user files on external drives
       # SECURITY: privileged mode and /dev access removed — not needed
-      - /media:/media
-      - /mnt:/mnt
+      # rshared propagation is REQUIRED so the container sees drives mounted after it starts
+      - /media:/media:rshared
+      - /mnt:/mnt:rshared
     networks:
       - cloudpi-net
     healthcheck:

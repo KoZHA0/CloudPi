@@ -71,3 +71,11 @@ walkthroughs/
 # Coverage and test outputs
 coverage/
 .nyc_output/
+
+codex/
+
+DOCUMENTATION.md
+docs/
+walkthroughs/
+
+*.png

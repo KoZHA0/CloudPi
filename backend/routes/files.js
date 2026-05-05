@@ -29,8 +29,9 @@ const { v4: uuidv4 } = require('uuid');
 const rateLimit = require('express-rate-limit'); // kept for reference but upload uses custom limiter
 const fastq = require('fastq');
 const archiver = require('archiver');
-const { computeFileHash, verifyFileHash, encryptFile, decryptFileToBuffer, isEncryptionEnabled } = require('../utils/crypto-utils');
+const { computeFileHash, verifyFileHash, encryptFile, decryptFileToBuffer, encryptFileWithKey, decryptFileToBufferWithKey, isEncryptionEnabled } = require('../utils/crypto-utils');
 const { JWT_SECRET } = require('../utils/auth-config');
+const { getActiveDEK } = require('../utils/key-wrap');
 
 const router = express.Router();
 
@@ -204,9 +205,16 @@ async function uploadWorker(task, callback) {
 
             // 2. Encrypt the file in-place if encryption is enabled
             let isEncrypted = 0;
+            let isKeyWrapped = 0;
             if (encryptionOn) {
                 try {
-                    await encryptFile(diskPath, diskPath);
+                    const activeDEK = getActiveDEK(storageSourceId || 'internal');
+                    if (activeDEK) {
+                        await encryptFileWithKey(diskPath, diskPath, activeDEK);
+                        isKeyWrapped = 1;
+                    } else {
+                        await encryptFile(diskPath, diskPath);
+                    }
                     isEncrypted = 1;
                 } catch (encErr) {
                     console.error('Encryption failed (storing plaintext):', encErr.message);
@@ -215,8 +223,8 @@ async function uploadWorker(task, callback) {
 
             // 3. Insert DB record with hash and encryption flag
             const result = db.prepare(`
-                INSERT INTO files (user_id, name, path, type, size, mime_type, parent_id, storage_source_id, sha256_hash, encrypted)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO files (user_id, name, path, type, size, mime_type, parent_id, storage_source_id, sha256_hash, encrypted, key_wrapped)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `).run(
                 userId,
                 file.originalname,
@@ -227,7 +235,8 @@ async function uploadWorker(task, callback) {
                 parentId,
                 storageSourceId || 'internal',
                 sha256Hash,
-                isEncrypted
+                isEncrypted,
+                isKeyWrapped
             );
 
             const uploaded = db.prepare('SELECT * FROM files WHERE id = ?').get(result.lastInsertRowid);
@@ -692,7 +701,18 @@ router.get('/:id/preview', async (req, res) => {
         // If file is encrypted, decrypt to buffer and send
         if (file.encrypted === 1) {
             try {
-                const decryptedBuffer = await decryptFileToBuffer(filePath);
+                let decryptedBuffer;
+                if (file.key_wrapped === 1) {
+                    const activeDEK = getActiveDEK(file.storage_source_id || 'internal');
+                    if (!activeDEK) {
+                        return res.status(403).json({
+                            error: 'Drive is locked. Please unlock the drive with its passphrase before accessing this file.'
+                        });
+                    }
+                    decryptedBuffer = await decryptFileToBufferWithKey(filePath, activeDEK);
+                } else {
+                    decryptedBuffer = await decryptFileToBuffer(filePath);
+                }
                 res.set('Content-Length', decryptedBuffer.length);
                 return res.send(decryptedBuffer);
             } catch (decErr) {
@@ -740,7 +760,18 @@ router.get('/:id/download', requireAuth, async (req, res) => {
             // If file is encrypted, decrypt to buffer, verify hash, and send
             if (file.encrypted === 1) {
                 try {
-                    const decryptedBuffer = await decryptFileToBuffer(filePath);
+                    let decryptedBuffer;
+                    if (file.key_wrapped === 1) {
+                        const activeDEK = getActiveDEK(file.storage_source_id || 'internal');
+                        if (!activeDEK) {
+                            return res.status(403).json({
+                                error: 'Drive is locked. Please unlock the drive with its passphrase before downloading this file.'
+                            });
+                        }
+                        decryptedBuffer = await decryptFileToBufferWithKey(filePath, activeDEK);
+                    } else {
+                        decryptedBuffer = await decryptFileToBuffer(filePath);
+                    }
 
                     // Verify SHA-256 integrity if hash exists
                     if (file.sha256_hash) {
@@ -796,7 +827,9 @@ router.get('/:id/download', requireAuth, async (req, res) => {
                         collected.push({
                             diskPath,
                             archivePath: childPath,
-                            encrypted: child.encrypted === 1
+                            encrypted: child.encrypted === 1,
+                            keyWrapped: child.key_wrapped === 1,
+                            storageSourceId: child.storage_source_id || 'internal'
                         });
                     }
                 }
@@ -822,9 +855,20 @@ router.get('/:id/download', requireAuth, async (req, res) => {
         });
         archive.pipe(res);
 
-        for (const { diskPath, archivePath, encrypted } of filesToZip) {
+        for (const { diskPath, archivePath, encrypted, keyWrapped, storageSourceId } of filesToZip) {
             if (encrypted) {
-                const decryptedBuffer = await decryptFileToBuffer(diskPath);
+                let decryptedBuffer;
+                if (keyWrapped) {
+                    const activeDEK = getActiveDEK(storageSourceId);
+                    if (!activeDEK) {
+                        // Skip locked files rather than aborting the entire ZIP
+                        console.warn(`⚠️  Skipping locked file in ZIP: ${archivePath} (drive ${storageSourceId} is locked)`);
+                        continue;
+                    }
+                    decryptedBuffer = await decryptFileToBufferWithKey(diskPath, activeDEK);
+                } else {
+                    decryptedBuffer = await decryptFileToBuffer(diskPath);
+                }
                 archive.append(decryptedBuffer, { name: archivePath });
             } else {
                 archive.file(diskPath, { name: archivePath });

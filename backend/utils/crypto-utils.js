@@ -247,12 +247,89 @@ function isEncryptionEnabled(db) {
     }
 }
 
+// ============================================
+// EXPLICIT-KEY VARIANTS (used with per-drive DEKs)
+// ============================================
+
+/**
+ * Encrypt a file using AES-256-GCM with an explicitly supplied key.
+ * Used when a per-drive DEK has been unlocked via key-wrap.js.
+ * File format is identical to encryptFile() — [12-byte IV][16-byte AuthTag][ciphertext].
+ *
+ * @param {string} inputPath  - Path to plaintext file
+ * @param {string} outputPath - Path to write encrypted file (can be same as input)
+ * @param {Buffer} key        - 32-byte AES-256 key (the unwrapped DEK)
+ * @returns {Promise<void>}
+ */
+function encryptFileWithKey(inputPath, outputPath, key) {
+    return new Promise((resolve, reject) => {
+        try {
+            if (!Buffer.isBuffer(key) || key.length !== KEY_LENGTH) {
+                return reject(new Error('encryptFileWithKey: key must be a 32-byte Buffer'));
+            }
+
+            const iv        = crypto.randomBytes(IV_LENGTH);
+            const plaintext = fs.readFileSync(inputPath);
+
+            const cipher    = crypto.createCipheriv(ALGORITHM, key, iv, {
+                authTagLength: AUTH_TAG_LENGTH
+            });
+            const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+            const authTag   = cipher.getAuthTag();
+
+            fs.writeFileSync(outputPath, Buffer.concat([iv, authTag, encrypted]));
+            resolve();
+        } catch (err) {
+            reject(err);
+        }
+    });
+}
+
+/**
+ * Decrypt a file encrypted with encryptFileWithKey() and return the plaintext as a Buffer.
+ *
+ * @param {string} inputPath - Path to encrypted file
+ * @param {Buffer} key       - 32-byte AES-256 key (the unwrapped DEK)
+ * @returns {Promise<Buffer>} Decrypted file contents
+ */
+function decryptFileToBufferWithKey(inputPath, key) {
+    return new Promise((resolve, reject) => {
+        try {
+            if (!Buffer.isBuffer(key) || key.length !== KEY_LENGTH) {
+                return reject(new Error('decryptFileToBufferWithKey: key must be a 32-byte Buffer'));
+            }
+
+            const data = fs.readFileSync(inputPath);
+
+            if (data.length < IV_LENGTH + AUTH_TAG_LENGTH) {
+                return reject(new Error('Encrypted file is too small — possibly corrupted'));
+            }
+
+            const iv         = data.subarray(0, IV_LENGTH);
+            const authTag    = data.subarray(IV_LENGTH, IV_LENGTH + AUTH_TAG_LENGTH);
+            const ciphertext = data.subarray(IV_LENGTH + AUTH_TAG_LENGTH);
+
+            const decipher = crypto.createDecipheriv(ALGORITHM, key, iv, {
+                authTagLength: AUTH_TAG_LENGTH
+            });
+            decipher.setAuthTag(authTag);
+            const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+
+            resolve(decrypted);
+        } catch (err) {
+            reject(err);
+        }
+    });
+}
+
 module.exports = {
     computeFileHash,
     verifyFileHash,
     encryptFile,
     decryptFile,
     decryptFileToBuffer,
+    encryptFileWithKey,
+    decryptFileToBufferWithKey,
     getEncryptionKey,
     isEncryptionEnabled
 };

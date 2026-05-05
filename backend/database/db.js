@@ -310,5 +310,14 @@ try {
   // Column already exists, ignore
 }
 
+// Add key_wrapped flag to distinguish per-drive DEK encryption from master-key encryption.
+// 0 = encrypted with the server-side master key (CLOUDPI_ENCRYPTION_KEY in .env)
+// 1 = encrypted with a per-drive DEK (wrapped in key.blob via key-wrap.js)
+try {
+  db.exec(`ALTER TABLE files ADD COLUMN key_wrapped INTEGER DEFAULT 0`);
+} catch (e) {
+  // Column already exists, ignore
+}
+
 // Export the database connection so other files can use it
 module.exports = db;

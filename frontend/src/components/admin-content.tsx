@@ -27,6 +27,9 @@ import {
     Unlock,
     ShieldCheck,
     ShieldOff,
+    ShieldAlert,
+    Eye,
+    EyeOff,
 } from "lucide-react"
 import {
     Dialog,
@@ -70,10 +73,15 @@ import {
     disableUser,
     toggleUserRole,
     unlockUser,
+    getDriveKeyStatus,
+    setupDriveKey,
+    unlockDrive,
+    lockDrive,
     type User,
     type StorageSource,
     type DetectedDrive,
     type RegisteredSource,
+    type KeyStatus,
 } from "@/lib/api"
 
 export function AdminContent() {
@@ -112,6 +120,18 @@ export function AdminContent() {
     // Quota editing state
     const [editingQuotaUserId, setEditingQuotaUserId] = useState<number | null>(null)
     const [quotaInput, setQuotaInput] = useState("")
+
+    // Drive encryption state
+    const [keyStatuses, setKeyStatuses] = useState<Record<string, KeyStatus>>({})
+    const [encryptionDialogOpen, setEncryptionDialogOpen] = useState(false)
+    const [encryptionAction, setEncryptionAction] = useState<'setup' | 'unlock'>('setup')
+    const [encryptionTargetId, setEncryptionTargetId] = useState<string | null>(null)
+    const [encryptionTargetLabel, setEncryptionTargetLabel] = useState('')
+    const [passphrase, setPassphrase] = useState('')
+    const [passphraseConfirm, setPassphraseConfirm] = useState('')
+    const [showPassphrase, setShowPassphrase] = useState(false)
+    const [isEncrypting, setIsEncrypting] = useState(false)
+    const [encryptionMessage, setEncryptionMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null)
 
     const loadUsers = async () => {
         try {
@@ -296,6 +316,87 @@ export function AdminContent() {
         if (!bytes) return 'Unlimited'
         if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`
         return `${(bytes / (1024 * 1024)).toFixed(0)} MB`
+    }
+
+    // ===== Drive Encryption Handlers =====
+
+    const loadKeyStatus = async (sourceId: string) => {
+        try {
+            const status = await getDriveKeyStatus(sourceId)
+            setKeyStatuses(prev => ({ ...prev, [sourceId]: status }))
+        } catch {
+            // Silently ignore — drive may not be accessible
+        }
+    }
+
+    const loadAllKeyStatuses = async () => {
+        for (const src of storageSources.filter(s => s.type === 'external')) {
+            loadKeyStatus(src.id)
+        }
+    }
+
+    useEffect(() => {
+        if (storageSources.length > 0) {
+            loadAllKeyStatuses()
+        }
+    }, [storageSources])
+
+    const openEncryptionDialog = (sourceId: string, label: string, action: 'setup' | 'unlock') => {
+        setEncryptionTargetId(sourceId)
+        setEncryptionTargetLabel(label)
+        setEncryptionAction(action)
+        setPassphrase('')
+        setPassphraseConfirm('')
+        setShowPassphrase(false)
+        setEncryptionMessage(null)
+        setEncryptionDialogOpen(true)
+    }
+
+    const handleEncryptionSubmit = async (e: React.FormEvent) => {
+        e.preventDefault()
+        if (!encryptionTargetId) return
+        setIsEncrypting(true)
+        setEncryptionMessage(null)
+
+        try {
+            if (encryptionAction === 'setup') {
+                if (passphrase !== passphraseConfirm) {
+                    setEncryptionMessage({ type: 'error', text: 'Passphrases do not match' })
+                    setIsEncrypting(false)
+                    return
+                }
+                if (passphrase.length < 12) {
+                    setEncryptionMessage({ type: 'error', text: 'Passphrase must be at least 12 characters' })
+                    setIsEncrypting(false)
+                    return
+                }
+                await setupDriveKey(encryptionTargetId, passphrase)
+                setEncryptionMessage({ type: 'success', text: 'Encryption key created! Drive is now unlocked and ready.' })
+            } else {
+                await unlockDrive(encryptionTargetId, passphrase)
+                setEncryptionMessage({ type: 'success', text: 'Drive unlocked successfully! Files are now accessible.' })
+            }
+            // Refresh key status
+            await loadKeyStatus(encryptionTargetId)
+            setTimeout(() => setEncryptionDialogOpen(false), 2000)
+        } catch (err) {
+            setEncryptionMessage({
+                type: 'error',
+                text: err instanceof Error ? err.message : 'Operation failed'
+            })
+        } finally {
+            setIsEncrypting(false)
+        }
+    }
+
+    const handleLockDrive = async (sourceId: string, label: string) => {
+        try {
+            await lockDrive(sourceId)
+            setDriveMessage({ type: 'success', text: `Drive "${label}" locked. DEK cleared from memory.` })
+            await loadKeyStatus(sourceId)
+        } catch (err) {
+            setDriveMessage({ type: 'error', text: err instanceof Error ? err.message : 'Failed to lock drive' })
+        }
     }
 
     const formatUsed = (bytes: number | undefined) => {
@@ -816,6 +917,160 @@ export function AdminContent() {
                 </Card>
             )}
 
+            {/* Drive Encryption Manager — Super Admin only */}
+            {currentUser?.id === 1 && storageSources.filter(s => s.type === 'external').length > 0 && (
+                <Card className="bg-card border-border">
+                    <CardHeader>
+                        <div>
+                            <CardTitle className="flex items-center gap-2">
+                                <ShieldAlert className="h-5 w-5" />
+                                Drive Encryption
+                            </CardTitle>
+                            <CardDescription>
+                                Protect USB drives with passphrase-based encryption. Files are encrypted with a per-drive key (DEK) wrapped by your passphrase — plug the drive into any CloudPi device and unlock with the same passphrase.
+                            </CardDescription>
+                        </div>
+                    </CardHeader>
+                    <CardContent className="space-y-3">
+                        {storageSources
+                            .filter(s => s.type === 'external')
+                            .map(source => {
+                                const ks = keyStatuses[source.id]
+                                const hasKey = ks?.has_key_blob ?? false
+                                const isUnlocked = ks?.unlocked ?? false
+                                const isAccessible = source.is_accessible ?? ks?.path_accessible ?? false
+
+                                return (
+                                    <div
+                                        key={source.id}
+                                        className="p-4 rounded-lg bg-secondary flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+                                    >
+                                        <div className="flex items-center gap-3">
+                                            <div className={`p-2 rounded-lg ${
+                                                !hasKey ? 'bg-amber-500/10' :
+                                                isUnlocked ? 'bg-green-500/10' : 'bg-red-500/10'
+                                            }`}>
+                                                {!hasKey ? (
+                                                    <ShieldOff className="h-5 w-5 text-amber-400" />
+                                                ) : isUnlocked ? (
+                                                    <Unlock className="h-5 w-5 text-green-400" />
+                                                ) : (
+                                                    <Lock className="h-5 w-5 text-red-400" />
+                                                )}
+                                            </div>
+                                            <div>
+                                                <div className="flex items-center gap-2 flex-wrap">
+                                                    <p className="font-medium text-sm">{source.label}</p>
+                                                    {!hasKey && (
+                                                        <Badge variant="outline" className="text-xs border-amber-500/50 text-amber-400">
+                                                            No encryption key
+                                                        </Badge>
+                                                    )}
+                                                    {hasKey && isUnlocked && (
+                                                        <Badge className="bg-green-500/20 text-green-400 text-xs">
+                                                            <Unlock className="h-3 w-3 mr-1" />Unlocked
+                                                        </Badge>
+                                                    )}
+                                                    {hasKey && !isUnlocked && (
+                                                        <Badge variant="outline" className="text-xs border-red-500/50 text-red-400">
+                                                            <Lock className="h-3 w-3 mr-1" />Locked
+                                                        </Badge>
+                                                    )}
+                                                    {!isAccessible && (
+                                                        <Badge variant="outline" className="text-xs border-muted-foreground/50 text-muted-foreground">
+                                                            Offline
+                                                        </Badge>
+                                                    )}
+                                                </div>
+                                                <p className="text-xs text-muted-foreground mt-1">
+                                                    {!hasKey
+                                                        ? 'No key.blob — set up encryption to protect files on this drive'
+                                                        : isUnlocked
+                                                            ? 'DEK is in memory — files can be encrypted/decrypted'
+                                                            : 'Drive is locked — enter passphrase to access encrypted files'
+                                                    }
+                                                </p>
+                                            </div>
+                                        </div>
+                                        <div className="flex items-center gap-2">
+                                            {!hasKey && isAccessible && (
+                                                <Button
+                                                    size="sm"
+                                                    className="gap-1"
+                                                    onClick={() => openEncryptionDialog(source.id, source.label, 'setup')}
+                                                >
+                                                    <KeyRound className="h-3 w-3" />
+                                                    Setup Key
+                                                </Button>
+                                            )}
+                                            {hasKey && !isUnlocked && isAccessible && (
+                                                <Button
+                                                    size="sm"
+                                                    variant="outline"
+                                                    className="gap-1"
+                                                    onClick={() => openEncryptionDialog(source.id, source.label, 'unlock')}
+                                                >
+                                                    <Unlock className="h-3 w-3" />
+                                                    Unlock
+                                                </Button>
+                                            )}
+                                            {hasKey && isUnlocked && (
+                                                <AlertDialog>
+                                                    <AlertDialogTrigger asChild>
+                                                        <Button
+                                                            size="sm"
+                                                            variant="outline"
+                                                            className="gap-1 border-red-500/30 text-red-400 hover:bg-red-500/10"
+                                                        >
+                                                            <Lock className="h-3 w-3" />
+                                                            Lock
+                                                        </Button>
+                                                    </AlertDialogTrigger>
+                                                    <AlertDialogContent>
+                                                        <AlertDialogHeader>
+                                                            <AlertDialogTitle>Lock Drive Encryption</AlertDialogTitle>
+                                                            <AlertDialogDescription>
+                                                                This will clear the encryption key from memory. Encrypted files on <strong>"{source.label}"</strong> will be inaccessible until the drive is unlocked again with the passphrase.
+                                                            </AlertDialogDescription>
+                                                        </AlertDialogHeader>
+                                                        <AlertDialogFooter>
+                                                            <AlertDialogCancel>Cancel</AlertDialogCancel>
+                                                            <AlertDialogAction
+                                                                onClick={() => handleLockDrive(source.id, source.label)}
+                                                                className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                                                            >
+                                                                Lock Drive
+                                                            </AlertDialogAction>
+                                                        </AlertDialogFooter>
+                                                    </AlertDialogContent>
+                                                </AlertDialog>
+                                            )}
+                                            <Button
+                                                size="sm"
+                                                variant="ghost"
+                                                className="h-8 w-8 p-0"
+                                                onClick={() => loadKeyStatus(source.id)}
+                                                title="Refresh encryption status"
+                                            >
+                                                <RefreshCw className="h-3 w-3" />
+                                            </Button>
+                                        </div>
+                                    </div>
+                                )
+                            })}
+
+                        {/* Info box */}
+                        <div className="p-3 rounded-lg bg-primary/5 border border-primary/20 text-xs text-muted-foreground space-y-1">
+                            <p className="font-medium text-primary">How drive encryption works</p>
+                            <p>• Each drive gets a unique <strong>Data Encryption Key (DEK)</strong> stored in <code className="bg-secondary px-1 rounded">key.blob</code> on the drive root.</p>
+                            <p>• The DEK is wrapped (encrypted) using your passphrase via <strong>scrypt</strong> — the passphrase is never stored.</p>
+                            <p>• Plug the drive into any CloudPi device, enter the passphrase, and files are accessible.</p>
+                            <p>• After server restart, drives must be unlocked again.</p>
+                        </div>
+                    </CardContent>
+                </Card>
+            )}
+
             {/* Reset Password Dialog */}
             <Dialog open={resetDialogOpen} onOpenChange={setResetDialogOpen}>
                 <DialogContent className="sm:max-w-md">
@@ -864,6 +1119,112 @@ export function AdminContent() {
                                     </>
                                 ) : (
                                     "Reset Password"
+                                )}
+                            </Button>
+                        </div>
+                    </form>
+                </DialogContent>
+            </Dialog>
+
+            {/* Encryption Passphrase Dialog */}
+            <Dialog open={encryptionDialogOpen} onOpenChange={setEncryptionDialogOpen}>
+                <DialogContent className="sm:max-w-md">
+                    <DialogHeader>
+                        <DialogTitle className="flex items-center gap-2">
+                            {encryptionAction === 'setup' ? (
+                                <><KeyRound className="h-5 w-5 text-primary" /> Set Up Drive Encryption</>
+                            ) : (
+                                <><Unlock className="h-5 w-5 text-primary" /> Unlock Drive</>
+                            )}
+                        </DialogTitle>
+                        <DialogDescription>
+                            {encryptionAction === 'setup'
+                                ? `Create a passphrase-protected encryption key for "${encryptionTargetLabel}". This passphrase will be needed to access files on any device.`
+                                : `Enter the passphrase to unlock "${encryptionTargetLabel}" and access its encrypted files.`
+                            }
+                        </DialogDescription>
+                    </DialogHeader>
+                    <form onSubmit={handleEncryptionSubmit} className="space-y-4 mt-4">
+                        {encryptionMessage && (
+                            <div className={`p-3 rounded-lg flex items-center gap-2 text-sm ${
+                                encryptionMessage.type === 'success'
+                                    ? 'bg-green-500/10 border border-green-500/50 text-green-400'
+                                    : 'bg-destructive/10 border border-destructive/50 text-destructive'
+                            }`}>
+                                {encryptionMessage.type === 'success' ? <Check className="h-4 w-4" /> : <X className="h-4 w-4" />}
+                                {encryptionMessage.text}
+                            </div>
+                        )}
+                        <div className="space-y-2">
+                            <Label htmlFor="drive-passphrase">Passphrase</Label>
+                            <div className="relative">
+                                <Input
+                                    id="drive-passphrase"
+                                    type={showPassphrase ? 'text' : 'password'}
+                                    placeholder={encryptionAction === 'setup' ? 'Minimum 12 characters' : 'Enter drive passphrase'}
+                                    value={passphrase}
+                                    onChange={(e) => setPassphrase(e.target.value)}
+                                    required
+                                    minLength={encryptionAction === 'setup' ? 12 : 1}
+                                    autoFocus
+                                />
+                                <Button
+                                    type="button"
+                                    variant="ghost"
+                                    size="icon"
+                                    className="absolute right-1 top-1/2 -translate-y-1/2 h-7 w-7"
+                                    onClick={() => setShowPassphrase(!showPassphrase)}
+                                >
+                                    {showPassphrase ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                                </Button>
+                            </div>
+                            {encryptionAction === 'setup' && passphrase.length > 0 && passphrase.length < 12 && (
+                                <p className="text-xs text-destructive">Passphrase must be at least 12 characters ({12 - passphrase.length} more needed)</p>
+                            )}
+                        </div>
+                        {encryptionAction === 'setup' && (
+                            <div className="space-y-2">
+                                <Label htmlFor="drive-passphrase-confirm">Confirm Passphrase</Label>
+                                <Input
+                                    id="drive-passphrase-confirm"
+                                    type={showPassphrase ? 'text' : 'password'}
+                                    placeholder="Re-enter passphrase"
+                                    value={passphraseConfirm}
+                                    onChange={(e) => setPassphraseConfirm(e.target.value)}
+                                    required
+                                />
+                                {passphraseConfirm.length > 0 && passphrase !== passphraseConfirm && (
+                                    <p className="text-xs text-destructive">Passphrases do not match</p>
+                                )}
+                            </div>
+                        )}
+                        {encryptionAction === 'setup' && (
+                            <div className="p-3 rounded-lg bg-amber-500/10 border border-amber-500/30 text-xs text-amber-400">
+                                <p className="font-medium flex items-center gap-1 mb-1">
+                                    <AlertTriangle className="h-3 w-3" /> Important
+                                </p>
+                                <p>If you lose this passphrase, encrypted files on this drive will be <strong>permanently unrecoverable</strong>. Store it safely.</p>
+                            </div>
+                        )}
+                        <div className="flex justify-end gap-2">
+                            <Button
+                                type="button"
+                                variant="outline"
+                                onClick={() => setEncryptionDialogOpen(false)}
+                            >
+                                Cancel
+                            </Button>
+                            <Button
+                                type="submit"
+                                disabled={isEncrypting || (encryptionAction === 'setup' && (passphrase.length < 12 || passphrase !== passphraseConfirm))}
+                            >
+                                {isEncrypting ? (
+                                    <>
+                                        <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                                        {encryptionAction === 'setup' ? 'Setting up...' : 'Unlocking...'}
+                                    </>
+                                ) : (
+                                    encryptionAction === 'setup' ? 'Create Encryption Key' : 'Unlock Drive'
                                 )}
                             </Button>
                         </div>

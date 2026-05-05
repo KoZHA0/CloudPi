@@ -79,3 +79,11 @@ backend/tests/performance-results.*
 backend/tests/temp-test-files/
 frontend/frontend
 *.save
+
+codex/
+
+DOCUMENTATION.md
+docs/
+walkthroughs/
+
+*.png

@@ -71,3 +71,11 @@ walkthroughs/
 # Coverage and test outputs
 coverage/
 .nyc_output/
+
+.env
+*.crt
+*.key
+backend/tests/performance-results.*
+backend/tests/temp-test-files/
+frontend/frontend
+*.save

@@ -39,7 +39,26 @@ async function apiRequest<T>(
         headers,
     });
 
-    const data = await response.json();
+    // Safely parse JSON — if the server returns non-JSON (e.g. HTML error page,
+    // empty body, or proxy error), show a human-readable message instead of
+    // crashing with "JSON.parse: unexpected character at line 1 column 1"
+    let data: any;
+    try {
+        const text = await response.text();
+        data = JSON.parse(text);
+    } catch {
+        // Non-JSON response — server likely crashed or returned an error page
+        if (response.status === 502 || response.status === 503) {
+            throw new Error('Server is temporarily unavailable. Please try again in a moment.');
+        }
+        if (response.status === 504) {
+            throw new Error('Server took too long to respond. The storage drive may be inaccessible.');
+        }
+        throw new Error(
+            `Server error (${response.status}): The server returned an unexpected response. ` +
+            'This often happens when an external storage drive is disconnected.'
+        );
+    }
 
     if (!response.ok) {
         throw new Error(data.error || 'API request failed');
@@ -391,7 +410,17 @@ export async function uploadFiles(files: File[], parentId: number | null = null)
         body: formData,
     });
 
-    const data = await response.json();
+    // Safe JSON parse for upload responses too
+    let data: any;
+    try {
+        const text = await response.text();
+        data = JSON.parse(text);
+    } catch {
+        throw new Error(
+            `Upload failed: The server returned an unexpected response. ` +
+            'Your assigned storage drive may be disconnected.'
+        );
+    }
     if (!response.ok) throw new Error(data.error || 'Upload failed');
     return data;
 }

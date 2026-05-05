@@ -264,9 +264,23 @@ router.put('/users/:id/storage', requireAdmin, (req, res) => {
 
         // Check if storage exists (if provided and not 'internal')
         if (default_storage_id && default_storage_id !== 'internal') {
-            const source = db.prepare('SELECT id FROM storage_sources WHERE id = ?').get(default_storage_id);
+            const source = db.prepare('SELECT id, label, path FROM storage_sources WHERE id = ?').get(default_storage_id);
             if (!source) {
                 return res.status(400).json({ error: 'Storage source not found' });
+            }
+
+            // SAFETY CHECK: Warn if the drive is not currently accessible
+            let driveAccessible = false;
+            try {
+                driveAccessible = fs.existsSync(source.path);
+            } catch (e) {
+                driveAccessible = false;
+            }
+
+            if (!driveAccessible) {
+                return res.status(400).json({
+                    error: `Drive "${source.label}" is not currently attached or accessible at ${source.path}. Please connect the drive first, or choose a different storage source.`
+                });
             }
         }
 

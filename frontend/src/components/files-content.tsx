@@ -134,6 +134,7 @@ export function FilesContent() {
     const [searchQuery, setSearchQuery] = useState("")
     const [isLoading, setIsLoading] = useState(true)
     const [error, setError] = useState<string | null>(null)
+    const [storageWarning, setStorageWarning] = useState<string | null>(null)
 
     // Dialogs
     const [showNewFolderDialog, setShowNewFolderDialog] = useState(false)
@@ -175,9 +176,15 @@ export function FilesContent() {
         setIsLoading(true)
         setError(null)
         try {
-            const data = await getFiles(currentFolderId)
+            const data = await getFiles(currentFolderId) as any
             setFiles(data.files)
             setBreadcrumbs(data.breadcrumbs)
+            // Show warning if user's assigned drive is disconnected
+            if (data.storageWarning) {
+                setStorageWarning(data.storageWarning)
+            } else {
+                setStorageWarning(null)
+            }
         } catch (err) {
             setError(err instanceof Error ? err.message : "Failed to load files")
         } finally {
@@ -642,6 +649,19 @@ export function FilesContent() {
                                 <p className="text-sm font-medium">Uploading files...</p>
                                 <Progress value={uploadProgress} className="mt-2" />
                             </div>
+                        </div>
+                    </CardContent>
+                </Card>
+            )}
+
+            {/* Storage Drive Disconnected Warning */}
+            {storageWarning && (
+                <Card className="bg-yellow-500/10 border-yellow-500/30">
+                    <CardContent className="py-3 flex items-start gap-3">
+                        <AlertCircle className="h-5 w-5 text-yellow-500 flex-shrink-0 mt-0.5" />
+                        <div>
+                            <p className="text-sm font-medium text-yellow-500">Storage Drive Disconnected</p>
+                            <p className="text-sm text-yellow-500/80 mt-0.5">{storageWarning}</p>
                         </div>
                     </CardContent>
                 </Card>

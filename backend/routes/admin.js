@@ -871,6 +871,15 @@ router.delete('/storage/:id', requireAdmin, (req, res) => {
             });
         }
 
+        // Clear any users whose default storage points to this source (FK dependency)
+        const affectedUsers = db.prepare(
+            'SELECT id FROM users WHERE default_storage_id = ?'
+        ).all(sourceId).map(u => u.id);
+        if (affectedUsers.length > 0) {
+            db.prepare('UPDATE users SET default_storage_id = NULL WHERE default_storage_id = ?').run(sourceId);
+            console.log(`💾 [AUDIT] Cleared default_storage_id for user_id(s) [${affectedUsers.join(', ')}] referencing removed source (admin user_id=${currentUserId}): ${source.label} (${sourceId})`);
+        }
+
         db.prepare('DELETE FROM storage_sources WHERE id = ?').run(sourceId);
         console.log(`💾 [AUDIT] Drive removed by admin (user_id=${currentUserId}): ${source.label} (${sourceId})`);
 

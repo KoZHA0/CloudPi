@@ -280,3 +280,26 @@ test('decryptFileToBufferWithKey throws with wrong key', async () => {
         fs.rmSync(tmpDir, { recursive: true, force: true });
     }
 });
+
+test('unwrapDEK rejects key.blob with N below minimum (crafted blob attack)', () => {
+    const tmpDir = makeTmpDir();
+    try {
+        const passphrase = 'legitimate-passphrase-crafted';
+        createKeyBlob(passphrase, tmpDir, 'test-drive-crafted');
+        clearDEK('test-drive-crafted');
+
+        // Tamper with key.blob to set a dangerously low N value
+        const blobPath = path.join(tmpDir, 'key.blob');
+        const blob = JSON.parse(fs.readFileSync(blobPath, 'utf8'));
+        blob.kdfParams.N = 128;
+        fs.writeFileSync(blobPath, JSON.stringify(blob, null, 2));
+
+        assert.throws(
+            () => unwrapDEK(passphrase, tmpDir, 'test-drive-crafted'),
+            /Unsafe scrypt parameter/
+        );
+    } finally {
+        clearDEK('test-drive-crafted');
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});

@@ -99,6 +99,19 @@ function deriveWrapKey(passphrase, salt, params = {}) {
     const N = params.N || SCRYPT_N;
     const r = params.r || SCRYPT_R;
     const p = params.p || SCRYPT_P;
+
+    // Enforce minimum security thresholds to prevent weak KDF settings in a
+    // crafted key.blob from making brute-force attacks trivially cheap.
+    if (typeof N !== 'number' || N < 16384) {
+        throw new Error(`Unsafe scrypt parameter: N=${N} is below the minimum of 16384`);
+    }
+    if (typeof r !== 'number' || r < 8) {
+        throw new Error(`Unsafe scrypt parameter: r=${r} is below the minimum of 8`);
+    }
+    if (typeof p !== 'number' || p < 1) {
+        throw new Error(`Unsafe scrypt parameter: p=${p} is below the minimum of 1`);
+    }
+
     return crypto.scryptSync(passphrase, salt, KEY_LENGTH, { N, r, p });
 }
 

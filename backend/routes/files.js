@@ -208,7 +208,9 @@ async function uploadWorker(task, callback) {
             let isKeyWrapped = 0;
             if (encryptionOn) {
                 try {
-                    const activeDEK = getActiveDEK(storageSourceId || 'internal');
+                    // Look up a per-drive DEK only when we have an explicit storage source ID.
+                    // Internal storage (or unassigned files) always uses the master key.
+                    const activeDEK = storageSourceId ? getActiveDEK(storageSourceId) : null;
                     if (activeDEK) {
                         await encryptFileWithKey(diskPath, diskPath, activeDEK);
                         isKeyWrapped = 1;
@@ -703,7 +705,9 @@ router.get('/:id/preview', async (req, res) => {
             try {
                 let decryptedBuffer;
                 if (file.key_wrapped === 1) {
-                    const activeDEK = getActiveDEK(file.storage_source_id || 'internal');
+                    const activeDEK = file.storage_source_id
+                        ? getActiveDEK(file.storage_source_id)
+                        : null;
                     if (!activeDEK) {
                         return res.status(403).json({
                             error: 'Drive is locked. Please unlock the drive with its passphrase before accessing this file.'
@@ -762,7 +766,9 @@ router.get('/:id/download', requireAuth, async (req, res) => {
                 try {
                     let decryptedBuffer;
                     if (file.key_wrapped === 1) {
-                        const activeDEK = getActiveDEK(file.storage_source_id || 'internal');
+                        const activeDEK = file.storage_source_id
+                            ? getActiveDEK(file.storage_source_id)
+                            : null;
                         if (!activeDEK) {
                             return res.status(403).json({
                                 error: 'Drive is locked. Please unlock the drive with its passphrase before downloading this file.'
@@ -855,13 +861,16 @@ router.get('/:id/download', requireAuth, async (req, res) => {
         });
         archive.pipe(res);
 
+        const skippedFiles = [];
         for (const { diskPath, archivePath, encrypted, keyWrapped, storageSourceId } of filesToZip) {
             if (encrypted) {
                 let decryptedBuffer;
                 if (keyWrapped) {
-                    const activeDEK = getActiveDEK(storageSourceId);
+                    const activeDEK = storageSourceId ? getActiveDEK(storageSourceId) : null;
                     if (!activeDEK) {
-                        // Skip locked files rather than aborting the entire ZIP
+                        // Skip locked files rather than aborting the entire ZIP;
+                        // report them via a response header so the client knows.
+                        skippedFiles.push(archivePath);
                         console.warn(`⚠️  Skipping locked file in ZIP: ${archivePath} (drive ${storageSourceId} is locked)`);
                         continue;
                     }
@@ -873,6 +882,11 @@ router.get('/:id/download', requireAuth, async (req, res) => {
             } else {
                 archive.file(diskPath, { name: archivePath });
             }
+        }
+
+        if (skippedFiles.length > 0) {
+            res.set('X-Skipped-Locked-Files', skippedFiles.join(';'));
+            console.warn(`⚠️  ZIP download skipped ${skippedFiles.length} locked file(s) — drive(s) must be unlocked first`);
         }
 
         archive.finalize();

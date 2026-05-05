@@ -1139,8 +1139,8 @@ router.post('/storage/:id/setup-key', requireAdmin, (req, res) => {
         if (!passphrase || String(passphrase).trim().length === 0) {
             return res.status(400).json({ error: 'passphrase is required' });
         }
-        if (String(passphrase).length < 8) {
-            return res.status(400).json({ error: 'passphrase must be at least 8 characters' });
+        if (String(passphrase).length < 12) {
+            return res.status(400).json({ error: 'passphrase must be at least 12 characters' });
         }
 
         createKeyBlob(String(passphrase), source.path, sourceId);

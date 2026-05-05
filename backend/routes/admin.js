@@ -34,6 +34,7 @@ const db = require('../database/db');
 const { JWT_SECRET, SALT_ROUNDS } = require('../utils/auth-config');
 const cryptoUtils = require('../utils/crypto-utils');
 const { sendEmail } = require('../utils/mailer');
+const { createKeyBlob, unwrapDEK, clearDEK, hasKeyBlob, isDriveUnlocked } = require('../utils/key-wrap');
 
 const router = express.Router();
 
@@ -1089,6 +1090,210 @@ router.post('/storage/:id/reactivate', requireAdmin, (req, res) => {
 
     } catch (error) {
         console.error('Reactivate storage error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// ============================================
+// KEY-WRAPPING ENDPOINTS (Super Admin only)
+// ============================================
+// These endpoints manage per-drive Data Encryption Keys (DEKs).
+// See docs/key-wrapping.md for full documentation.
+
+/**
+ * POST /api/admin/storage/:id/setup-key
+ * Create a new key.blob on a drive (first-time setup).
+ *
+ * Generates a random DEK, wraps it with a key derived from the passphrase via
+ * scrypt, and writes key.blob to the drive root. The DEK is also cached in
+ * memory so the drive is immediately usable for encryption/decryption.
+ *
+ * Body: { passphrase: "..." }
+ *
+ * MIGRATION NOTE:
+ *   Files already encrypted with the server-side master key (CLOUDPI_ENCRYPTION_KEY)
+ *   remain accessible via the master-key path — they are NOT re-encrypted automatically.
+ *   After running setup-key, all NEW uploads to this drive will be encrypted with the
+ *   per-drive DEK. To migrate existing files, download and re-upload them with the
+ *   drive unlocked, or use the migration script described in docs/key-wrapping.md.
+ */
+router.post('/storage/:id/setup-key', requireAdmin, (req, res) => {
+    try {
+        const currentUserId = req.user.userId;
+        if (currentUserId !== 1) {
+            return res.status(403).json({ error: 'Only the Super Admin can set up drive encryption keys' });
+        }
+
+        const sourceId = req.params.id;
+        const source = db.prepare('SELECT * FROM storage_sources WHERE id = ?').get(sourceId);
+
+        if (!source) {
+            return res.status(404).json({ error: 'Storage source not found' });
+        }
+
+        if (!source.path || !fs.existsSync(source.path)) {
+            return res.status(400).json({ error: `Drive path not accessible: ${source.path}` });
+        }
+
+        const { passphrase } = req.body;
+        if (!passphrase || String(passphrase).trim().length === 0) {
+            return res.status(400).json({ error: 'passphrase is required' });
+        }
+        if (String(passphrase).length < 12) {
+            return res.status(400).json({ error: 'passphrase must be at least 12 characters' });
+        }
+
+        createKeyBlob(String(passphrase), source.path, sourceId);
+
+        console.log(`🔑 [AUDIT] key.blob created by Super Admin (user_id=${currentUserId}) for drive: ${source.label} (${sourceId})`);
+
+        res.status(201).json({
+            message: `Key-wrapping set up for "${source.label}". The drive is now unlocked in memory.`,
+            source_id: sourceId,
+            key_blob_path: `${source.path}/key.blob`,
+            migration_note:
+                'Existing files encrypted with the server master key are NOT re-encrypted automatically. ' +
+                'New uploads to this drive will use the per-drive DEK. ' +
+                'See docs/key-wrapping.md for migration guidance.'
+        });
+
+    } catch (error) {
+        if (error.message.includes('key.blob already exists')) {
+            return res.status(409).json({ error: error.message });
+        }
+        console.error('Setup key error:', error);
+        res.status(500).json({ error: 'Server error during key setup: ' + error.message });
+    }
+});
+
+/**
+ * POST /api/admin/storage/:id/unlock
+ * Unlock a drive by loading its DEK into memory.
+ *
+ * Reads key.blob from the drive, re-derives the wrapping key from the passphrase,
+ * decrypts the DEK, and caches it in memory. The DEK is cleared from memory when
+ * the server restarts or when the lock endpoint is called.
+ *
+ * Body: { passphrase: "..." }
+ */
+router.post('/storage/:id/unlock', requireAdmin, (req, res) => {
+    try {
+        const currentUserId = req.user.userId;
+        if (currentUserId !== 1) {
+            return res.status(403).json({ error: 'Only the Super Admin can unlock drive encryption keys' });
+        }
+
+        const sourceId = req.params.id;
+        const source = db.prepare('SELECT * FROM storage_sources WHERE id = ?').get(sourceId);
+
+        if (!source) {
+            return res.status(404).json({ error: 'Storage source not found' });
+        }
+
+        if (!source.path || !fs.existsSync(source.path)) {
+            return res.status(400).json({ error: `Drive path not accessible: ${source.path}` });
+        }
+
+        if (!hasKeyBlob(source.path)) {
+            return res.status(404).json({
+                error: `No key.blob found on this drive. Run setup-key first.`
+            });
+        }
+
+        const { passphrase } = req.body;
+        if (!passphrase || String(passphrase).trim().length === 0) {
+            return res.status(400).json({ error: 'passphrase is required' });
+        }
+
+        unwrapDEK(String(passphrase), source.path, sourceId);
+
+        console.log(`🔓 [AUDIT] Drive unlocked by Super Admin (user_id=${currentUserId}): ${source.label} (${sourceId})`);
+
+        res.json({
+            message: `Drive "${source.label}" unlocked successfully. New uploads and downloads will use the per-drive DEK.`,
+            source_id: sourceId,
+            locked: false
+        });
+
+    } catch (error) {
+        if (error.message.includes('Wrong passphrase') || error.message.includes('authentication failed')) {
+            return res.status(401).json({ error: 'Wrong passphrase — decryption failed' });
+        }
+        console.error('Unlock drive error:', error);
+        res.status(500).json({ error: 'Server error during unlock: ' + error.message });
+    }
+});
+
+/**
+ * POST /api/admin/storage/:id/lock
+ * Lock a drive by clearing its DEK from memory.
+ *
+ * After this call, files encrypted with the per-drive DEK cannot be accessed
+ * until the drive is unlocked again with the correct passphrase.
+ */
+router.post('/storage/:id/lock', requireAdmin, (req, res) => {
+    try {
+        const currentUserId = req.user.userId;
+        if (currentUserId !== 1) {
+            return res.status(403).json({ error: 'Only the Super Admin can lock drives' });
+        }
+
+        const sourceId = req.params.id;
+        const source = db.prepare('SELECT * FROM storage_sources WHERE id = ?').get(sourceId);
+
+        if (!source) {
+            return res.status(404).json({ error: 'Storage source not found' });
+        }
+
+        clearDEK(sourceId);
+
+        console.log(`🔒 [AUDIT] Drive locked by Super Admin (user_id=${currentUserId}): ${source.label} (${sourceId})`);
+
+        res.json({
+            message: `Drive "${source.label}" locked. DEK cleared from memory.`,
+            source_id: sourceId,
+            locked: true
+        });
+
+    } catch (error) {
+        console.error('Lock drive error:', error);
+        res.status(500).json({ error: 'Server error during lock' });
+    }
+});
+
+/**
+ * GET /api/admin/storage/:id/key-status
+ * Returns the key-wrapping status of a drive.
+ *
+ * Reports:
+ * - has_key_blob: whether key.blob exists on the drive (key-wrapping is set up)
+ * - unlocked: whether the DEK is currently in memory (drive is unlocked)
+ *
+ * NOTE: This endpoint does NOT return any key material — only status.
+ */
+router.get('/storage/:id/key-status', requireAdmin, (req, res) => {
+    try {
+        const sourceId = req.params.id;
+        const source = db.prepare('SELECT id, label, path, type FROM storage_sources WHERE id = ?').get(sourceId);
+
+        if (!source) {
+            return res.status(404).json({ error: 'Storage source not found' });
+        }
+
+        const pathAccessible = source.path ? fs.existsSync(source.path) : false;
+        const keyBlobPresent = pathAccessible && hasKeyBlob(source.path);
+        const unlocked = isDriveUnlocked(sourceId);
+
+        res.json({
+            source_id: sourceId,
+            label: source.label,
+            has_key_blob: keyBlobPresent,
+            unlocked,
+            path_accessible: pathAccessible
+        });
+
+    } catch (error) {
+        console.error('Key status error:', error);
         res.status(500).json({ error: 'Server error' });
     }
 });

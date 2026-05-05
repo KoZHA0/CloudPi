@@ -45,11 +45,13 @@ COPY backend/ ./
 RUN rm -rf tests walkthroughs .env .env.example
 
 # Create directories for persistent data
-RUN mkdir -p uploads storage
+# /data is mounted as a Docker volume for the SQLite database
+RUN mkdir -p uploads storage /data
 
 # SECURITY: Run as non-root user (limits damage if app is exploited)
 # node:20-alpine already includes a 'node' user with uid 1000
-RUN chown -R node:node /app/backend
+# Must chown /data too — SQLite needs write access for DB + WAL/journal files
+RUN chown -R node:node /app/backend /data
 USER node
 
 EXPOSE 3001

@@ -71,10 +71,33 @@ function resolveFilePath(file) {
 /**
  * Get the user's default storage source ID.
  * Falls back to 'internal' if not set.
+ *
+ * AUTO-FALLBACK: If the user's assigned drive is disconnected (path not
+ * accessible), automatically falls back to internal storage so operations
+ * keep working instead of crashing with cryptic errors.
  */
 function getUserStorageId(userId) {
     const user = db.prepare('SELECT default_storage_id FROM users WHERE id = ?').get(userId);
-    return (user && user.default_storage_id) || 'internal';
+    const storageId = (user && user.default_storage_id) || 'internal';
+
+    if (storageId !== 'internal') {
+        const source = db.prepare('SELECT path, is_active, label FROM storage_sources WHERE id = ?').get(storageId);
+        if (!source || !source.is_active) {
+            console.warn(`⚠️ [STORAGE] User ${userId} assigned to storage "${storageId}" which is inactive or missing. Falling back to internal.`);
+            return 'internal';
+        }
+        try {
+            if (!fs.existsSync(source.path)) {
+                console.warn(`⚠️ [STORAGE] User ${userId} assigned to drive "${source.label}" at ${source.path} but the drive is NOT attached. Falling back to internal storage.`);
+                return 'internal';
+            }
+        } catch (e) {
+            console.warn(`⚠️ [STORAGE] User ${userId} — error checking drive "${source.label}" at ${source.path}: ${e.message}. Falling back to internal.`);
+            return 'internal';
+        }
+    }
+
+    return storageId;
 }
 
 // Configure multer for file uploads — saves to the user's assigned storage
@@ -363,7 +386,21 @@ router.get('/', requireAuth, (req, res) => {
             }
         }
 
-        res.json({ files, breadcrumbs });
+        // Check if user's assigned storage is disconnected and add a warning
+        const userRow = db.prepare('SELECT default_storage_id FROM users WHERE id = ?').get(userId);
+        let storageWarning = null;
+        if (userRow && userRow.default_storage_id && userRow.default_storage_id !== 'internal') {
+            const source = db.prepare('SELECT path, label, is_active FROM storage_sources WHERE id = ?').get(userRow.default_storage_id);
+            if (source) {
+                let accessible = false;
+                try { accessible = fs.existsSync(source.path); } catch (e) { /* ignore */ }
+                if (!accessible || !source.is_active) {
+                    storageWarning = `Your assigned storage drive "${source.label}" is not currently attached. New files will be saved to internal storage until the drive is reconnected.`;
+                }
+            }
+        }
+
+        res.json({ files, breadcrumbs, ...(storageWarning && { storageWarning }) });
     } catch (error) {
         console.error('List files error:', error);
         res.status(500).json({ error: 'Server error' });

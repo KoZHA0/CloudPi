@@ -86,7 +86,12 @@ services:
       # Mount the nginx config
       - ./deploy/docker-nginx.conf:/etc/nginx/conf.d/cloudpi.conf:ro
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
       # Mount Tailscale certs
+=======
+      
+      # Map the Tailscale certs (Host) to the CloudPi certs (Container)
+>>>>>>> Stashed changes
 =======
       
       # Map the Tailscale certs (Host) to the CloudPi certs (Container)

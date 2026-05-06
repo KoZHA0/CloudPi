@@ -102,7 +102,17 @@ services:
     volumes:
       # Mount the nginx config
       - ./deploy/docker-nginx.conf:/etc/nginx/conf.d/cloudpi.conf:ro
+<<<<<<< Updated upstream
+<<<<<<< Updated upstream
       # Mount Tailscale certs
+=======
+      
+      # Map the Tailscale certs (Host) to the CloudPi certs (Container)
+>>>>>>> Stashed changes
+=======
+      
+      # Map the Tailscale certs (Host) to the CloudPi certs (Container)
+>>>>>>> Stashed changes
       - /etc/ssl/certs/pi.taild54945.ts.net.crt:/etc/ssl/certs/cloudpi.crt:ro
       - /etc/ssl/private/pi.taild54945.ts.net.key:/etc/ssl/private/cloudpi.key:ro
     depends_on:

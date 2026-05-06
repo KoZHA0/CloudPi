@@ -176,13 +176,25 @@ app.use('/api/shares', shareRoutes);
 const dashboardRoutes = require('./routes/dashboard');
 app.use('/api/dashboard', dashboardRoutes);
 
+// WebDAV + LUKS routes
+// - /webdav/*        — Cryptomator-compatible WebDAV endpoint (per-user chroot)
+// - /api/luks/status — LUKS drive status (polled by the frontend)
+// - /api/luks/unlock — Admin-only: unlock + mount the LUKS drive
+// - /api/luks/lock   — Admin-only: lock the LUKS drive
+const webdavRoutes = require('./routes/webdav');
+app.use('/', webdavRoutes);
+
 // Start server
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log('');
   console.log('🚀 CloudPi Backend Server Started!');
-  console.log(`   URL: http://localhost:${PORT}`);
-  console.log(`   Test: http://localhost:${PORT}/api/test`);
-  console.log(`   Encryption: ${require('./utils/crypto-utils').isEncryptionEnabled(db) ? 'ENABLED 🔒' : 'DISABLED'}`);
-  console.log('');
+  console.log(`   URL:    http://localhost:${PORT}`);
+  console.log(`   Test:   http://localhost:${PORT}/api/test`);
+  console.log(`   WebDAV: http://localhost:${PORT}/webdav/`);
+  // Log the LUKS drive status asynchronously (non-blocking)
+  require('./utils/luks').getLuksStatus()
+    .then(s => console.log(`   LUKS:   ${s.status.toUpperCase()} (${s.device})`))
+    .catch(() => console.log('   LUKS:   status unavailable (running on non-Linux host?)'))
+    .finally(() => console.log(''));
 });

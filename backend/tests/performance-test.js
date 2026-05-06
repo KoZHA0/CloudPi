@@ -43,7 +43,7 @@ const path = require('path');
 // CONFIGURATION — UPDATE THESE BEFORE RUNNING
 // ============================================================
 const CONFIG = {
-    host: 'pi.taild54945.ts.net',
+    host: '127.0.0.1',
     port: 3001,
     username: 'Admin',       // ← Change to your username
     password: '123456',    // ← Change to your password

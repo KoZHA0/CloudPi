@@ -29,9 +29,8 @@ const { v4: uuidv4 } = require('uuid');
 const rateLimit = require('express-rate-limit'); // kept for reference but upload uses custom limiter
 const fastq = require('fastq');
 const archiver = require('archiver');
-const { computeFileHash, verifyFileHash, encryptFile, decryptFileToBuffer, encryptFileWithKey, decryptFileToBufferWithKey, isEncryptionEnabled } = require('../utils/crypto-utils');
+const { computeFileHash, verifyFileHash } = require('../utils/crypto-utils');
 const { JWT_SECRET } = require('../utils/auth-config');
-const { getActiveDEK } = require('../utils/key-wrap');
 
 const router = express.Router();
 
@@ -212,13 +211,12 @@ async function uploadWorker(task, callback) {
     try {
         const { userId, parentId, files, storageSourceId } = task;
         const uploadedFiles = [];
-        const encryptionOn = isEncryptionEnabled(db);
 
         for (const file of files) {
             const fileType = getFileType(file.mimetype);
             const diskPath = file.path;
 
-            // 1. Compute SHA-256 hash of the PLAINTEXT file (before encryption)
+            // Compute SHA-256 hash for integrity verification on download
             let sha256Hash = null;
             try {
                 sha256Hash = await computeFileHash(diskPath);
@@ -226,30 +224,11 @@ async function uploadWorker(task, callback) {
                 console.error('Hash computation failed:', hashErr.message);
             }
 
-            // 2. Encrypt the file in-place if encryption is enabled
-            let isEncrypted = 0;
-            let isKeyWrapped = 0;
-            if (encryptionOn) {
-                try {
-                    // Look up a per-drive DEK only when we have an explicit storage source ID.
-                    // Internal storage (or unassigned files) always uses the master key.
-                    const activeDEK = storageSourceId ? getActiveDEK(storageSourceId) : null;
-                    if (activeDEK) {
-                        await encryptFileWithKey(diskPath, diskPath, activeDEK);
-                        isKeyWrapped = 1;
-                    } else {
-                        await encryptFile(diskPath, diskPath);
-                    }
-                    isEncrypted = 1;
-                } catch (encErr) {
-                    console.error('Encryption failed (storing plaintext):', encErr.message);
-                }
-            }
-
-            // 3. Insert DB record with hash and encryption flag
+            // Files are stored as plaintext — LUKS provides disk-level encryption.
+            // Cryptomator provides per-vault client-side encryption for WebDAV users.
             const result = db.prepare(`
                 INSERT INTO files (user_id, name, path, type, size, mime_type, parent_id, storage_source_id, sha256_hash, encrypted, key_wrapped)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)
             `).run(
                 userId,
                 file.originalname,
@@ -259,9 +238,7 @@ async function uploadWorker(task, callback) {
                 file.mimetype,
                 parentId,
                 storageSourceId || 'internal',
-                sha256Hash,
-                isEncrypted,
-                isKeyWrapped
+                sha256Hash
             );
 
             const uploaded = db.prepare('SELECT * FROM files WHERE id = ?').get(result.lastInsertRowid);
@@ -737,31 +714,7 @@ router.get('/:id/preview', async (req, res) => {
         res.set('Content-Disposition', `inline; filename="${encodeURIComponent(file.name)}"`);
         res.set('Cache-Control', 'public, max-age=86400');
 
-        // If file is encrypted, decrypt to buffer and send
-        if (file.encrypted === 1) {
-            try {
-                let decryptedBuffer;
-                if (file.key_wrapped === 1) {
-                    const activeDEK = file.storage_source_id
-                        ? getActiveDEK(file.storage_source_id)
-                        : null;
-                    if (!activeDEK) {
-                        return res.status(403).json({
-                            error: 'Drive is locked. Please unlock the drive with its passphrase before accessing this file.'
-                        });
-                    }
-                    decryptedBuffer = await decryptFileToBufferWithKey(filePath, activeDEK);
-                } else {
-                    decryptedBuffer = await decryptFileToBuffer(filePath);
-                }
-                res.set('Content-Length', decryptedBuffer.length);
-                return res.send(decryptedBuffer);
-            } catch (decErr) {
-                console.error('Decryption error during preview:', decErr.message);
-                return res.status(500).json({ error: 'Failed to decrypt file for preview' });
-            }
-        }
-
+        // Serve the file directly (no AES decryption — LUKS handles disk encryption)
         res.sendFile(filePath);
     } catch (error) {
         if (error.name === 'JsonWebTokenError' || error.name === 'TokenExpiredError') {
@@ -798,45 +751,7 @@ router.get('/:id/download', requireAuth, async (req, res) => {
                 return res.status(404).json({ error: 'File not found on disk' });
             }
 
-            // If file is encrypted, decrypt to buffer, verify hash, and send
-            if (file.encrypted === 1) {
-                try {
-                    let decryptedBuffer;
-                    if (file.key_wrapped === 1) {
-                        const activeDEK = file.storage_source_id
-                            ? getActiveDEK(file.storage_source_id)
-                            : null;
-                        if (!activeDEK) {
-                            return res.status(403).json({
-                                error: 'Drive is locked. Please unlock the drive with its passphrase before downloading this file.'
-                            });
-                        }
-                        decryptedBuffer = await decryptFileToBufferWithKey(filePath, activeDEK);
-                    } else {
-                        decryptedBuffer = await decryptFileToBuffer(filePath);
-                    }
-
-                    // Verify SHA-256 integrity if hash exists
-                    if (file.sha256_hash) {
-                        const crypto = require('crypto');
-                        const computedHash = crypto.createHash('sha256').update(decryptedBuffer).digest('hex');
-                        if (computedHash !== file.sha256_hash) {
-                            console.warn(`⚠️  Integrity mismatch for file ${file.id} (${file.name})`);
-                            res.set('X-Integrity-Warning', 'hash-mismatch');
-                        }
-                    }
-
-                    res.set('Content-Type', file.mime_type || 'application/octet-stream');
-                    res.set('Content-Disposition', `attachment; filename="${encodeURIComponent(file.name)}"`);
-                    res.set('Content-Length', decryptedBuffer.length);
-                    return res.send(decryptedBuffer);
-                } catch (decErr) {
-                    console.error('Decryption error during download:', decErr.message);
-                    return res.status(500).json({ error: 'Failed to decrypt file' });
-                }
-            }
-
-            // Unencrypted file — verify hash if available, then send
+            // Verify SHA-256 integrity if hash is recorded
             if (file.sha256_hash) {
                 try {
                     const { valid } = await verifyFileHash(filePath, file.sha256_hash);
@@ -891,39 +806,16 @@ router.get('/:id/download', requireAuth, async (req, res) => {
         res.set('Content-Type', 'application/zip');
         res.set('Content-Disposition', `attachment; filename="${encodeURIComponent(zipName)}"`);
 
-        const archive = archiver('zip', { zlib: { level: 5 } }); // level 5 = balanced speed/size
+        const archive = archiver('zip', { zlib: { level: 5 } });
         archive.on('error', (err) => {
             console.error('ZIP error:', err);
             if (!res.headersSent) res.status(500).json({ error: 'ZIP creation failed' });
         });
         archive.pipe(res);
 
-        const skippedFiles = [];
-        for (const { diskPath, archivePath, encrypted, keyWrapped, storageSourceId } of filesToZip) {
-            if (encrypted) {
-                let decryptedBuffer;
-                if (keyWrapped) {
-                    const activeDEK = storageSourceId ? getActiveDEK(storageSourceId) : null;
-                    if (!activeDEK) {
-                        // Skip locked files rather than aborting the entire ZIP;
-                        // report them via a response header so the client knows.
-                        skippedFiles.push(archivePath);
-                        console.warn(`⚠️  Skipping locked file in ZIP: ${archivePath} (drive ${storageSourceId} is locked)`);
-                        continue;
-                    }
-                    decryptedBuffer = await decryptFileToBufferWithKey(diskPath, activeDEK);
-                } else {
-                    decryptedBuffer = await decryptFileToBuffer(diskPath);
-                }
-                archive.append(decryptedBuffer, { name: archivePath });
-            } else {
-                archive.file(diskPath, { name: archivePath });
-            }
-        }
-
-        if (skippedFiles.length > 0) {
-            res.set('X-Skipped-Locked-Files', skippedFiles.join(';'));
-            console.warn(`⚠️  ZIP download skipped ${skippedFiles.length} locked file(s) — drive(s) must be unlocked first`);
+        // Files are stored as plaintext on the LUKS-encrypted disk — add directly
+        for (const { diskPath, archivePath } of filesToZip) {
+            archive.file(diskPath, { name: archivePath });
         }
 
         archive.finalize();

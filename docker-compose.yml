@@ -33,6 +33,15 @@ services:
       - CLOUDPI_DB_PATH=/data/cloudpi.db
       # Host path where USB drives are auto-mounted (default: /media/pi)
       - CLOUDPI_EXTERNAL_DRIVES_PATH=/media/pi
+      # ── LUKS Configuration ──────────────────────────────────────────────
+      # LUKS_DEVICE: the raw LUKS-encrypted partition (e.g. /dev/sda1)
+      # The backend calls `cryptsetup luksOpen` and `mount` on this device
+      # via the host OS (via a privileged sudoers-wrapped helper or host scripts).
+      # If you manage LUKS unlocking purely at host level before Docker starts,
+      # only LUKS_MOUNT_POINT is strictly needed here.
+      - LUKS_DEVICE=${LUKS_DEVICE:-/dev/sda1}
+      - LUKS_MAPPER_NAME=${LUKS_MAPPER_NAME:-cloudpi-data}
+      - LUKS_MOUNT_POINT=${LUKS_MOUNT_POINT:-/media/cloudpi-data}
     volumes:
       # Persist database (survives container rebuilds)
       - cloudpi-db:/data
@@ -49,6 +58,14 @@ services:
       # drives mounted on the host after startup, but cannot propagate mounts
       # back to the host. Narrowed to /media/pi to limit visibility.
       - /media/pi:/media/pi:rslave
+      # ── LUKS / Cryptomator data volume ──────────────────────────────────
+      # Once the admin unlocks the LUKS drive via the Web UI, the host mounts
+      # the decrypted ext4/exfat partition here.  This bind mount lets the
+      # backend (and WebDAV server) serve files from the encrypted drive.
+      # rslave: same one-way propagation policy as /media/pi above.
+      # NOTE: The directory must exist on the host before Docker starts;
+      #       it is created automatically by luks.js on first unlock.
+      - /media/cloudpi-data:/media/cloudpi-data:rslave
     networks:
       - cloudpi-net
     healthcheck:

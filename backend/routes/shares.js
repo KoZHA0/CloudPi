@@ -19,7 +19,6 @@ const fs = require('fs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const db = require('../database/db');
-const { decryptFileToBuffer } = require('../utils/crypto-utils');
 const { JWT_SECRET } = require('../utils/auth-config');
 
 const router = express.Router();
@@ -278,27 +277,7 @@ router.get('/shared-folder/:shareId/download/:fileId', requireAuth, async (req, 
             filePath = path.join(storageDir, String(file.user_id), file.path);
         }
 
-        if (file.type !== 'folder') {
-            if (!fs.existsSync(filePath)) {
-                return res.status(404).json({ error: 'File not found on disk' });
-            }
-
-            // Decrypt if file is encrypted
-            if (file.encrypted === 1) {
-                try {
-                    const decryptedBuffer = await decryptFileToBuffer(filePath);
-                    res.set('Content-Type', file.mime_type || 'application/octet-stream');
-                    res.set('Content-Disposition', `attachment; filename="${encodeURIComponent(file.name)}"`);
-                    res.set('Content-Length', decryptedBuffer.length);
-                    return res.send(decryptedBuffer);
-                } catch (decErr) {
-                    console.error('Decryption error (shared download):', decErr.message);
-                    return res.status(500).json({ error: 'Failed to decrypt file' });
-                }
-            }
-
             return res.download(filePath, file.name);
-        }
 
         // ZIP download for subfolders
         const archiver = require('archiver');
@@ -349,13 +328,8 @@ router.get('/shared-folder/:shareId/download/:fileId', requireAuth, async (req, 
             if (!res.headersSent) res.status(500).json({ error: 'ZIP creation failed' });
         });
         archive.pipe(res);
-        for (const { diskPath, archivePath, encrypted } of filesToZip) {
-            if (encrypted) {
-                const decryptedBuffer = await decryptFileToBuffer(diskPath);
-                archive.append(decryptedBuffer, { name: archivePath });
-            } else {
-                archive.file(diskPath, { name: archivePath });
-            }
+        for (const { diskPath, archivePath } of filesToZip) {
+            archive.file(diskPath, { name: archivePath });
         }
         archive.finalize();
     } catch (error) {
@@ -429,18 +403,6 @@ router.get('/shared-folder/:shareId/preview/:fileId', requireAuth, async (req, r
         res.set('Content-Type', file.mime_type || 'application/octet-stream');
         res.set('Content-Disposition', `inline; filename="${encodeURIComponent(file.name)}"`);
         res.set('Cache-Control', 'public, max-age=86400');
-
-        // Decrypt if file is encrypted
-        if (file.encrypted === 1) {
-            try {
-                const decryptedBuffer = await decryptFileToBuffer(filePath);
-                res.set('Content-Length', decryptedBuffer.length);
-                return res.send(decryptedBuffer);
-            } catch (decErr) {
-                console.error('Decryption error (shared preview):', decErr.message);
-                return res.status(500).json({ error: 'Failed to decrypt file for preview' });
-            }
-        }
 
         res.sendFile(filePath);
     } catch (error) {
@@ -611,20 +573,6 @@ router.get('/public/:link/download', async (req, res) => {
             return res.status(404).json({ error: 'File not found on disk' });
         }
 
-        // Decrypt if file is encrypted
-        if (share.encrypted === 1) {
-            try {
-                const decryptedBuffer = await decryptFileToBuffer(filePath);
-                res.set('Content-Type', share.mime_type || 'application/octet-stream');
-                res.set('Content-Disposition', `attachment; filename="${encodeURIComponent(share.file_name)}"`);
-                res.set('Content-Length', decryptedBuffer.length);
-                return res.send(decryptedBuffer);
-            } catch (decErr) {
-                console.error('Decryption error (public download):', decErr.message);
-                return res.status(500).json({ error: 'Failed to decrypt file' });
-            }
-        }
-
         res.set('Content-Type', share.mime_type || 'application/octet-stream');
         res.set('Content-Disposition', `attachment; filename="${encodeURIComponent(share.file_name)}"`);
         res.sendFile(filePath);
@@ -667,18 +615,6 @@ router.get('/public/:link/preview', async (req, res) => {
         res.set('Content-Type', share.mime_type || 'application/octet-stream');
         res.set('Content-Disposition', `inline; filename="${encodeURIComponent(share.file_name)}"`);
         res.set('Cache-Control', 'public, max-age=86400');
-
-        // Decrypt if file is encrypted
-        if (share.encrypted === 1) {
-            try {
-                const decryptedBuffer = await decryptFileToBuffer(filePath);
-                res.set('Content-Length', decryptedBuffer.length);
-                return res.send(decryptedBuffer);
-            } catch (decErr) {
-                console.error('Decryption error (public preview):', decErr.message);
-                return res.status(500).json({ error: 'Failed to decrypt file for preview' });
-            }
-        }
 
         res.sendFile(filePath);
     } catch (error) {

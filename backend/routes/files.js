@@ -108,8 +108,14 @@ function getUserStorageId(userId) {
             return 'internal';
         }
         try {
-            if (!fs.existsSync(source.path)) {
-                console.warn(`⚠️ [STORAGE] User ${userId} assigned to drive "${source.label}" at ${source.path} but the drive is NOT attached. Falling back to internal storage.`);
+            // Use mount-point-aware check: the ghost /media/pi/sda1 directory
+            // persists after USB unplug, but it's on the root filesystem.
+            // isDriveActuallyPresent detects this by comparing device IDs.
+            const { isDriveActuallyPresent } = require('./events');
+            if (!isDriveActuallyPresent(source.path, storageId)) {
+                console.warn(`⚠️ [STORAGE] User ${userId} assigned to drive "${source.label}" at ${source.path} but the drive is NOT actually mounted. Falling back to internal storage.`);
+                // Also update DB so we don't re-check on every request
+                db.prepare('UPDATE storage_sources SET is_accessible = 0 WHERE id = ?').run(storageId);
                 return 'internal';
             }
         } catch (e) {
@@ -127,10 +133,11 @@ const multerStorage = multer.diskStorage({
         const userId = req.user.userId;
         const storageId = getUserStorageId(userId);
 
-        // Check storage source is active
+        // Check storage source is active and actually mounted
         if (storageId !== 'internal') {
-            const source = db.prepare('SELECT is_active, path FROM storage_sources WHERE id = ?').get(storageId);
-            if (!source || !source.is_active || !fs.existsSync(source.path)) {
+            const source = db.prepare('SELECT is_active, path, id FROM storage_sources WHERE id = ?').get(storageId);
+            const { isDriveActuallyPresent } = require('./events');
+            if (!source || !source.is_active || !isDriveActuallyPresent(source.path, source.id)) {
                 // Fallback to internal if external drive unavailable
                 req._storageSourceId = 'internal';
                 const userDir = path.join(DEFAULT_STORAGE_DIR, String(userId));
@@ -814,6 +821,22 @@ router.get('/:id/thumbnail', async (req, res) => {
 
         if (!file) return res.status(404).json({ error: 'File not found' });
 
+        // Check if the file's storage source is ACTUALLY mounted
+        if (file.storage_source_id && file.storage_source_id !== 'internal') {
+            const source = db.prepare('SELECT is_accessible, label, path FROM storage_sources WHERE id = ?')
+                .get(file.storage_source_id);
+            const { isDriveActuallyPresent } = require('./events');
+            if (source && (!source.is_accessible || !isDriveActuallyPresent(source.path, file.storage_source_id))) {
+                if (source.is_accessible) {
+                    db.prepare('UPDATE storage_sources SET is_accessible = 0 WHERE id = ?').run(file.storage_source_id);
+                }
+                return res.status(503).json({
+                    error: `Storage drive "${source.label}" is disconnected.`,
+                    drive_disconnected: true
+                });
+            }
+        }
+
         const filePath = resolveFilePath(file);
         if (!fs.existsSync(filePath)) {
             return res.status(404).json({ error: 'File not found on disk' });
@@ -948,11 +971,16 @@ router.get('/:id/preview', async (req, res) => {
             return res.status(404).json({ error: 'File not found' });
         }
 
-        // Check if the file's storage source is accessible (drive connected)
+        // Check if the file's storage source is ACTUALLY mounted (not just DB flag)
         if (file.storage_source_id && file.storage_source_id !== 'internal') {
-            const source = db.prepare('SELECT is_accessible, label FROM storage_sources WHERE id = ?')
+            const source = db.prepare('SELECT is_accessible, label, path FROM storage_sources WHERE id = ?')
                 .get(file.storage_source_id);
-            if (source && !source.is_accessible) {
+            const { isDriveActuallyPresent } = require('./events');
+            if (source && (!source.is_accessible || !isDriveActuallyPresent(source.path, file.storage_source_id))) {
+                // Update DB if stale
+                if (source.is_accessible) {
+                    db.prepare('UPDATE storage_sources SET is_accessible = 0 WHERE id = ?').run(file.storage_source_id);
+                }
                 return res.status(503).json({
                     error: `Storage drive "${source.label}" is disconnected. This file is temporarily unavailable.`,
                     drive_disconnected: true
@@ -1006,11 +1034,15 @@ router.get('/:id/download', requireAuth, async (req, res) => {
             return res.status(404).json({ error: 'File not found' });
         }
 
-        // Check if the file's storage source is accessible (drive connected)
+        // Check if the file's storage source is ACTUALLY mounted (not just DB flag)
         if (file.storage_source_id && file.storage_source_id !== 'internal') {
-            const source = db.prepare('SELECT is_accessible, label FROM storage_sources WHERE id = ?')
+            const source = db.prepare('SELECT is_accessible, label, path FROM storage_sources WHERE id = ?')
                 .get(file.storage_source_id);
-            if (source && !source.is_accessible) {
+            const { isDriveActuallyPresent } = require('./events');
+            if (source && (!source.is_accessible || !isDriveActuallyPresent(source.path, file.storage_source_id))) {
+                if (source.is_accessible) {
+                    db.prepare('UPDATE storage_sources SET is_accessible = 0 WHERE id = ?').run(file.storage_source_id);
+                }
                 return res.status(503).json({
                     error: `Storage drive "${source.label}" is disconnected. This file is temporarily unavailable.`,
                     drive_disconnected: true

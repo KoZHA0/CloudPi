@@ -9,7 +9,8 @@
  */
 
 const DEFAULT_JWT_SECRET = 'cloudpi-secret-key-change-this-in-production';
-const JWT_SECRET = process.env.JWT_SECRET || DEFAULT_JWT_SECRET;
+// .trim() handles Windows CRLF in .env (Docker may include \r in values)
+const JWT_SECRET = (process.env.JWT_SECRET || DEFAULT_JWT_SECRET).trim();
 const SALT_ROUNDS = 10;
 
 if (process.env.NODE_ENV === 'production' && JWT_SECRET === DEFAULT_JWT_SECRET) {

@@ -66,6 +66,10 @@ services:
       # NOTE: The directory must exist on the host before Docker starts;
       #       it is created automatically by luks.js on first unlock.
       - /media/cloudpi-data:/media/cloudpi-data:rslave
+    # Expose backend port to host's localhost ONLY (not public).
+    # Required for the udev drive-notify webhook (host→container).
+    ports:
+      - "127.0.0.1:3001:3001"
     networks:
       - cloudpi-net
     healthcheck:

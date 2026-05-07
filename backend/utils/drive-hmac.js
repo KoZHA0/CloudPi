@@ -18,7 +18,8 @@ const crypto = require('crypto');
  * @returns {string|null} Hex-encoded HMAC, or null if no key configured
  */
 function computeDriveHmac(driveId) {
-    const key = process.env.CLOUDPI_ENCRYPTION_KEY;
+    // .trim() handles Windows CRLF line endings in .env files (Docker may include \r)
+    const key = (process.env.CLOUDPI_ENCRYPTION_KEY || '').trim();
     if (!key || key.length !== 64) return null;
     return crypto.createHmac('sha256', Buffer.from(key, 'hex'))
         .update(driveId)

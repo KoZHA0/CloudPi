@@ -679,6 +679,9 @@ router.get('/storage', requireAdmin, (req, res) => {
             ORDER BY s.type ASC, s.created_at ASC
         `).all();
 
+        // Import identity-aware check (handles ghost partition at same mount point)
+        const { isDriveActuallyPresent } = require('./events');
+
         // Enrich with live accessibility info and disk space
         const enriched = sources.map(source => {
             // Primary source: the is_accessible column (updated by udev events)
@@ -686,7 +689,8 @@ router.get('/storage', requireAdmin, (req, res) => {
             let is_accessible = !!source.is_accessible;
             if (source.type !== 'internal') {
                 try {
-                    const fsAccessible = fs.existsSync(source.path);
+                    // Identity-aware: check .cloudpi-id matches, not just path exists
+                    const fsAccessible = isDriveActuallyPresent(source.path, source.id);
                     // If DB says accessible but filesystem disagrees, update DB
                     if (is_accessible && !fsAccessible) {
                         db.prepare('UPDATE storage_sources SET is_accessible = 0 WHERE id = ?').run(source.id);
@@ -1080,9 +1084,11 @@ router.get('/drives', requireAdmin, async (req, res) => {
         }
 
         // Dirty unplug detection: check registered sources that aren't in the detected drives
+        const { isDriveActuallyPresent } = require('./events');
         const enrichedSources = registeredSources.map(src => {
             const isPresent = drives.some(d => d.registeredId === src.id);
-            const isAccessible = src.path ? fs.existsSync(src.path) : false;
+            // Identity-aware: verify .cloudpi-id matches, not just path exists
+            const isAccessible = src.path ? isDriveActuallyPresent(src.path, src.id) : false;
             return {
                 ...src,
                 status: isAccessible ? 'online' : (isPresent ? 'detected' : 'offline'),

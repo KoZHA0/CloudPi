@@ -83,6 +83,7 @@ export interface User {
     storage_quota?: number | null;
     used_bytes?: number;
     two_factor_enabled?: number;
+    avatar_url?: string | null;
 }
 
 export interface AuthenticatedResponse {
@@ -172,6 +173,37 @@ export async function updateProfile(
         method: 'PUT',
         body: JSON.stringify({ username, email, currentPassword }),
     });
+}
+
+// Avatar API
+export function getAvatarUrl(filename: string): string {
+    return `${API_BASE}/auth/avatar/${filename}`;
+}
+
+export async function uploadAvatar(file: File): Promise<{ message: string; avatar_url: string }> {
+    const formData = new FormData();
+    formData.append('avatar', file);
+
+    const token = getToken();
+    const response = await fetch(`${API_BASE}/auth/avatar`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}` },
+        body: formData,
+    });
+
+    let data: any;
+    try {
+        const text = await response.text();
+        data = JSON.parse(text);
+    } catch {
+        throw new Error('Failed to upload avatar');
+    }
+    if (!response.ok) throw new Error(data.error || 'Avatar upload failed');
+    return data;
+}
+
+export async function removeAvatar(): Promise<{ message: string }> {
+    return apiRequest<{ message: string }>('/auth/avatar', { method: 'DELETE' });
 }
 
 // ============================================
@@ -335,6 +367,8 @@ export interface FileItem {
     created_at: string;
     modified_at: string;
     trashed_at?: string;
+    is_accessible?: boolean | number;  // from JOIN with storage_sources
+    storage_source_id?: string;
 }
 
 export interface Breadcrumb {
@@ -436,6 +470,12 @@ export function getPreviewUrl(fileId: number): string {
     return `${API_BASE}/files/${fileId}/preview?token=${token}`;
 }
 
+// Rich media thumbnail (image/video)
+export function getThumbnailUrl(fileId: number, size: number = 256): string {
+    const token = getToken();
+    return `${API_BASE}/files/${fileId}/thumbnail?token=${token}&size=${size}`;
+}
+
 export async function downloadFile(fileId: number, fileName: string): Promise<void> {
     const token = getToken();
     const response = await fetch(`${API_BASE}/files/${fileId}/download`, {
@@ -476,6 +516,14 @@ export async function toggleStar(fileId: number): Promise<{ message: string; sta
 export async function moveFile(fileId: number, parentId: number | null): Promise<{ message: string }> {
     return apiRequest<{ message: string }>(`/files/${fileId}/move`, {
         method: 'PUT',
+        body: JSON.stringify({ parent_id: parentId }),
+    });
+}
+
+// Copy file/folder
+export async function copyFile(fileId: number, parentId: number | null): Promise<{ message: string; file: FileItem }> {
+    return apiRequest<{ message: string; file: FileItem }>(`/files/${fileId}/copy`, {
+        method: 'POST',
         body: JSON.stringify({ parent_id: parentId }),
     });
 }
@@ -526,6 +574,16 @@ export interface ShareItem {
     shared_by_name?: string;
 }
 
+export interface ShareAccessItem {
+    id: number;
+    file_id: number;
+    shared_with: number;
+    permission: string;
+    created_at: string;
+    share_link: string;
+    shared_with_name?: string;
+}
+
 // List users to share with
 export async function getShareUsers(): Promise<{ users: ShareUser[] }> {
     return apiRequest<{ users: ShareUser[] }>('/shares/users');
@@ -544,6 +602,14 @@ export async function getMyShares(): Promise<{ shares: ShareItem[] }> {
     return apiRequest<{ shares: ShareItem[] }>('/shares/my-shares');
 }
 
+// List users who currently have access to a specific file
+export async function getShareAccess(fileId: number): Promise<{
+    file: { id: number; name: string; type: string };
+    access: ShareAccessItem[];
+}> {
+    return apiRequest(`/shares/file/${fileId}/access`);
+}
+
 // List files shared with me
 export async function getSharedWithMe(): Promise<{ shares: ShareItem[] }> {
     return apiRequest<{ shares: ShareItem[] }>('/shares/shared-with-me');
@@ -552,6 +618,13 @@ export async function getSharedWithMe(): Promise<{ shares: ShareItem[] }> {
 // Revoke a share
 export async function revokeShare(shareId: number): Promise<{ message: string }> {
     return apiRequest<{ message: string }>(`/shares/${shareId}`, {
+        method: 'DELETE',
+    });
+}
+
+// Revoke a specific user's access from a shared file
+export async function revokeShareAccess(fileId: number, userId: number): Promise<{ message: string }> {
+    return apiRequest<{ message: string }>(`/shares/file/${fileId}/access/${userId}`, {
         method: 'DELETE',
     });
 }
@@ -788,4 +861,58 @@ export async function lockDrive(
     return apiRequest(`/admin/storage/${sourceId}/lock`, {
         method: 'POST',
     });
+}
+
+// ============= DRIVE STATUS SSE =============
+
+export interface DriveStatusEvent {
+    source_id: string;
+    label: string;
+    status: 'online' | 'offline';
+    timestamp: number;
+}
+
+export interface SSEConnectedEvent {
+    message: string;
+    drives: DriveStatusEvent[];
+}
+
+/**
+ * Create an EventSource connection for real-time drive status updates.
+ * Uses SSE (Server-Sent Events) — no polling needed.
+ *
+ * @param onStatusChange - Called when a drive's status changes
+ * @param onConnected - Called with initial drive states on connection
+ * @returns cleanup function to close the connection
+ */
+export function subscribeToDriveEvents(
+    onStatusChange: (data: DriveStatusEvent) => void,
+    onConnected?: (data: SSEConnectedEvent) => void
+): () => void {
+    const token = getToken();
+    if (!token) return () => {};
+
+    const es = new EventSource(`${API_BASE}/events?token=${encodeURIComponent(token)}`);
+
+    es.addEventListener('connected', (e) => {
+        try {
+            const data = JSON.parse((e as MessageEvent).data);
+            onConnected?.(data);
+        } catch { /* ignore parse errors */ }
+    });
+
+    es.addEventListener('drive_status_change', (e) => {
+        try {
+            const data = JSON.parse((e as MessageEvent).data);
+            onStatusChange(data);
+        } catch { /* ignore parse errors */ }
+    });
+
+    es.onerror = () => {
+        // EventSource auto-reconnects on error — no manual handling needed.
+        // The browser will retry with exponential backoff.
+    };
+
+    // Return cleanup function
+    return () => es.close();
 }

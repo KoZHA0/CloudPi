@@ -28,6 +28,7 @@ const express = require('express');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
+const os = require('os');
 const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
@@ -37,29 +38,8 @@ const { sendEmail } = require('../utils/mailer');
 
 const router = express.Router();
 
-/**
- * HMAC helper for .cloudpi-id integrity.
- * Uses the server's CLOUDPI_ENCRYPTION_KEY to sign and verify drive IDs.
- * Prevents attackers from crafting a fake .cloudpi-id on a rogue USB.
- */
-function computeDriveHmac(driveId) {
-    const key = process.env.CLOUDPI_ENCRYPTION_KEY;
-    if (!key || key.length !== 64) return null;
-    return crypto.createHmac('sha256', Buffer.from(key, 'hex'))
-        .update(driveId)
-        .digest('hex');
-}
-
-function verifyDriveHmac(driveId, hmac) {
-    const expected = computeDriveHmac(driveId);
-    if (!expected || !hmac) return false;
-    // Constant-time comparison to prevent timing attacks
-    try {
-        return crypto.timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(hmac, 'hex'));
-    } catch {
-        return false;
-    }
-}
+// HMAC helpers for .cloudpi-id integrity (shared utility)
+const { computeDriveHmac, verifyDriveHmac } = require('../utils/drive-hmac');
 
 /**
  * ADMIN MIDDLEWARE
@@ -573,12 +553,6 @@ router.put('/settings', requireAdmin, (req, res) => {
                 finalValue = String(numValue);
             } else if (allowedStringKeys.includes(key)) {
                 finalValue = String(value);
-                
-                // If it's the SMTP password and encryption is enabled globally, encrypt it!
-                // Wait, cryptoUtils.encryptFileBuffer takes a buffer. 
-                // We can just use node crypto if we want a simple string encryption.
-                // Let's use cryptoUtils.encryptString if it exists, otherwise manual or plain.
-                // Let's implement manual AES encryption here using the CLOUDPI_ENCRYPTION_KEY to keep it simple.
             }
             
             // Handle smtp_pass encryption
@@ -705,13 +679,25 @@ router.get('/storage', requireAdmin, (req, res) => {
             ORDER BY s.type ASC, s.created_at ASC
         `).all();
 
-        // Check if external drives are still accessible
+        // Enrich with live accessibility info and disk space
         const enriched = sources.map(source => {
-            let is_accessible = false;
-            try {
-                is_accessible = fs.existsSync(source.path);
-            } catch (e) {
-                is_accessible = false;
+            // Primary source: the is_accessible column (updated by udev events)
+            // Cross-check: verify filesystem agrees with DB state
+            let is_accessible = !!source.is_accessible;
+            if (source.type !== 'internal') {
+                try {
+                    const fsAccessible = fs.existsSync(source.path);
+                    // If DB says accessible but filesystem disagrees, update DB
+                    if (is_accessible && !fsAccessible) {
+                        db.prepare('UPDATE storage_sources SET is_accessible = 0 WHERE id = ?').run(source.id);
+                        is_accessible = false;
+                    } else if (!is_accessible && fsAccessible) {
+                        // Drive appeared without udev event (edge case) — don't auto-reactivate
+                        // Admin must manually verify via reactivate endpoint
+                    }
+                } catch (e) {
+                    is_accessible = false;
+                }
             }
 
             // Get total disk space if accessible
@@ -958,8 +944,27 @@ router.delete('/storage/:id', requireAdmin, (req, res) => {
 // - Raspberry Pi OS (desktop): /media/pi
 // - Headless Pi with usbmount: /media/usb0, /media/usb1, etc.
 // - Docker: set via CLOUDPI_EXTERNAL_DRIVES_PATH env var
-const EXTERNAL_DRIVES_PATH = process.env.CLOUDPI_EXTERNAL_DRIVES_PATH
-    || (process.platform === 'linux' ? '/media/pi' : null);
+let EXTERNAL_DRIVES_PATH = process.env.CLOUDPI_EXTERNAL_DRIVES_PATH;
+
+if (!EXTERNAL_DRIVES_PATH && process.platform === 'linux') {
+    const username = os.userInfo().username;
+    // Check common Linux mount points
+    const commonPaths = [
+        `/run/media/${username}`, // Modern Linux (Kali, Arch, Fedora)
+        `/media/${username}`,     // Ubuntu, Debian, Mint
+        '/media/pi',              // Raspberry Pi OS fallback
+        '/media'                  // Generic fallback
+    ];
+    
+    // Find the first path that actually exists on the system
+    for (const p of commonPaths) {
+        if (fs.existsSync(p)) {
+            EXTERNAL_DRIVES_PATH = p;
+            break;
+        }
+    }
+    if (!EXTERNAL_DRIVES_PATH) EXTERNAL_DRIVES_PATH = '/media/pi'; // Ultimate fallback
+}
 
 /**
  * GET /api/admin/drives

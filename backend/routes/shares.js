@@ -6,6 +6,8 @@
  * Routes:
  *   POST   /api/shares              - Share a file with a user
  *   GET    /api/shares/my-shares     - Files I've shared with others
+ *   GET    /api/shares/file/:fileId/access - List who has access to one file
+ *   DELETE /api/shares/file/:fileId/access/:userId - Revoke one user's access
  *   GET    /api/shares/shared-with-me - Files shared with me
  *   DELETE /api/shares/:id           - Revoke a share
  *   GET    /api/shares/users         - List users to share with
@@ -105,6 +107,72 @@ router.get('/my-shares', requireAuth, (req, res) => {
         res.json({ shares });
     } catch (error) {
         console.error('List my shares error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+/**
+ * GET /api/shares/file/:fileId/access
+ * List all users who currently have access to this file
+ */
+router.get('/file/:fileId/access', requireAuth, (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const fileId = Number(req.params.fileId);
+
+        const file = db.prepare(
+            'SELECT id, name, type FROM files WHERE id = ? AND user_id = ? AND trashed = 0'
+        ).get(fileId, userId);
+
+        if (!file) {
+            return res.status(404).json({ error: 'File not found' });
+        }
+
+        const accessList = db.prepare(`
+            SELECT s.id, s.file_id, s.shared_with, s.permission, s.created_at, s.share_link,
+                   u.username as shared_with_name
+            FROM shares s
+            LEFT JOIN users u ON s.shared_with = u.id
+            WHERE s.shared_by = ? AND s.file_id = ?
+            ORDER BY s.created_at DESC
+        `).all(userId, fileId);
+
+        res.json({
+            file: {
+                id: file.id,
+                name: file.name,
+                type: file.type
+            },
+            access: accessList
+        });
+    } catch (error) {
+        console.error('Get share access error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+/**
+ * DELETE /api/shares/file/:fileId/access/:userId
+ * Revoke a specific user's access to a file
+ */
+router.delete('/file/:fileId/access/:userId', requireAuth, (req, res) => {
+    try {
+        const ownerId = req.user.userId;
+        const fileId = Number(req.params.fileId);
+        const targetUserId = Number(req.params.userId);
+
+        const share = db.prepare(
+            'SELECT * FROM shares WHERE file_id = ? AND shared_by = ? AND shared_with = ?'
+        ).get(fileId, ownerId, targetUserId);
+
+        if (!share) {
+            return res.status(404).json({ error: 'Share not found for this user' });
+        }
+
+        db.prepare('DELETE FROM shares WHERE id = ?').run(share.id);
+        res.json({ message: 'Access revoked' });
+    } catch (error) {
+        console.error('Revoke share access error:', error);
         res.status(500).json({ error: 'Server error' });
     }
 });
@@ -277,7 +345,12 @@ router.get('/shared-folder/:shareId/download/:fileId', requireAuth, async (req, 
             filePath = path.join(storageDir, String(file.user_id), file.path);
         }
 
+        if (file.type !== 'folder') {
+            if (!fs.existsSync(filePath)) {
+                return res.status(404).json({ error: 'File not found on disk' });
+            }
             return res.download(filePath, file.name);
+        }
 
         // ZIP download for subfolders
         const archiver = require('archiver');

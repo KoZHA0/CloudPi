@@ -1,6 +1,10 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { useState, useEffect } from 'react'
 import { AuthProvider } from '@/contexts/auth-context'
+import { ThemeProvider } from '@/contexts/theme-context'
+import { UploadProvider } from '@/contexts/upload-context'
+import { DriveStatusProvider } from '@/contexts/drive-status-context'
+import { UploadManager } from '@/components/upload-manager'
 import { DashboardLayout } from '@/components/dashboard-layout'
 import { DashboardPage } from '@/pages/dashboard'
 import { LoginPage } from '@/pages/login'
@@ -92,11 +96,18 @@ function AppContent() {
 
 function App() {
     return (
-        <AuthProvider>
-            <BrowserRouter>
-                <AppContent />
-            </BrowserRouter>
-        </AuthProvider>
+        <ThemeProvider>
+            <AuthProvider>
+                <UploadProvider>
+                    <DriveStatusProvider>
+                        <BrowserRouter>
+                            <AppContent />
+                            <UploadManager />
+                        </BrowserRouter>
+                    </DriveStatusProvider>
+                </UploadProvider>
+            </AuthProvider>
+        </ThemeProvider>
     )
 }
 

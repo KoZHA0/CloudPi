@@ -449,7 +449,7 @@ router.get('/me', (req, res) => {
 
         // Get fresh user data from database
         const user = db.prepare(
-            'SELECT id, username, email, is_admin, is_disabled, token_version, two_factor_enabled, created_at FROM users WHERE id = ?'
+            'SELECT id, username, email, is_admin, is_disabled, token_version, two_factor_enabled, avatar_url, created_at FROM users WHERE id = ?'
         ).get(decoded.userId);
 
         if (!user) {
@@ -926,6 +926,145 @@ router.post('/check-recovery', (req, res) => {
         console.error('Check recovery error:', error);
         res.status(500).json({ error: 'Server error' });
     }
+});
+
+// ============================================
+// AVATAR UPLOAD
+// ============================================
+
+/**
+ * Auth middleware for avatar routes.
+ * The rest of auth.js uses inline JWT checks, but avatar needs
+ * middleware because multer must have req.user populated before
+ * it generates the filename.
+ */
+function requireAuth(req, res, next) {
+    try {
+        const authHeader = req.headers.authorization;
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+            return res.status(401).json({ error: 'No token provided' });
+        }
+        const token = authHeader.split(' ')[1];
+        const decoded = jwt.verify(token, JWT_SECRET);
+
+        const user = db.prepare('SELECT token_version, is_disabled FROM users WHERE id = ?').get(decoded.userId);
+        if (!user) return res.status(401).json({ error: 'User not found' });
+        if (user.is_disabled) return res.status(403).json({ error: 'Account is disabled' });
+
+        const tokenVersion = decoded.tokenVersion || 0;
+        if (tokenVersion !== (user.token_version || 1)) {
+            return res.status(401).json({ error: 'Token expired or invalidated' });
+        }
+
+        req.user = decoded;
+        next();
+    } catch (error) {
+        if (error.name === 'JsonWebTokenError' || error.name === 'TokenExpiredError') {
+            return res.status(401).json({ error: 'Invalid token' });
+        }
+        console.error('Auth error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+}
+
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+
+const AVATAR_DIR = path.join(__dirname, '..', 'uploads', 'avatars');
+if (!fs.existsSync(AVATAR_DIR)) {
+    fs.mkdirSync(AVATAR_DIR, { recursive: true });
+}
+
+const avatarStorage = multer.diskStorage({
+    destination: (req, file, cb) => cb(null, AVATAR_DIR),
+    filename: (req, file, cb) => {
+        const ext = path.extname(file.originalname).toLowerCase();
+        cb(null, `avatar-${req.user.userId}-${Date.now()}${ext}`);
+    }
+});
+
+const avatarUpload = multer({
+    storage: avatarStorage,
+    limits: { fileSize: 2 * 1024 * 1024 }, // 2MB max
+    fileFilter: (req, file, cb) => {
+        const allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+        if (!allowed.includes(file.mimetype)) {
+            return cb(new Error('Only JPEG, PNG, GIF, and WebP images are allowed'));
+        }
+        cb(null, true);
+    }
+});
+
+/**
+ * POST /api/auth/avatar
+ * Upload a new profile picture
+ */
+router.post('/avatar', requireAuth, avatarUpload.single('avatar'), (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ error: 'No file uploaded' });
+        }
+
+        const userId = req.user.userId;
+
+        // Delete old avatar if it exists
+        const existing = db.prepare('SELECT avatar_url FROM users WHERE id = ?').get(userId);
+        if (existing && existing.avatar_url) {
+            const oldPath = path.join(AVATAR_DIR, existing.avatar_url);
+            if (fs.existsSync(oldPath)) {
+                try { fs.unlinkSync(oldPath); } catch (e) { /* ignore */ }
+            }
+        }
+
+        // Save new avatar filename in DB
+        db.prepare('UPDATE users SET avatar_url = ? WHERE id = ?').run(req.file.filename, userId);
+
+        res.json({
+            message: 'Avatar updated',
+            avatar_url: req.file.filename,
+        });
+    } catch (error) {
+        console.error('Avatar upload error:', error);
+        res.status(500).json({ error: 'Failed to upload avatar' });
+    }
+});
+
+/**
+ * DELETE /api/auth/avatar
+ * Remove profile picture
+ */
+router.delete('/avatar', requireAuth, (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const existing = db.prepare('SELECT avatar_url FROM users WHERE id = ?').get(userId);
+
+        if (existing && existing.avatar_url) {
+            const oldPath = path.join(AVATAR_DIR, existing.avatar_url);
+            if (fs.existsSync(oldPath)) {
+                try { fs.unlinkSync(oldPath); } catch (e) { /* ignore */ }
+            }
+        }
+
+        db.prepare('UPDATE users SET avatar_url = NULL WHERE id = ?').run(userId);
+        res.json({ message: 'Avatar removed' });
+    } catch (error) {
+        console.error('Avatar delete error:', error);
+        res.status(500).json({ error: 'Failed to remove avatar' });
+    }
+});
+
+/**
+ * GET /api/auth/avatar/:filename
+ * Serve avatar image (public within authenticated context)
+ */
+router.get('/avatar/:filename', (req, res) => {
+    const filePath = path.join(AVATAR_DIR, path.basename(req.params.filename));
+    if (!fs.existsSync(filePath)) {
+        return res.status(404).json({ error: 'Avatar not found' });
+    }
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.sendFile(filePath);
 });
 
 module.exports = router;

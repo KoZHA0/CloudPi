@@ -13,6 +13,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "
 import { Bell, Globe, Palette, HardDrive, Trash2, Server, Database, Loader2, Shield, Save, CheckCircle2, Plus, Usb, Mail, Send } from "lucide-react"
 import { getDashboardStats, getSystemHealth, getRateLimitSettings, updateSettings, testSmtpSettings, getStorageSources, addStorageSource, removeStorageSource, type DashboardStats, type RateLimitSettings, type SystemHealth, type StorageSource } from "@/lib/api"
 import { useAuth } from "@/contexts/auth-context"
+import { useTheme } from "@/contexts/theme-context"
 
 function getErrorMessage(error: unknown, fallback: string): string {
     return error instanceof Error ? error.message : fallback
@@ -37,6 +38,7 @@ function formatUptime(seconds: number): string {
 
 export function SettingsContent() {
     const { user } = useAuth()
+    const { theme, setTheme } = useTheme()
     const isAdmin = user?.is_admin === 1
 
     const [stats, setStats] = useState<DashboardStats | null>(null)
@@ -239,7 +241,7 @@ export function SettingsContent() {
                                     <Label className="text-base">Theme</Label>
                                     <p className="text-sm text-muted-foreground">Select your preferred theme</p>
                                 </div>
-                                <Select defaultValue="dark">
+                                <Select value={theme} onValueChange={(value) => setTheme(value as "light" | "dark" | "system")}>
                                     <SelectTrigger className="w-32">
                                         <SelectValue />
                                     </SelectTrigger>

@@ -32,7 +32,7 @@ import {
 import { Button } from "@/components/ui/button"
 import { Progress } from "@/components/ui/progress"
 import { useAuth } from "@/contexts/auth-context"
-import { getStorageStats } from "@/lib/api"
+import { getStorageStats, getAvatarUrl } from "@/lib/api"
 
 function formatBytes(bytes: number, decimals = 1) {
     if (bytes === 0) return '0 Bytes';
@@ -291,7 +291,7 @@ export function Sidebar() {
                             <DropdownMenuTrigger asChild>
                                 <Button variant="ghost" className="w-full justify-start gap-3 px-2 hover:bg-sidebar-accent">
                                     <Avatar className="h-8 w-8">
-                                        <AvatarImage src="/diverse-user-avatars.png" />
+                                        <AvatarImage src={user?.avatar_url ? getAvatarUrl(user.avatar_url) : undefined} />
                                         <AvatarFallback className="bg-primary text-primary-foreground">
                                             {user?.username?.charAt(0).toUpperCase() || 'U'}
                                         </AvatarFallback>

@@ -786,19 +786,92 @@ function sleep(ms) {
 }
 
 // ============================================================
+// AVERAGING HELPERS
+// ============================================================
+
+/**
+ * Average an array of performance result sets (from multiple runs).
+ * Each run produces an array of result objects with the same length/order.
+ * Numeric fields are averaged; hash verification is 'Pass' only if ALL runs passed.
+ */
+function averagePerformanceResults(allRuns) {
+    const rowCount = allRuns[0].length;
+    const runCount = allRuns.length;
+    const averaged = [];
+
+    for (let i = 0; i < rowCount; i++) {
+        const rows = allRuns.map(run => run[i]);
+
+        averaged.push({
+            fileSize:         rows[0].fileSize,
+            compression:      rows[0].compression,
+            uploadTime:       (rows.reduce((s, r) => s + parseFloat(r.uploadTime), 0) / runCount).toFixed(3),
+            downloadTime:     (rows.reduce((s, r) => s + parseFloat(r.downloadTime), 0) / runCount).toFixed(3),
+            throughput:        (rows.reduce((s, r) => s + parseFloat(r.throughput), 0) / runCount).toFixed(2),
+            cpuUsage:          Math.round(rows.reduce((s, r) => s + r.cpuUsage, 0) / runCount),
+            memoryUsage:       Math.round(rows.reduce((s, r) => s + r.memoryUsage, 0) / runCount),
+            hashVerification:  rows.every(r => r.hashVerification === 'Pass') ? 'Pass' : 'FAIL',
+        });
+    }
+
+    return averaged;
+}
+
+/**
+ * Average an array of concurrent result sets (from multiple runs).
+ */
+function averageConcurrentResults(allRuns) {
+    const rowCount = allRuns[0].length;
+    const runCount = allRuns.length;
+    const averaged = [];
+
+    for (let i = 0; i < rowCount; i++) {
+        const rows = allRuns.map(run => run[i]);
+
+        // Parse success rates like "5/5" → compute average numerator
+        const avgSuccess = rows.reduce((s, r) => {
+            const [ok] = r.successRate.split('/').map(Number);
+            return s + ok;
+        }, 0) / runCount;
+        const totalUsers = rows[0].users;
+
+        averaged.push({
+            users:             rows[0].users,
+            operation:         rows[0].operation,
+            situation:         rows[0].situation,
+            totalTimeSec:      (rows.reduce((s, r) => s + parseFloat(r.totalTimeSec), 0) / runCount).toFixed(2),
+            avgUploadSec:      (rows.reduce((s, r) => s + parseFloat(r.avgUploadSec), 0) / runCount).toFixed(3),
+            avgDownloadSec:    (rows.reduce((s, r) => s + parseFloat(r.avgDownloadSec), 0) / runCount).toFixed(3),
+            successRate:       `${Math.round(avgSuccess)}/${totalUsers}`,
+            cpuUsage:          Math.round(rows.reduce((s, r) => s + r.cpuUsage, 0) / runCount),
+            memoryUsage:       Math.round(rows.reduce((s, r) => s + r.memoryUsage, 0) / runCount),
+            hashVerification:  rows.every(r => r.hashVerification === 'Pass') ? 'Pass' : 'FAIL',
+            failedCount:       Math.round(rows.reduce((s, r) => s + r.failedCount, 0) / runCount),
+        });
+    }
+
+    return averaged;
+}
+
+// ============================================================
 // MAIN ENTRY POINT
 // ============================================================
+
+const NUM_RUNS = 3; // Number of test iterations to average
 
 async function main() {
     console.log('');
     console.log('╔══════════════════════════════════════════════════════════════╗');
     console.log('║        CloudPi Performance Evaluation Test Script           ║');
+    console.log('║                                                              ║');
+    console.log(`║        Running ${NUM_RUNS} iterations — results will be averaged        ║`);
     console.log('╚══════════════════════════════════════════════════════════════╝');
     console.log('');
     console.log(`  Target:  http://${CONFIG.host}:${CONFIG.port}`);
     console.log(`  User:    ${CONFIG.username}`);
     console.log(`  Device:  ${os.hostname()} (${os.arch()}, ${Math.round(os.totalmem() / (1024 * 1024))}MB RAM)`);
     console.log(`  Node:    ${process.version}`);
+    console.log(`  Runs:    ${NUM_RUNS} (averaged)`);
 
     // Create temp directory
     if (!fs.existsSync(TEMP_DIR)) {
@@ -811,23 +884,48 @@ async function main() {
         const token = await login();
         console.log(' ✅ Authenticated');
 
-        // Step 2: Run performance tests
-        const perfResults = await runPerformanceTests(token);
+        // Step 2: Run tests NUM_RUNS times and collect results
+        const allPerfResults = [];
+        const allConcurrentResults = [];
 
-        // Step 3: Run concurrent user tests
-        const concurrentResults = await runConcurrentTests(token);
+        for (let run = 1; run <= NUM_RUNS; run++) {
+            console.log(`\n${'━'.repeat(80)}`);
+            console.log(`  RUN ${run} OF ${NUM_RUNS}`);
+            console.log(`${'━'.repeat(80)}`);
 
-        // Step 4: Print formatted results
-        printPerformanceTable(perfResults);
-        printSummaryTable(perfResults);
-        printConcurrentTable(concurrentResults);
+            // Performance tests
+            const perfResults = await runPerformanceTests(token);
+            allPerfResults.push(perfResults);
 
-        // Step 5: Save to files
+            // Concurrent user tests
+            const concurrentResults = await runConcurrentTests(token);
+            allConcurrentResults.push(concurrentResults);
+
+            if (run < NUM_RUNS) {
+                console.log(`\n⏸️  Cooldown before next run...`);
+                await sleep(3000); // 3s cooldown between runs
+            }
+        }
+
+        // Step 3: Compute averaged results
+        console.log(`\n\n${'═'.repeat(80)}`);
+        console.log(`  AVERAGED RESULTS (across ${NUM_RUNS} runs)`);
+        console.log(`${'═'.repeat(80)}`);
+
+        const avgPerfResults = averagePerformanceResults(allPerfResults);
+        const avgConcurrentResults = averageConcurrentResults(allConcurrentResults);
+
+        // Step 4: Print formatted averaged results
+        printPerformanceTable(avgPerfResults);
+        printSummaryTable(avgPerfResults);
+        printConcurrentTable(avgConcurrentResults);
+
+        // Step 5: Save averaged results to files
         console.log('\n');
-        saveMarkdown(perfResults, concurrentResults);
-        saveCsv(perfResults, concurrentResults);
+        saveMarkdown(avgPerfResults, avgConcurrentResults);
+        saveCsv(avgPerfResults, avgConcurrentResults);
 
-        console.log('\n✅ All tests completed successfully!\n');
+        console.log(`\n✅ All ${NUM_RUNS} runs completed. Results above are averaged.\n`);
 
     } catch (error) {
         console.error('\n\n❌ Test failed:', error.message);

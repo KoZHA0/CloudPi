@@ -117,7 +117,7 @@ function createDynamicLimiter({ maxKey, maxDefault, windowKey, windowDefault, er
 // Global API limiter (default: 100 per 15 min)
 const globalLimiter = createDynamicLimiter({
   maxKey: 'rate_limit_api_max',
-  maxDefault: 100,
+  maxDefault: 1000,
   windowKey: 'rate_limit_api_window',
   windowDefault: 15,
   errorPrefix: 'Too many requests.',
@@ -184,9 +184,15 @@ app.use('/api/dashboard', dashboardRoutes);
 const webdavRoutes = require('./routes/webdav');
 app.use('/', webdavRoutes);
 
+// Events routes (SSE stream + udev drive-change webhook)
+// - GET  /api/events             — SSE stream for real-time drive status updates
+// - POST /api/events/drive-change — Webhook called by udev on USB plug/unplug
+const eventsRoutes = require('./routes/events');
+app.use('/api/events', eventsRoutes);
+
 // Start server
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log('');
   console.log('🚀 CloudPi Backend Server Started!');
   console.log(`   URL:    http://localhost:${PORT}`);
@@ -197,4 +203,14 @@ app.listen(PORT, () => {
     .then(s => console.log(`   LUKS:   ${s.status.toUpperCase()} (${s.device})`))
     .catch(() => console.log('   LUKS:   status unavailable (running on non-Linux host?)'))
     .finally(() => console.log(''));
+});
+
+// Keep the process alive and handle errors
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`❌ Port ${PORT} is already in use. Kill the other process or change PORT in .env`);
+  } else {
+    console.error('❌ Server error:', err);
+  }
+  process.exit(1);
 });

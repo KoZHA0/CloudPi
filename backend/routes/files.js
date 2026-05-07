@@ -10,10 +10,12 @@
  * GET    /api/files/search       - Global file/folder search
  * POST   /api/files/folder       - Create new folder
  * POST   /api/files/upload       - Upload file(s)
+ * GET    /api/files/:id/thumbnail - Get rich media thumbnail
  * GET    /api/files/:id/download - Download file or folder (ZIP)
  * PUT    /api/files/:id          - Rename file/folder
  * PUT    /api/files/:id/star     - Toggle star status
  * PUT    /api/files/:id/move     - Move to different folder
+ * POST   /api/files/:id/copy     - Copy file/folder to different location
  * PUT    /api/files/:id/restore  - Restore from trash
  * DELETE /api/files/:id          - Move to trash
  * DELETE /api/files/:id/permanent - Permanently delete
@@ -29,6 +31,7 @@ const { v4: uuidv4 } = require('uuid');
 const rateLimit = require('express-rate-limit'); // kept for reference but upload uses custom limiter
 const fastq = require('fastq');
 const archiver = require('archiver');
+const { spawn } = require('child_process');
 const { computeFileHash, verifyFileHash } = require('../utils/crypto-utils');
 const { JWT_SECRET } = require('../utils/auth-config');
 
@@ -36,10 +39,29 @@ const router = express.Router();
 
 // Default storage directory for internal storage (backward compatible)
 const DEFAULT_STORAGE_DIR = path.join(__dirname, '..', 'storage');
+const THUMBNAILS_DIR = path.join(DEFAULT_STORAGE_DIR, '.thumbnails');
+
+let sharp = null;
+try {
+    sharp = require('sharp');
+} catch (e) {
+    console.warn('sharp is not installed - image thumbnails will use fallback previews');
+}
+
+let ffmpegPath = null;
+try {
+    ffmpegPath = require('ffmpeg-static');
+} catch (e) {
+    console.warn('ffmpeg-static is not installed - video thumbnails are unavailable');
+}
 
 // Ensure internal storage directory exists
 if (!fs.existsSync(DEFAULT_STORAGE_DIR)) {
     fs.mkdirSync(DEFAULT_STORAGE_DIR, { recursive: true });
+}
+
+if (!fs.existsSync(THUMBNAILS_DIR)) {
+    fs.mkdirSync(THUMBNAILS_DIR, { recursive: true });
 }
 
 /**
@@ -80,9 +102,9 @@ function getUserStorageId(userId) {
     const storageId = (user && user.default_storage_id) || 'internal';
 
     if (storageId !== 'internal') {
-        const source = db.prepare('SELECT path, is_active, label FROM storage_sources WHERE id = ?').get(storageId);
-        if (!source || !source.is_active) {
-            console.warn(`⚠️ [STORAGE] User ${userId} assigned to storage "${storageId}" which is inactive or missing. Falling back to internal.`);
+        const source = db.prepare('SELECT path, is_active, is_accessible, label FROM storage_sources WHERE id = ?').get(storageId);
+        if (!source || !source.is_active || !source.is_accessible) {
+            console.warn(`⚠️ [STORAGE] User ${userId} assigned to storage "${storageId}" which is inactive or inaccessible. Falling back to internal.`);
             return 'internal';
         }
         try {
@@ -312,6 +334,96 @@ function getFileType(mimeType) {
     return 'document';
 }
 
+function normalizeParentId(parentId) {
+    if (parentId === null || parentId === undefined || parentId === '') return null;
+    const parsed = Number(parentId);
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function splitFileName(name) {
+    const ext = path.extname(name);
+    if (!ext) return { base: name, ext: '' };
+    return {
+        base: name.slice(0, -ext.length),
+        ext,
+    };
+}
+
+function hasNameConflict(userId, parentId, name, excludeId = null) {
+    const baseParams = [userId, name];
+    let query = 'SELECT id FROM files WHERE user_id = ? AND name = ? AND trashed = 0';
+
+    if (excludeId) {
+        query += ' AND id != ?';
+        baseParams.push(excludeId);
+    }
+
+    if (parentId) {
+        query += ' AND parent_id = ?';
+        baseParams.push(parentId);
+    } else {
+        query += ' AND parent_id IS NULL';
+    }
+
+    return !!db.prepare(query).get(...baseParams);
+}
+
+function getUniqueSiblingName(userId, parentId, originalName, excludeId = null) {
+    if (!hasNameConflict(userId, parentId, originalName, excludeId)) {
+        return originalName;
+    }
+
+    const { base, ext } = splitFileName(originalName);
+    let counter = 1;
+    while (counter < 1000) {
+        const candidate = `${base} (${counter})${ext}`;
+        if (!hasNameConflict(userId, parentId, candidate, excludeId)) {
+            return candidate;
+        }
+        counter += 1;
+    }
+
+    return `${base} (${Date.now()})${ext}`;
+}
+
+function isFolderDescendant(userId, ancestorId, targetFolderId) {
+    let currentId = targetFolderId;
+    while (currentId) {
+        if (Number(currentId) === Number(ancestorId)) {
+            return true;
+        }
+        const parent = db.prepare(
+            'SELECT parent_id FROM files WHERE id = ? AND user_id = ? AND type = \'folder\''
+        ).get(currentId, userId);
+        currentId = parent?.parent_id || null;
+    }
+    return false;
+}
+
+function runFfmpeg(args) {
+    return new Promise((resolve, reject) => {
+        const child = spawn(ffmpegPath, args, { windowsHide: true });
+        let stderr = '';
+
+        child.stderr.on('data', (chunk) => {
+            stderr += String(chunk || '');
+        });
+        child.on('error', reject);
+        child.on('close', (code) => {
+            if (code === 0) return resolve();
+            reject(new Error(stderr || `ffmpeg exited with code ${code}`));
+        });
+    });
+}
+
+function ensureThumbnailDirForUser(userId) {
+    const dir = path.join(THUMBNAILS_DIR, String(userId));
+    if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+    }
+    return dir;
+}
+
 // ============================================
 // STATIC ROUTES FIRST (before :id routes)
 // ============================================
@@ -327,22 +439,25 @@ router.get('/', requireAuth, (req, res) => {
         const starredOnly = req.query.starred === 'true';
 
         let query = `
-            SELECT id, name, type, size, mime_type, parent_id, starred, created_at, modified_at
-            FROM files 
-            WHERE user_id = ? AND trashed = 0
+            SELECT f.id, f.name, f.type, f.size, f.mime_type, f.parent_id, f.starred,
+                   f.created_at, f.modified_at, f.storage_source_id,
+                   COALESCE(ss.is_accessible, 1) as is_accessible
+            FROM files f
+            LEFT JOIN storage_sources ss ON f.storage_source_id = ss.id
+            WHERE f.user_id = ? AND f.trashed = 0
         `;
         const params = [userId];
 
         if (starredOnly) {
-            query += ' AND starred = 1';
+            query += ' AND f.starred = 1';
         } else if (parentId) {
-            query += ' AND parent_id = ?';
+            query += ' AND f.parent_id = ?';
             params.push(parentId);
         } else {
-            query += ' AND parent_id IS NULL';
+            query += ' AND f.parent_id IS NULL';
         }
 
-        query += " ORDER BY CASE WHEN type = 'folder' THEN 0 ELSE 1 END, name ASC";
+        query += " ORDER BY CASE WHEN f.type = 'folder' THEN 0 ELSE 1 END, f.name ASC";
 
         const files = db.prepare(query).all(...params);
 
@@ -364,16 +479,13 @@ router.get('/', requireAuth, (req, res) => {
         }
 
         // Check if user's assigned storage is disconnected and add a warning
+        // Uses the is_accessible column (updated by udev events) instead of polling fs.existsSync
         const userRow = db.prepare('SELECT default_storage_id FROM users WHERE id = ?').get(userId);
         let storageWarning = null;
         if (userRow && userRow.default_storage_id && userRow.default_storage_id !== 'internal') {
-            const source = db.prepare('SELECT path, label, is_active FROM storage_sources WHERE id = ?').get(userRow.default_storage_id);
-            if (source) {
-                let accessible = false;
-                try { accessible = fs.existsSync(source.path); } catch (e) { /* ignore */ }
-                if (!accessible || !source.is_active) {
-                    storageWarning = `Your assigned storage drive "${source.label}" is not currently attached. New files will be saved to internal storage until the drive is reconnected.`;
-                }
+            const source = db.prepare('SELECT label, is_active, is_accessible FROM storage_sources WHERE id = ?').get(userRow.default_storage_id);
+            if (source && (!source.is_active || !source.is_accessible)) {
+                storageWarning = `Your assigned storage drive "${source.label}" is not currently attached. New files will be saved to internal storage until the drive is reconnected.`;
             }
         }
 
@@ -418,10 +530,12 @@ router.get('/recent', requireAuth, (req, res) => {
         const userId = req.user.userId;
 
         const files = db.prepare(`
-            SELECT id, name, type, size, mime_type, parent_id, starred, modified_at
-            FROM files 
-            WHERE user_id = ? AND trashed = 0 AND type != 'folder'
-            ORDER BY modified_at DESC
+            SELECT f.id, f.name, f.type, f.size, f.mime_type, f.parent_id, f.starred, f.modified_at,
+                   COALESCE(ss.is_accessible, 1) as is_accessible
+            FROM files f
+            LEFT JOIN storage_sources ss ON f.storage_source_id = ss.id
+            WHERE f.user_id = ? AND f.trashed = 0 AND f.type != 'folder'
+            ORDER BY f.modified_at DESC
             LIMIT 20
         `).all(userId);
 
@@ -449,12 +563,15 @@ router.get('/search', requireAuth, (req, res) => {
         const searchTerm = `%${String(query).trim()}%`;
 
         const files = db.prepare(`
-            SELECT id, name, type, size, mime_type, parent_id, starred, created_at, modified_at
-            FROM files
-            WHERE user_id = ? AND trashed = 0 AND name LIKE ?
+            SELECT f.id, f.name, f.type, f.size, f.mime_type, f.parent_id, f.starred,
+                   f.created_at, f.modified_at,
+                   COALESCE(ss.is_accessible, 1) as is_accessible
+            FROM files f
+            LEFT JOIN storage_sources ss ON f.storage_source_id = ss.id
+            WHERE f.user_id = ? AND f.trashed = 0 AND f.name LIKE ?
             ORDER BY 
-                CASE WHEN type = 'folder' THEN 0 ELSE 1 END,
-                modified_at DESC
+                CASE WHEN f.type = 'folder' THEN 0 ELSE 1 END,
+                f.modified_at DESC
             LIMIT 50
         `).all(userId, searchTerm);
 
@@ -656,6 +773,139 @@ router.post('/upload', uploadLimiter, requireAuth, upload.array('files', 10), as
 // ============================================
 
 /**
+ * GET /api/files/:id/thumbnail
+ * Returns thumbnail for image/video files.
+ * - Images: generated via sharp when available, otherwise falls back to original preview.
+ * - Videos: generated via ffmpeg (first frame around 1s) and cached on disk.
+ */
+router.get('/:id/thumbnail', async (req, res) => {
+    try {
+        // Accept token from query string OR Authorization header
+        let token = req.query.token ? String(req.query.token) : null;
+        if (!token) {
+            const authHeader = req.headers.authorization;
+            if (authHeader && authHeader.startsWith('Bearer ')) {
+                token = authHeader.split(' ')[1];
+            }
+        }
+
+        if (!token) {
+            return res.status(401).json({ error: 'No token provided' });
+        }
+
+        const decoded = jwt.verify(token, JWT_SECRET);
+        const userId = decoded.userId;
+        const fileId = req.params.id;
+        const size = Math.min(512, Math.max(64, Number(req.query.size) || 256));
+
+        // Validate token_version
+        const dbUser = db.prepare('SELECT token_version, is_disabled FROM users WHERE id = ?').get(userId);
+        if (!dbUser) return res.status(401).json({ error: 'User not found' });
+        if (dbUser.is_disabled) return res.status(403).json({ error: 'Account is disabled' });
+        if (decoded.tokenVersion !== undefined) {
+            if (decoded.tokenVersion !== (dbUser.token_version || 1)) {
+                return res.status(401).json({ error: 'Token invalidated' });
+            }
+        }
+
+        const file = db.prepare(
+            "SELECT * FROM files WHERE id = ? AND user_id = ? AND type != 'folder'"
+        ).get(fileId, userId);
+
+        if (!file) return res.status(404).json({ error: 'File not found' });
+
+        const filePath = resolveFilePath(file);
+        if (!fs.existsSync(filePath)) {
+            return res.status(404).json({ error: 'File not found on disk' });
+        }
+
+        const thumbDir = ensureThumbnailDirForUser(userId);
+        const sourceStat = fs.statSync(filePath);
+
+        if (file.type === 'image') {
+            // Fallback to original preview if sharp is unavailable
+            if (!sharp) {
+                res.set('Cache-Control', 'public, max-age=86400');
+                res.set('X-Thumbnail-Fallback', 'original');
+                res.set('Content-Type', file.mime_type || 'application/octet-stream');
+                return res.sendFile(filePath);
+            }
+
+            const thumbPath = path.join(thumbDir, `${file.id}-${size}.webp`);
+            const shouldGenerate = !fs.existsSync(thumbPath) || fs.statSync(thumbPath).mtimeMs < sourceStat.mtimeMs;
+            if (shouldGenerate) {
+                await sharp(filePath)
+                    .rotate()
+                    .resize(size, size, { fit: 'cover', withoutEnlargement: true })
+                    .webp({ quality: 82 })
+                    .toFile(thumbPath);
+            }
+
+            res.set('Cache-Control', 'public, max-age=86400');
+            res.set('Content-Type', 'image/webp');
+            return res.sendFile(thumbPath);
+        }
+
+        if (file.type === 'video') {
+            if (!ffmpegPath) {
+                return res.status(503).json({
+                    error: 'Video thumbnails are unavailable (ffmpeg not installed)'
+                });
+            }
+
+            const thumbPath = path.join(thumbDir, `${file.id}-${size}.jpg`);
+            const shouldGenerate = !fs.existsSync(thumbPath) || fs.statSync(thumbPath).mtimeMs < sourceStat.mtimeMs;
+            if (shouldGenerate) {
+                try {
+                    await runFfmpeg([
+                        '-y',
+                        '-ss',
+                        '00:00:01',
+                        '-i',
+                        filePath,
+                        '-frames:v',
+                        '1',
+                        '-vf',
+                        `scale=${size}:${size}:force_original_aspect_ratio=decrease`,
+                        '-q:v',
+                        '4',
+                        thumbPath
+                    ]);
+                } catch {
+                    // Very short clips may not have a frame at 1 second; retry from the start.
+                    await runFfmpeg([
+                        '-y',
+                        '-ss',
+                        '00:00:00',
+                        '-i',
+                        filePath,
+                        '-frames:v',
+                        '1',
+                        '-vf',
+                        `scale=${size}:${size}:force_original_aspect_ratio=decrease`,
+                        '-q:v',
+                        '4',
+                        thumbPath
+                    ]);
+                }
+            }
+
+            res.set('Cache-Control', 'public, max-age=86400');
+            res.set('Content-Type', 'image/jpeg');
+            return res.sendFile(thumbPath);
+        }
+
+        return res.status(400).json({ error: 'Thumbnails are only available for images and videos' });
+    } catch (error) {
+        if (error.name === 'JsonWebTokenError' || error.name === 'TokenExpiredError') {
+            return res.status(401).json({ error: 'Invalid token' });
+        }
+        console.error('Thumbnail error:', error);
+        return res.status(500).json({ error: 'Server error during thumbnail generation' });
+    }
+});
+
+/**
  * GET /api/files/:id/preview
  * Serve a file for inline preview (images, PDFs, videos, audio, text)
  * Accepts token via query string (needed for <img>, <video>, <audio>, <iframe> tags)
@@ -696,6 +946,18 @@ router.get('/:id/preview', async (req, res) => {
 
         if (!file) {
             return res.status(404).json({ error: 'File not found' });
+        }
+
+        // Check if the file's storage source is accessible (drive connected)
+        if (file.storage_source_id && file.storage_source_id !== 'internal') {
+            const source = db.prepare('SELECT is_accessible, label FROM storage_sources WHERE id = ?')
+                .get(file.storage_source_id);
+            if (source && !source.is_accessible) {
+                return res.status(503).json({
+                    error: `Storage drive "${source.label}" is disconnected. This file is temporarily unavailable.`,
+                    drive_disconnected: true
+                });
+            }
         }
 
         const filePath = resolveFilePath(file);
@@ -742,6 +1004,18 @@ router.get('/:id/download', requireAuth, async (req, res) => {
 
         if (!file) {
             return res.status(404).json({ error: 'File not found' });
+        }
+
+        // Check if the file's storage source is accessible (drive connected)
+        if (file.storage_source_id && file.storage_source_id !== 'internal') {
+            const source = db.prepare('SELECT is_accessible, label FROM storage_sources WHERE id = ?')
+                .get(file.storage_source_id);
+            if (source && !source.is_accessible) {
+                return res.status(503).json({
+                    error: `Storage drive "${source.label}" is disconnected. This file is temporarily unavailable.`,
+                    drive_disconnected: true
+                });
+            }
         }
 
         // --- Regular file download ---
@@ -919,45 +1193,159 @@ router.put('/:id/move', requireAuth, (req, res) => {
     try {
         const userId = req.user.userId;
         const fileId = req.params.id;
-        const { parent_id } = req.body; // null for root
+        const destinationParentId = normalizeParentId(req.body.parent_id); // null for root
 
         const file = db.prepare(
-            'SELECT * FROM files WHERE id = ? AND user_id = ?'
-        ).get(fileId, userId);
+            'SELECT * FROM files WHERE id = ? AND user_id = ? AND trashed = 0'
+        ).get(Number(fileId), userId);
 
         if (!file) {
             return res.status(404).json({ error: 'File not found' });
         }
 
+        if (destinationParentId && Number(destinationParentId) === Number(file.id)) {
+            return res.status(400).json({ error: 'Cannot move an item into itself' });
+        }
+
+        if (destinationParentId !== null && destinationParentId === file.parent_id) {
+            return res.json({ message: 'Item is already in this folder' });
+        }
+
         // Validate destination folder
-        if (parent_id) {
+        if (destinationParentId) {
             const destFolder = db.prepare(
-                "SELECT id FROM files WHERE id = ? AND user_id = ? AND type = 'folder'"
-            ).get(parent_id, userId);
+                "SELECT id FROM files WHERE id = ? AND user_id = ? AND type = 'folder' AND trashed = 0"
+            ).get(destinationParentId, userId);
             if (!destFolder) {
                 return res.status(400).json({ error: 'Destination folder not found' });
             }
 
             // Prevent moving folder into itself or its children
-            if (file.type === 'folder') {
-                let checkId = parent_id;
-                while (checkId) {
-                    if (checkId === parseInt(fileId)) {
-                        return res.status(400).json({ error: 'Cannot move folder into itself' });
-                    }
-                    const parent = db.prepare('SELECT parent_id FROM files WHERE id = ?').get(checkId);
-                    checkId = parent?.parent_id;
-                }
+            if (file.type === 'folder' && isFolderDescendant(userId, file.id, destinationParentId)) {
+                return res.status(400).json({ error: 'Cannot move a folder into itself or one of its subfolders' });
             }
         }
 
-        db.prepare('UPDATE files SET parent_id = ?, modified_at = CURRENT_TIMESTAMP WHERE id = ?')
-            .run(parent_id || null, fileId);
+        const finalName = getUniqueSiblingName(userId, destinationParentId, file.name, file.id);
 
-        res.json({ message: 'Moved successfully' });
+        db.prepare('UPDATE files SET parent_id = ?, modified_at = CURRENT_TIMESTAMP WHERE id = ?')
+            .run(destinationParentId, file.id);
+
+        if (finalName !== file.name) {
+            db.prepare('UPDATE files SET name = ?, modified_at = CURRENT_TIMESTAMP WHERE id = ?')
+                .run(finalName, file.id);
+        }
+
+        res.json({
+            message: finalName === file.name
+                ? 'Moved successfully'
+                : `Moved and renamed to "${finalName}" to avoid a name conflict`
+        });
     } catch (error) {
         console.error('Move error:', error);
         res.status(500).json({ error: 'Server error' });
+    }
+});
+
+/**
+ * POST /api/files/:id/copy
+ * Copy file/folder to a destination folder (or root when parent_id is null)
+ */
+router.post('/:id/copy', requireAuth, (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const sourceId = Number(req.params.id);
+        const destinationParentId = normalizeParentId(req.body.parent_id);
+
+        const source = db.prepare(
+            'SELECT * FROM files WHERE id = ? AND user_id = ? AND trashed = 0'
+        ).get(sourceId, userId);
+
+        if (!source) {
+            return res.status(404).json({ error: 'Source file not found' });
+        }
+
+        if (destinationParentId && Number(destinationParentId) === Number(source.id)) {
+            return res.status(400).json({ error: 'Cannot copy an item into itself' });
+        }
+
+        if (destinationParentId) {
+            const destFolder = db.prepare(
+                "SELECT id FROM files WHERE id = ? AND user_id = ? AND type = 'folder' AND trashed = 0"
+            ).get(destinationParentId, userId);
+            if (!destFolder) {
+                return res.status(400).json({ error: 'Destination folder not found' });
+            }
+
+            if (source.type === 'folder' && isFolderDescendant(userId, source.id, destinationParentId)) {
+                return res.status(400).json({ error: 'Cannot copy a folder into itself or one of its subfolders' });
+            }
+        }
+
+        const copyRecursive = (item, targetParentId) => {
+            const safeName = getUniqueSiblingName(userId, targetParentId, item.name);
+
+            if (item.type === 'folder') {
+                const insertedFolder = db.prepare(`
+                    INSERT INTO files (user_id, name, path, type, size, mime_type, parent_id, storage_source_id)
+                    VALUES (?, ?, '', 'folder', 0, NULL, ?, ?)
+                `).run(userId, safeName, targetParentId, item.storage_source_id || 'internal');
+                const newFolderId = insertedFolder.lastInsertRowid;
+
+                const children = db.prepare(
+                    'SELECT * FROM files WHERE user_id = ? AND parent_id = ? AND trashed = 0 ORDER BY id ASC'
+                ).all(userId, item.id);
+                for (const child of children) {
+                    copyRecursive(child, newFolderId);
+                }
+
+                return db.prepare('SELECT * FROM files WHERE id = ?').get(newFolderId);
+            }
+
+            const sourcePath = resolveFilePath(item);
+            if (!fs.existsSync(sourcePath)) {
+                throw new Error(`Source file is missing on disk: ${item.name}`);
+            }
+
+            const ext = path.extname(item.path || item.name || '');
+            const newDiskName = `${uuidv4()}${ext}`;
+            const storageId = item.storage_source_id || 'internal';
+            const destinationBase = getStorageBasePath(storageId, userId);
+            if (!fs.existsSync(destinationBase)) {
+                fs.mkdirSync(destinationBase, { recursive: true });
+            }
+            const destinationPath = path.join(destinationBase, newDiskName);
+            fs.copyFileSync(sourcePath, destinationPath);
+
+            const insertedFile = db.prepare(`
+                INSERT INTO files (user_id, name, path, type, size, mime_type, parent_id, storage_source_id, sha256_hash, encrypted, key_wrapped)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `).run(
+                userId,
+                safeName,
+                newDiskName,
+                item.type,
+                item.size || 0,
+                item.mime_type,
+                targetParentId,
+                storageId,
+                item.sha256_hash || null,
+                item.encrypted || 0,
+                item.key_wrapped || 0
+            );
+
+            return db.prepare('SELECT * FROM files WHERE id = ?').get(insertedFile.lastInsertRowid);
+        };
+
+        const copiedItem = copyRecursive(source, destinationParentId);
+
+        res.status(201).json({
+            message: source.type === 'folder' ? 'Folder copied successfully' : 'File copied successfully',
+            file: copiedItem
+        });
+    } catch (error) {
+        console.error('Copy error:', error);
+        res.status(500).json({ error: error.message || 'Server error' });
     }
 });
 

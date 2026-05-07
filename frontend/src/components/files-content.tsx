@@ -5,6 +5,13 @@ import { Card, CardContent, CardHeader } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import {
+    ContextMenu,
+    ContextMenuContent,
+    ContextMenuItem,
+    ContextMenuSeparator,
+    ContextMenuTrigger,
+} from "@/components/ui/context-menu"
+import {
     Dialog,
     DialogContent,
     DialogHeader,
@@ -30,7 +37,6 @@ import {
 } from "@/components/ui/alert-dialog"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Label } from "@/components/ui/label"
-import { Progress } from "@/components/ui/progress"
 import {
     Folder,
     FileText,
@@ -42,9 +48,11 @@ import {
     Grid3X3,
     List,
     SortAsc,
+    SortDesc,
     Upload,
     FolderPlus,
     Download,
+    Filter,
     Trash2,
     Star,
     Search,
@@ -62,23 +70,33 @@ import {
     X,
     FileIcon,
     Maximize2,
+    Info,
+    Calendar,
+    Clock,
+    Scissors,
+    Copy,
+    ArrowLeft,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import {
     getFiles,
     createFolder,
-    uploadFiles,
     downloadFile,
     renameFile,
     toggleStar,
+    moveFile,
+    copyFile,
     deleteFile,
     getPreviewUrl,
+    getThumbnailUrl,
     createShareLink,
     getShareUsers,
     type FileItem,
     type Breadcrumb,
     type ShareUser,
 } from "@/lib/api"
+import { useUpload } from "@/contexts/upload-context"
+import { useDriveStatus } from "@/contexts/drive-status-context"
 
 const getFileIcon = (type: FileItem["type"]) => {
     const icons = {
@@ -125,6 +143,8 @@ function formatDate(dateString: string): string {
 }
 
 export function FilesContent() {
+    const { addUpload } = useUpload()
+    const { isFileAccessible, disconnectedDrives, notification } = useDriveStatus()
     const [view, setView] = useState<"grid" | "list">("grid")
     const [files, setFiles] = useState<FileItem[]>([])
     const [breadcrumbs, setBreadcrumbs] = useState<Breadcrumb[]>([])
@@ -136,13 +156,30 @@ export function FilesContent() {
     const [error, setError] = useState<string | null>(null)
     const [storageWarning, setStorageWarning] = useState<string | null>(null)
 
+    // Sorting & filtering
+    const [sortKey, setSortKey] = useState<"name" | "modified" | "size" | "type">("name")
+    const [sortDirection, setSortDirection] = useState<"asc" | "desc">("asc")
+    const [filterType, setFilterType] = useState<string | null>(null)
+
+    // File details sidebar
+    const [detailFile, setDetailFile] = useState<FileItem | null>(null)
+    const [brokenThumbnails, setBrokenThumbnails] = useState<Record<number, boolean>>({})
+
     // Dialogs
     const [showNewFolderDialog, setShowNewFolderDialog] = useState(false)
     const [showRenameDialog, setShowRenameDialog] = useState(false)
     const [showDeleteDialog, setShowDeleteDialog] = useState(false)
+    const [showLocationDialog, setShowLocationDialog] = useState(false)
     const [newFolderName, setNewFolderName] = useState("")
     const [renameValue, setRenameValue] = useState("")
     const [selectedItem, setSelectedItem] = useState<FileItem | null>(null)
+    const [locationMode, setLocationMode] = useState<"move" | "copy">("move")
+    const [locationTarget, setLocationTarget] = useState<FileItem | null>(null)
+    const [destinationFolderId, setDestinationFolderId] = useState<number | null>(null)
+    const [destinationFolders, setDestinationFolders] = useState<FileItem[]>([])
+    const [destinationBreadcrumbs, setDestinationBreadcrumbs] = useState<Breadcrumb[]>([])
+    const [destinationLoading, setDestinationLoading] = useState(false)
+    const [isApplyingLocation, setIsApplyingLocation] = useState(false)
 
     // File preview
     const [previewFile, setPreviewFile] = useState<FileItem | null>(null)
@@ -150,8 +187,6 @@ export function FilesContent() {
     const [pdfBlobUrl, setPdfBlobUrl] = useState<string | null>(null)
 
     // Upload
-    const [isUploading, setIsUploading] = useState(false)
-    const [uploadProgress, setUploadProgress] = useState(0)
     const fileInputRef = useRef<HTMLInputElement>(null)
 
     // Drag and drop
@@ -192,9 +227,44 @@ export function FilesContent() {
         }
     }
 
-    const filteredFiles = files.filter((file) =>
-        file.name.toLowerCase().includes(searchQuery.toLowerCase())
-    )
+    const filteredFiles = files
+        .filter((file) => file.name.toLowerCase().includes(searchQuery.toLowerCase()))
+        .filter((file) => {
+            if (!filterType) return true
+            if (filterType === "starred") return file.starred === 1
+            return file.type === filterType
+        })
+        .sort((a, b) => {
+            // Folders always come first
+            if (a.type === "folder" && b.type !== "folder") return -1
+            if (a.type !== "folder" && b.type === "folder") return 1
+
+            let cmp = 0
+            switch (sortKey) {
+                case "name":
+                    cmp = a.name.localeCompare(b.name)
+                    break
+                case "modified":
+                    cmp = new Date(a.modified_at).getTime() - new Date(b.modified_at).getTime()
+                    break
+                case "size":
+                    cmp = a.size - b.size
+                    break
+                case "type":
+                    cmp = a.type.localeCompare(b.type)
+                    break
+            }
+            return sortDirection === "asc" ? cmp : -cmp
+        })
+
+    function handleSort(key: typeof sortKey) {
+        if (sortKey === key) {
+            setSortDirection(d => d === "asc" ? "desc" : "asc")
+        } else {
+            setSortKey(key)
+            setSortDirection("asc")
+        }
+    }
 
     // Navigation
     function navigateToFolder(folderId: number | null) {
@@ -234,30 +304,8 @@ export function FilesContent() {
         const fileList = e.target.files
         if (!fileList || fileList.length === 0) return
 
-        setIsUploading(true)
-        setUploadProgress(0)
-
-        try {
-            const filesArray = Array.from(fileList)
-            // Simulate progress
-            const progressInterval = setInterval(() => {
-                setUploadProgress((prev) => Math.min(prev + 10, 90))
-            }, 200)
-
-            await uploadFiles(filesArray, currentFolderId)
-
-            clearInterval(progressInterval)
-            setUploadProgress(100)
-
-            setTimeout(() => {
-                setIsUploading(false)
-                setUploadProgress(0)
-                loadFiles()
-            }, 500)
-        } catch (err) {
-            setError(err instanceof Error ? err.message : "Upload failed")
-            setIsUploading(false)
-        }
+        const filesArray = Array.from(fileList)
+        addUpload(filesArray, currentFolderId, () => loadFiles())
 
         // Reset input
         if (fileInputRef.current) {
@@ -298,29 +346,8 @@ export function FilesContent() {
         const droppedFiles = e.dataTransfer.files
         if (!droppedFiles || droppedFiles.length === 0) return
 
-        setIsUploading(true)
-        setUploadProgress(0)
-
-        try {
-            const filesArray = Array.from(droppedFiles)
-            const progressInterval = setInterval(() => {
-                setUploadProgress((prev) => Math.min(prev + 10, 90))
-            }, 200)
-
-            await uploadFiles(filesArray, currentFolderId)
-
-            clearInterval(progressInterval)
-            setUploadProgress(100)
-
-            setTimeout(() => {
-                setIsUploading(false)
-                setUploadProgress(0)
-                loadFiles()
-            }, 500)
-        } catch (err) {
-            setError(err instanceof Error ? err.message : "Upload failed")
-            setIsUploading(false)
-        }
+        const filesArray = Array.from(droppedFiles)
+        addUpload(filesArray, currentFolderId, () => loadFiles())
     }
 
     // Download (supports both files and folders — folders download as ZIP)
@@ -424,6 +451,54 @@ export function FilesContent() {
             loadFiles()
         } catch (err) {
             setError(err instanceof Error ? err.message : "Rename failed")
+        }
+    }
+
+    async function loadDestinationView(parentId: number | null) {
+        setDestinationLoading(true)
+        try {
+            const data = await getFiles(parentId)
+            const folders = data.files.filter((file) => file.type === "folder")
+            setDestinationFolders(folders)
+            setDestinationBreadcrumbs(data.breadcrumbs)
+        } catch (err) {
+            setError(err instanceof Error ? err.message : "Failed to load destination folders")
+        } finally {
+            setDestinationLoading(false)
+        }
+    }
+
+    async function openLocationDialog(file: FileItem, mode: "move" | "copy") {
+        setLocationTarget(file)
+        setLocationMode(mode)
+        setShowLocationDialog(true)
+        const initialParent = currentFolderId
+        setDestinationFolderId(initialParent)
+        await loadDestinationView(initialParent)
+    }
+
+    async function handleDestinationNavigate(folderId: number | null) {
+        setDestinationFolderId(folderId)
+        await loadDestinationView(folderId)
+    }
+
+    async function applyLocationAction() {
+        if (!locationTarget || isApplyingLocation) return
+
+        setIsApplyingLocation(true)
+        try {
+            if (locationMode === "move") {
+                await moveFile(locationTarget.id, destinationFolderId)
+            } else {
+                await copyFile(locationTarget.id, destinationFolderId)
+            }
+            setShowLocationDialog(false)
+            setLocationTarget(null)
+            await loadFiles()
+        } catch (err) {
+            setError(err instanceof Error ? err.message : `${locationMode === "move" ? "Move" : "Copy"} failed`)
+        } finally {
+            setIsApplyingLocation(false)
         }
     }
 
@@ -585,13 +660,8 @@ export function FilesContent() {
                     <Button
                         className="gap-2"
                         onClick={() => fileInputRef.current?.click()}
-                        disabled={isUploading}
                     >
-                        {isUploading ? (
-                            <Loader2 className="h-4 w-4 animate-spin" />
-                        ) : (
-                            <Upload className="h-4 w-4" />
-                        )}
+                        <Upload className="h-4 w-4" />
                         Upload
                     </Button>
                     <Button
@@ -625,37 +695,92 @@ export function FilesContent() {
                     </div>
                     <DropdownMenu>
                         <DropdownMenuTrigger asChild>
-                            <Button variant="outline" size="icon">
-                                <SortAsc className="h-4 w-4" />
+                            <Button variant="outline" size="icon" title={`Sort by ${sortKey} (${sortDirection})`}>
+                                {sortDirection === "asc" ? <SortAsc className="h-4 w-4" /> : <SortDesc className="h-4 w-4" />}
                             </Button>
                         </DropdownMenuTrigger>
                         <DropdownMenuContent align="end">
-                            <DropdownMenuItem>Name</DropdownMenuItem>
-                            <DropdownMenuItem>Date modified</DropdownMenuItem>
-                            <DropdownMenuItem>Size</DropdownMenuItem>
-                            <DropdownMenuItem>Type</DropdownMenuItem>
+                            <DropdownMenuItem onClick={() => handleSort("name")} className={cn(sortKey === "name" && "text-primary font-medium")}>
+                                Name {sortKey === "name" && (sortDirection === "asc" ? "↑" : "↓")}
+                            </DropdownMenuItem>
+                            <DropdownMenuItem onClick={() => handleSort("modified")} className={cn(sortKey === "modified" && "text-primary font-medium")}>
+                                Date modified {sortKey === "modified" && (sortDirection === "asc" ? "↑" : "↓")}
+                            </DropdownMenuItem>
+                            <DropdownMenuItem onClick={() => handleSort("size")} className={cn(sortKey === "size" && "text-primary font-medium")}>
+                                Size {sortKey === "size" && (sortDirection === "asc" ? "↑" : "↓")}
+                            </DropdownMenuItem>
+                            <DropdownMenuItem onClick={() => handleSort("type")} className={cn(sortKey === "type" && "text-primary font-medium")}>
+                                Type {sortKey === "type" && (sortDirection === "asc" ? "↑" : "↓")}
+                            </DropdownMenuItem>
                         </DropdownMenuContent>
                     </DropdownMenu>
                 </div>
             </div>
 
-            {/* Upload Progress */}
-            {isUploading && (
-                <Card className="bg-secondary">
-                    <CardContent className="py-4">
-                        <div className="flex items-center gap-4">
-                            <Loader2 className="h-5 w-5 animate-spin text-primary" />
-                            <div className="flex-1">
-                                <p className="text-sm font-medium">Uploading files...</p>
-                                <Progress value={uploadProgress} className="mt-2" />
-                            </div>
+            {/* Filter Chips */}
+            <div className="flex items-center gap-2 overflow-x-auto pb-1">
+                <Filter className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                {[
+                    { key: null, label: "All" },
+                    { key: "image", label: "🖼️ Images" },
+                    { key: "document", label: "📄 Docs" },
+                    { key: "video", label: "🎬 Videos" },
+                    { key: "audio", label: "🎵 Audio" },
+                    { key: "archive", label: "📦 Archives" },
+                    { key: "starred", label: "⭐ Starred" },
+                ].map((f) => (
+                    <Button
+                        key={f.key ?? "all"}
+                        variant={filterType === f.key ? "default" : "outline"}
+                        size="sm"
+                        className="h-7 text-xs shrink-0 rounded-full"
+                        onClick={() => setFilterType(f.key)}
+                    >
+                        {f.label}
+                    </Button>
+                ))}
+            </div>
+
+            {/* Drive Status Notification Toast */}
+            {notification && (
+                <div className={cn(
+                    "fixed bottom-6 right-6 z-50 flex items-center gap-3 px-5 py-3 rounded-xl shadow-lg border transition-all animate-in slide-in-from-bottom-4 duration-300",
+                    notification.type === "disconnect"
+                        ? "bg-yellow-500/10 border-yellow-500/30 text-yellow-500"
+                        : "bg-green-500/10 border-green-500/30 text-green-500"
+                )}>
+                    {notification.type === "disconnect" ? (
+                        <AlertCircle className="h-5 w-5 flex-shrink-0" />
+                    ) : (
+                        <Check className="h-5 w-5 flex-shrink-0" />
+                    )}
+                    <span className="text-sm font-medium">
+                        {notification.type === "disconnect"
+                            ? `Drive "${notification.label}" disconnected`
+                            : `Drive "${notification.label}" is back online`}
+                    </span>
+                </div>
+            )}
+
+            {/* Storage Drive Disconnected Warning (real-time via SSE) */}
+            {disconnectedDrives.length > 0 && (
+                <Card className="bg-yellow-500/10 border-yellow-500/30">
+                    <CardContent className="py-3 flex items-start gap-3">
+                        <AlertCircle className="h-5 w-5 text-yellow-500 flex-shrink-0 mt-0.5" />
+                        <div>
+                            <p className="text-sm font-medium text-yellow-500">Storage Drive Disconnected</p>
+                            <p className="text-sm text-yellow-500/80 mt-0.5">
+                                {disconnectedDrives.length === 1
+                                    ? `Drive "${disconnectedDrives[0].label}" is not currently attached. Files on this drive are temporarily unavailable.`
+                                    : `${disconnectedDrives.length} drives are disconnected: ${disconnectedDrives.map(d => `"${d.label}"`).join(", ")}. Files on these drives are temporarily unavailable.`}
+                            </p>
                         </div>
                     </CardContent>
                 </Card>
             )}
 
-            {/* Storage Drive Disconnected Warning */}
-            {storageWarning && (
+            {/* Legacy storage warning (from API, as fallback) */}
+            {storageWarning && disconnectedDrives.length === 0 && (
                 <Card className="bg-yellow-500/10 border-yellow-500/30">
                     <CardContent className="py-3 flex items-start gap-3">
                         <AlertCircle className="h-5 w-5 text-yellow-500 flex-shrink-0 mt-0.5" />
@@ -756,124 +881,214 @@ export function FilesContent() {
                 <div className="grid gap-3 grid-cols-1 xs:grid-cols-2 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
                     {filteredFiles.map((file) => {
                         const Icon = getFileIcon(file.type)
+                        const accessible = isFileAccessible(file)
                         return (
-                            <Card
-                                key={file.id}
-                                className={cn(
-                                    "group relative cursor-pointer transition-colors hover:bg-secondary",
-                                    selectedFiles.includes(file.id) && "ring-2 ring-primary bg-primary/5"
-                                )}
-                                onClick={() => isSelecting ? toggleFileSelection(file.id) : handleFileClick(file)}
-                            >
-                                <CardContent className="p-4">
-                                    <div className="absolute right-2 top-2 flex items-center gap-1">
-                                        {file.starred === 1 && (
-                                            <Star className="h-4 w-4 fill-yellow-400 text-yellow-400" />
+                            <ContextMenu key={file.id}>
+                                <ContextMenuTrigger asChild>
+                                    <Card
+                                        className={cn(
+                                            "group relative cursor-pointer transition-colors hover:bg-secondary",
+                                            selectedFiles.includes(file.id) && "ring-2 ring-primary bg-primary/5",
+                                            !accessible && "opacity-50"
                                         )}
-                                        {file.type !== 'folder' && (
-                                            <Button
-                                                variant="ghost"
-                                                size="icon"
-                                                className="h-8 w-8 sm:opacity-0 sm:group-hover:opacity-100"
-                                                onClick={(e) => { e.stopPropagation(); openPreview(file) }}
-                                            >
-                                                <Maximize2 className="h-4 w-4" />
-                                            </Button>
-                                        )}
-                                        <DropdownMenu>
-                                            <DropdownMenuTrigger asChild>
-                                                <Button
-                                                    variant="ghost"
-                                                    size="icon"
-                                                    className="h-8 w-8 sm:opacity-0 sm:group-hover:opacity-100"
-                                                >
-                                                    <MoreVertical className="h-4 w-4" />
-                                                </Button>
-                                            </DropdownMenuTrigger>
-                                            <DropdownMenuContent align="end">
-                                                {file.type === "folder" ? (
-                                                    <>
-                                                        <DropdownMenuItem onClick={() => handleFileClick(file)}>
-                                                            <FolderOpen className="h-4 w-4 mr-2" />
-                                                            Open
-                                                        </DropdownMenuItem>
-                                                        <DropdownMenuItem onClick={() => handleDownload(file)}>
-                                                            <Download className="h-4 w-4 mr-2" />
-                                                            Download as ZIP
-                                                        </DropdownMenuItem>
-                                                    </>
-                                                ) : (
-                                                    <>
-                                                        <DropdownMenuItem onClick={() => openPreview(file)}>
-                                                            <Eye className="h-4 w-4 mr-2" />
-                                                            Preview
-                                                        </DropdownMenuItem>
-                                                        <DropdownMenuItem onClick={() => handleDownload(file)}>
-                                                            <Download className="h-4 w-4 mr-2" />
-                                                            Download
-                                                        </DropdownMenuItem>
-                                                    </>
-                                                )}
-                                                <DropdownMenuItem onClick={() => openRenameDialog(file)}>
-                                                    <Pencil className="h-4 w-4 mr-2" />
-                                                    Rename
-                                                </DropdownMenuItem>
-                                                <DropdownMenuItem onClick={() => handleToggleStar(file)}>
-                                                    <Star className="h-4 w-4 mr-2" />
-                                                    {file.starred ? "Unstar" : "Star"}
-                                                </DropdownMenuItem>
-                                                <DropdownMenuItem onClick={() => handleShare(file)}>
-                                                    <Link2 className="h-4 w-4 mr-2" />
-                                                    Share
-                                                </DropdownMenuItem>
-                                                <DropdownMenuSeparator />
-                                                <DropdownMenuItem
-                                                    className="text-destructive"
-                                                    onClick={() => openDeleteDialog(file)}
-                                                >
-                                                    <Trash2 className="h-4 w-4 mr-2" />
-                                                    Delete
-                                                </DropdownMenuItem>
-                                            </DropdownMenuContent>
-                                        </DropdownMenu>
-                                    </div>
-                                    <div
-                                        className="flex flex-col items-center pt-4"
-                                        onClick={() => {
-                                            if (file.type === "folder") handleFileClick(file)
-                                            else openPreview(file)
-                                        }}
+                                        onClick={() => isSelecting ? toggleFileSelection(file.id) : (accessible ? handleFileClick(file) : null)}
+                                        title={!accessible ? "Drive disconnected — file temporarily unavailable" : undefined}
                                     >
-                                        {file.type === "image" ? (
-                                            <div className="w-full h-20 sm:h-24 mb-2 sm:mb-3 rounded overflow-hidden bg-secondary flex items-center justify-center">
-                                                <img
-                                                    src={getPreviewUrl(file.id)}
-                                                    alt={file.name}
-                                                    className="w-full h-full object-cover"
-                                                    loading="lazy"
-                                                    onError={(e) => {
-                                                        // If image fails to load, replace with icon
-                                                        const target = e.target as HTMLImageElement
-                                                        target.style.display = 'none'
-                                                        const parent = target.parentElement
-                                                        if (parent) {
-                                                            parent.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-green-400"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>'
-                                                        }
-                                                    }}
-                                                />
+                                        <CardContent className="p-4">
+                                            <div className="absolute right-2 top-2 flex items-center gap-1">
+                                                {file.starred === 1 && (
+                                                    <Star className="h-4 w-4 fill-yellow-400 text-yellow-400" />
+                                                )}
+                                                {file.type !== 'folder' && (
+                                                    <Button
+                                                        variant="ghost"
+                                                        size="icon"
+                                                        className="h-8 w-8 sm:opacity-0 sm:group-hover:opacity-100"
+                                                        onClick={(e) => { e.stopPropagation(); openPreview(file) }}
+                                                    >
+                                                        <Maximize2 className="h-4 w-4" />
+                                                    </Button>
+                                                )}
+                                                <DropdownMenu>
+                                                    <DropdownMenuTrigger asChild>
+                                                        <Button
+                                                            variant="ghost"
+                                                            size="icon"
+                                                            className="h-8 w-8 sm:opacity-0 sm:group-hover:opacity-100"
+                                                        >
+                                                            <MoreVertical className="h-4 w-4" />
+                                                        </Button>
+                                                    </DropdownMenuTrigger>
+                                                    <DropdownMenuContent align="end">
+                                                        {file.type === "folder" ? (
+                                                            <>
+                                                                <DropdownMenuItem onClick={() => handleFileClick(file)}>
+                                                                    <FolderOpen className="h-4 w-4 mr-2" />
+                                                                    Open
+                                                                </DropdownMenuItem>
+                                                                <DropdownMenuItem
+                                                                    onClick={() => accessible && handleDownload(file)}
+                                                                    disabled={!accessible}
+                                                                    title={!accessible ? "Drive disconnected" : undefined}
+                                                                >
+                                                                    <Download className="h-4 w-4 mr-2" />
+                                                                    Download as ZIP
+                                                                </DropdownMenuItem>
+                                                            </>
+                                                        ) : (
+                                                            <>
+                                                                <DropdownMenuItem
+                                                                    onClick={() => accessible && openPreview(file)}
+                                                                    disabled={!accessible}
+                                                                    title={!accessible ? "Drive disconnected" : undefined}
+                                                                >
+                                                                    <Eye className="h-4 w-4 mr-2" />
+                                                                    Preview
+                                                                </DropdownMenuItem>
+                                                                <DropdownMenuItem
+                                                                    onClick={() => accessible && handleDownload(file)}
+                                                                    disabled={!accessible}
+                                                                    title={!accessible ? "Drive disconnected" : undefined}
+                                                                >
+                                                                    <Download className="h-4 w-4 mr-2" />
+                                                                    Download
+                                                                </DropdownMenuItem>
+                                                            </>
+                                                        )}
+                                                        <DropdownMenuItem onClick={() => openRenameDialog(file)}>
+                                                            <Pencil className="h-4 w-4 mr-2" />
+                                                            Rename
+                                                        </DropdownMenuItem>
+                                                        <DropdownMenuItem onClick={() => openLocationDialog(file, "move")}>
+                                                            <Scissors className="h-4 w-4 mr-2" />
+                                                            Move
+                                                        </DropdownMenuItem>
+                                                        <DropdownMenuItem onClick={() => openLocationDialog(file, "copy")}>
+                                                            <Copy className="h-4 w-4 mr-2" />
+                                                            Copy
+                                                        </DropdownMenuItem>
+                                                        <DropdownMenuItem onClick={() => handleToggleStar(file)}>
+                                                            <Star className="h-4 w-4 mr-2" />
+                                                            {file.starred ? "Unstar" : "Star"}
+                                                        </DropdownMenuItem>
+                                                        <DropdownMenuItem onClick={() => handleShare(file)}>
+                                                            <Link2 className="h-4 w-4 mr-2" />
+                                                            Share
+                                                        </DropdownMenuItem>
+                                                        <DropdownMenuItem onClick={() => setDetailFile(file)}>
+                                                            <Info className="h-4 w-4 mr-2" />
+                                                            Details
+                                                        </DropdownMenuItem>
+                                                        <DropdownMenuSeparator />
+                                                        <DropdownMenuItem
+                                                            className="text-destructive"
+                                                            onClick={() => openDeleteDialog(file)}
+                                                        >
+                                                            <Trash2 className="h-4 w-4 mr-2" />
+                                                            Delete
+                                                        </DropdownMenuItem>
+                                                    </DropdownMenuContent>
+                                                </DropdownMenu>
                                             </div>
-                                        ) : (
-                                            <Icon className={cn("h-10 w-10 sm:h-12 sm:w-12 mb-2 sm:mb-3", getFileColor(file.type))} />
-                                        )}
-                                        <p className="text-xs sm:text-sm font-medium text-card-foreground text-center line-clamp-2 w-full px-1" title={file.name}>
-                                            {file.name}
-                                        </p>
-                                        <p className="text-xs text-muted-foreground mt-1">
-                                            {formatFileSize(file.size)}
-                                        </p>
-                                    </div>
-                                </CardContent>
-                            </Card>
+                                            <div
+                                                className="flex flex-col items-center pt-4"
+                                                onClick={() => {
+                                                    if (!accessible) return
+                                                    if (file.type === "folder") handleFileClick(file)
+                                                    else openPreview(file)
+                                                }}
+                                            >
+                                                {file.type === "image" || file.type === "video" ? (
+                                                    <div className="w-full h-20 sm:h-24 mb-2 sm:mb-3 rounded overflow-hidden bg-secondary flex items-center justify-center">
+                                                        {brokenThumbnails[file.id] ? (
+                                                            <Icon className={cn("h-10 w-10 sm:h-12 sm:w-12", getFileColor(file.type))} />
+                                                        ) : (
+                                                            <img
+                                                                src={getThumbnailUrl(file.id, 256)}
+                                                                alt={file.name}
+                                                                className="w-full h-full object-cover"
+                                                                loading="lazy"
+                                                                onError={(e) => {
+                                                                    const target = e.currentTarget
+                                                                    if (file.type === "image" && !target.dataset.fallback) {
+                                                                        target.dataset.fallback = "1"
+                                                                        target.src = getPreviewUrl(file.id)
+                                                                        return
+                                                                    }
+                                                                    setBrokenThumbnails(prev => ({ ...prev, [file.id]: true }))
+                                                                }}
+                                                            />
+                                                        )}
+                                                    </div>
+                                                ) : (
+                                                    <Icon className={cn("h-10 w-10 sm:h-12 sm:w-12 mb-2 sm:mb-3", getFileColor(file.type))} />
+                                                )}
+                                                <p className="text-xs sm:text-sm font-medium text-card-foreground text-center line-clamp-2 w-full px-1" title={file.name}>
+                                                    {file.name}
+                                                </p>
+                                                <p className="text-xs text-muted-foreground mt-1">
+                                                    {formatFileSize(file.size)}
+                                                </p>
+                                            </div>
+                                        </CardContent>
+                                    </Card>
+                                </ContextMenuTrigger>
+                                <ContextMenuContent className="w-48">
+                                    {file.type === "folder" ? (
+                                        <>
+                                            <ContextMenuItem onClick={() => handleFileClick(file)}>
+                                                <FolderOpen className="h-4 w-4 mr-2" />
+                                                Open
+                                            </ContextMenuItem>
+                                            <ContextMenuItem onClick={() => handleDownload(file)}>
+                                                <Download className="h-4 w-4 mr-2" />
+                                                Download as ZIP
+                                            </ContextMenuItem>
+                                        </>
+                                    ) : (
+                                        <>
+                                            <ContextMenuItem onClick={() => openPreview(file)}>
+                                                <Eye className="h-4 w-4 mr-2" />
+                                                Preview
+                                            </ContextMenuItem>
+                                            <ContextMenuItem onClick={() => handleDownload(file)}>
+                                                <Download className="h-4 w-4 mr-2" />
+                                                Download
+                                            </ContextMenuItem>
+                                        </>
+                                    )}
+                                    <ContextMenuSeparator />
+                                    <ContextMenuItem onClick={() => openRenameDialog(file)}>
+                                        <Pencil className="h-4 w-4 mr-2" />
+                                        Rename
+                                    </ContextMenuItem>
+                                    <ContextMenuItem onClick={() => openLocationDialog(file, "move")}>
+                                        <Scissors className="h-4 w-4 mr-2" />
+                                        Move
+                                    </ContextMenuItem>
+                                    <ContextMenuItem onClick={() => openLocationDialog(file, "copy")}>
+                                        <Copy className="h-4 w-4 mr-2" />
+                                        Copy
+                                    </ContextMenuItem>
+                                    <ContextMenuItem onClick={() => handleToggleStar(file)}>
+                                        <Star className="h-4 w-4 mr-2" />
+                                        {file.starred ? "Unstar" : "Star"}
+                                    </ContextMenuItem>
+                                    <ContextMenuItem onClick={() => handleShare(file)}>
+                                        <Link2 className="h-4 w-4 mr-2" />
+                                        Share
+                                    </ContextMenuItem>
+                                    <ContextMenuItem onClick={() => setDetailFile(file)}>
+                                        <Info className="h-4 w-4 mr-2" />
+                                        Details
+                                    </ContextMenuItem>
+                                    <ContextMenuSeparator />
+                                    <ContextMenuItem className="text-destructive" onClick={() => openDeleteDialog(file)}>
+                                        <Trash2 className="h-4 w-4 mr-2" />
+                                        Delete
+                                    </ContextMenuItem>
+                                </ContextMenuContent>
+                            </ContextMenu>
                         )
                     })}
                 </div>
@@ -893,19 +1108,46 @@ export function FilesContent() {
                     <CardContent className="p-0">
                         {filteredFiles.map((file) => {
                             const Icon = getFileIcon(file.type)
+                            const accessible = isFileAccessible(file)
                             return (
                                 <div
                                     key={file.id}
                                     className={cn(
                                         "flex sm:grid sm:grid-cols-12 gap-2 sm:gap-4 items-center px-4 sm:px-6 py-3 border-b border-border last:border-0 hover:bg-secondary cursor-pointer",
-                                        selectedFiles.includes(file.id) && "bg-primary/10"
+                                        selectedFiles.includes(file.id) && "bg-primary/10",
+                                        !accessible && "opacity-50"
                                     )}
-                                    onClick={() => isSelecting ? toggleFileSelection(file.id) : handleFileClick(file)}
+                                    onClick={() => isSelecting ? toggleFileSelection(file.id) : (accessible ? handleFileClick(file) : null)}
+                                    title={!accessible ? "Drive disconnected — file temporarily unavailable" : undefined}
                                 >
                                     <div
                                         className="flex-1 sm:col-span-7 md:col-span-6 flex items-center gap-3 min-w-0"
                                     >
-                                        <Icon className={cn("h-5 w-5 flex-shrink-0", getFileColor(file.type))} />
+                                        {file.type === "image" || file.type === "video" ? (
+                                            <div className="h-9 w-9 rounded overflow-hidden bg-secondary shrink-0 flex items-center justify-center">
+                                                {brokenThumbnails[file.id] ? (
+                                                    <Icon className={cn("h-5 w-5", getFileColor(file.type))} />
+                                                ) : (
+                                                    <img
+                                                        src={getThumbnailUrl(file.id, 96)}
+                                                        alt={file.name}
+                                                        className="h-full w-full object-cover"
+                                                        loading="lazy"
+                                                        onError={(e) => {
+                                                            const target = e.currentTarget
+                                                            if (file.type === "image" && !target.dataset.fallback) {
+                                                                target.dataset.fallback = "1"
+                                                                target.src = getPreviewUrl(file.id)
+                                                                return
+                                                            }
+                                                            setBrokenThumbnails(prev => ({ ...prev, [file.id]: true }))
+                                                        }}
+                                                    />
+                                                )}
+                                            </div>
+                                        ) : (
+                                            <Icon className={cn("h-5 w-5 flex-shrink-0", getFileColor(file.type))} />
+                                        )}
                                         <div className="min-w-0 flex-1">
                                             <span className="text-sm font-medium text-card-foreground truncate block">
                                                 {file.name}
@@ -959,6 +1201,14 @@ export function FilesContent() {
                                                     <Pencil className="h-4 w-4 mr-2" />
                                                     Rename
                                                 </DropdownMenuItem>
+                                                <DropdownMenuItem onClick={() => openLocationDialog(file, "move")}>
+                                                    <Scissors className="h-4 w-4 mr-2" />
+                                                    Move
+                                                </DropdownMenuItem>
+                                                <DropdownMenuItem onClick={() => openLocationDialog(file, "copy")}>
+                                                    <Copy className="h-4 w-4 mr-2" />
+                                                    Copy
+                                                </DropdownMenuItem>
                                                 <DropdownMenuItem onClick={() => handleToggleStar(file)}>
                                                     <Star className="h-4 w-4 mr-2" />
                                                     {file.starred ? "Unstar" : "Star"}
@@ -966,6 +1216,10 @@ export function FilesContent() {
                                                 <DropdownMenuItem onClick={() => handleShare(file)}>
                                                     <Link2 className="h-4 w-4 mr-2" />
                                                     Share
+                                                </DropdownMenuItem>
+                                                <DropdownMenuItem onClick={() => setDetailFile(file)}>
+                                                    <Info className="h-4 w-4 mr-2" />
+                                                    Details
                                                 </DropdownMenuItem>
                                                 <DropdownMenuSeparator />
                                                 <DropdownMenuItem
@@ -1008,6 +1262,139 @@ export function FilesContent() {
                         </Button>
                         <Button onClick={handleCreateFolder} disabled={!newFolderName.trim()}>
                             Create
+                        </Button>
+                    </DialogFooter>
+                </DialogContent>
+            </Dialog>
+
+            {/* Move/Copy Destination Dialog */}
+            <Dialog
+                open={showLocationDialog}
+                onOpenChange={(open) => {
+                    setShowLocationDialog(open)
+                    if (!open) {
+                        setLocationTarget(null)
+                        setDestinationFolders([])
+                        setDestinationBreadcrumbs([])
+                        setDestinationFolderId(null)
+                    }
+                }}
+            >
+                <DialogContent className="sm:max-w-lg">
+                    <DialogHeader>
+                        <DialogTitle className="flex items-center gap-2">
+                            {locationMode === "move" ? <Scissors className="h-5 w-5" /> : <Copy className="h-5 w-5" />}
+                            {locationMode === "move" ? "Move to..." : "Copy to..."}
+                        </DialogTitle>
+                    </DialogHeader>
+
+                    <div className="space-y-4">
+                        <div className="text-sm text-muted-foreground">
+                            {locationMode === "move" ? "Moving" : "Copying"}{" "}
+                            <span className="font-medium text-foreground">"{locationTarget?.name}"</span>
+                        </div>
+
+                        <div className="rounded-lg border border-border p-3 space-y-3">
+                            <div className="flex items-center justify-between gap-2">
+                                <div className="flex items-center gap-2 text-sm min-w-0">
+                                    <Button
+                                        variant="ghost"
+                                        size="icon"
+                                        className="h-7 w-7"
+                                        disabled={destinationFolderId === null || destinationLoading}
+                                        onClick={() => {
+                                            if (destinationBreadcrumbs.length <= 1) {
+                                                handleDestinationNavigate(null)
+                                                return
+                                            }
+                                            const parentCrumb = destinationBreadcrumbs[destinationBreadcrumbs.length - 2]
+                                            handleDestinationNavigate(parentCrumb.id)
+                                        }}
+                                    >
+                                        <ArrowLeft className="h-4 w-4" />
+                                    </Button>
+                                    <div className="flex items-center gap-1 overflow-x-auto whitespace-nowrap">
+                                        <Button
+                                            variant="ghost"
+                                            size="sm"
+                                            className={cn("h-7 px-2", destinationFolderId === null && "text-primary")}
+                                            onClick={() => handleDestinationNavigate(null)}
+                                        >
+                                            <Home className="h-3.5 w-3.5 mr-1" />
+                                            Root
+                                        </Button>
+                                        {destinationBreadcrumbs.map((crumb) => (
+                                            <div key={crumb.id} className="flex items-center gap-1">
+                                                <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />
+                                                <Button
+                                                    variant="ghost"
+                                                    size="sm"
+                                                    className={cn("h-7 px-2", destinationFolderId === crumb.id && "text-primary")}
+                                                    onClick={() => handleDestinationNavigate(crumb.id)}
+                                                >
+                                                    {crumb.name}
+                                                </Button>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div className="text-xs text-muted-foreground">
+                                Destination:{" "}
+                                <span className="text-foreground font-medium">
+                                    {destinationBreadcrumbs.length > 0
+                                        ? destinationBreadcrumbs[destinationBreadcrumbs.length - 1].name
+                                        : "Root"}
+                                </span>
+                            </div>
+                        </div>
+
+                        <div className="space-y-2 max-h-64 overflow-y-auto border border-border rounded-lg p-2">
+                            {destinationLoading ? (
+                                <div className="flex items-center justify-center py-8">
+                                    <Loader2 className="h-5 w-5 animate-spin text-primary" />
+                                </div>
+                            ) : destinationFolders.length === 0 ? (
+                                <div className="text-sm text-muted-foreground text-center py-6">
+                                    No subfolders here
+                                </div>
+                            ) : (
+                                destinationFolders
+                                    .filter((folder) => folder.id !== locationTarget?.id)
+                                    .map((folder) => (
+                                        <Button
+                                            key={folder.id}
+                                            variant="ghost"
+                                            className="w-full justify-between h-auto py-2.5 px-3"
+                                            onClick={() => handleDestinationNavigate(folder.id)}
+                                        >
+                                            <span className="flex items-center gap-2 min-w-0">
+                                                <Folder className="h-4 w-4 text-blue-400 shrink-0" />
+                                                <span className="truncate">{folder.name}</span>
+                                            </span>
+                                            <ChevronRight className="h-4 w-4 text-muted-foreground" />
+                                        </Button>
+                                    ))
+                            )}
+                        </div>
+                    </div>
+
+                    <DialogFooter>
+                        <Button variant="outline" onClick={() => setShowLocationDialog(false)}>
+                            Cancel
+                        </Button>
+                        <Button onClick={applyLocationAction} disabled={isApplyingLocation || destinationLoading}>
+                            {isApplyingLocation ? (
+                                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                            ) : locationMode === "move" ? (
+                                <Scissors className="h-4 w-4 mr-2" />
+                            ) : (
+                                <Copy className="h-4 w-4 mr-2" />
+                            )}
+                            {isApplyingLocation
+                                ? (locationMode === "move" ? "Moving..." : "Copying...")
+                                : (locationMode === "move" ? "Move Here" : "Copy Here")}
                         </Button>
                     </DialogFooter>
                 </DialogContent>
@@ -1285,6 +1672,139 @@ export function FilesContent() {
                     )}
                 </DialogContent>
             </Dialog>
+
+            {/* File Details Sidebar */}
+            {detailFile && (
+                <div className="fixed inset-0 z-50 flex justify-end" onClick={() => setDetailFile(null)}>
+                    <div className="absolute inset-0 bg-background/60 backdrop-blur-sm" />
+                    <div
+                        className="relative w-full max-w-sm bg-card border-l border-border h-full overflow-y-auto animate-in slide-in-from-right duration-300"
+                        onClick={(e) => e.stopPropagation()}
+                    >
+                        {/* Header */}
+                        <div className="sticky top-0 bg-card/95 backdrop-blur-sm border-b border-border p-4 flex items-center justify-between z-10">
+                            <h3 className="font-semibold text-card-foreground">File Details</h3>
+                            <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => setDetailFile(null)}>
+                                <X className="h-4 w-4" />
+                            </Button>
+                        </div>
+
+                        <div className="p-5 space-y-6">
+                            {/* File icon + name */}
+                            <div className="flex flex-col items-center text-center gap-3">
+                                {detailFile.type === "image" ? (
+                                    <div className="w-32 h-32 rounded-lg overflow-hidden bg-secondary">
+                                        <img
+                                            src={getPreviewUrl(detailFile.id)}
+                                            alt={detailFile.name}
+                                            className="w-full h-full object-cover"
+                                            onError={(e) => {
+                                                const target = e.target as HTMLImageElement
+                                                target.style.display = 'none'
+                                            }}
+                                        />
+                                    </div>
+                                ) : (
+                                    <div className="w-20 h-20 rounded-xl bg-secondary flex items-center justify-center">
+                                        {(() => {
+                                            const DetailIcon = getFileIcon(detailFile.type)
+                                            return <DetailIcon className={cn("h-10 w-10", getFileColor(detailFile.type))} />
+                                        })()}
+                                    </div>
+                                )}
+                                <p className="text-sm font-semibold text-card-foreground break-all">{detailFile.name}</p>
+                            </div>
+
+                            {/* Metadata grid */}
+                            <div className="space-y-3">
+                                <div className="flex items-start gap-3 p-3 rounded-lg bg-secondary">
+                                    <FileIcon className="h-4 w-4 text-muted-foreground mt-0.5 shrink-0" />
+                                    <div>
+                                        <p className="text-xs text-muted-foreground">Type</p>
+                                        <p className="text-sm text-card-foreground capitalize">{detailFile.type}</p>
+                                        {detailFile.mime_type && (
+                                            <p className="text-xs text-muted-foreground mt-0.5 font-mono">{detailFile.mime_type}</p>
+                                        )}
+                                    </div>
+                                </div>
+
+                                <div className="flex items-start gap-3 p-3 rounded-lg bg-secondary">
+                                    <Info className="h-4 w-4 text-muted-foreground mt-0.5 shrink-0" />
+                                    <div>
+                                        <p className="text-xs text-muted-foreground">Size</p>
+                                        <p className="text-sm text-card-foreground">{formatFileSize(detailFile.size)}</p>
+                                        {detailFile.size > 0 && (
+                                            <p className="text-xs text-muted-foreground mt-0.5">{detailFile.size.toLocaleString()} bytes</p>
+                                        )}
+                                    </div>
+                                </div>
+
+                                <div className="flex items-start gap-3 p-3 rounded-lg bg-secondary">
+                                    <Calendar className="h-4 w-4 text-muted-foreground mt-0.5 shrink-0" />
+                                    <div>
+                                        <p className="text-xs text-muted-foreground">Created</p>
+                                        <p className="text-sm text-card-foreground">
+                                            {detailFile.created_at ? new Date(detailFile.created_at).toLocaleString() : "—"}
+                                        </p>
+                                    </div>
+                                </div>
+
+                                <div className="flex items-start gap-3 p-3 rounded-lg bg-secondary">
+                                    <Clock className="h-4 w-4 text-muted-foreground mt-0.5 shrink-0" />
+                                    <div>
+                                        <p className="text-xs text-muted-foreground">Modified</p>
+                                        <p className="text-sm text-card-foreground">
+                                            {detailFile.modified_at ? new Date(detailFile.modified_at).toLocaleString() : "—"}
+                                        </p>
+                                    </div>
+                                </div>
+
+                                {detailFile.starred === 1 && (
+                                    <div className="flex items-start gap-3 p-3 rounded-lg bg-yellow-500/10">
+                                        <Star className="h-4 w-4 text-yellow-400 mt-0.5 shrink-0 fill-yellow-400" />
+                                        <div>
+                                            <p className="text-sm text-card-foreground">Starred</p>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+
+                            {/* Quick Actions */}
+                            <div className="space-y-2 pt-2 border-t border-border">
+                                <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider">Actions</p>
+                                <div className="flex flex-wrap gap-2">
+                                    {detailFile.type !== "folder" && (
+                                        <Button variant="outline" size="sm" className="gap-2" onClick={() => { handleDownload(detailFile); }}>
+                                            <Download className="h-3.5 w-3.5" />
+                                            Download
+                                        </Button>
+                                    )}
+                                    <Button variant="outline" size="sm" className="gap-2" onClick={() => { setDetailFile(null); openRenameDialog(detailFile); }}>
+                                        <Pencil className="h-3.5 w-3.5" />
+                                        Rename
+                                    </Button>
+                                    <Button variant="outline" size="sm" className="gap-2" onClick={() => { setDetailFile(null); openLocationDialog(detailFile, "move"); }}>
+                                        <Scissors className="h-3.5 w-3.5" />
+                                        Move
+                                    </Button>
+                                    <Button variant="outline" size="sm" className="gap-2" onClick={() => { setDetailFile(null); openLocationDialog(detailFile, "copy"); }}>
+                                        <Copy className="h-3.5 w-3.5" />
+                                        Copy
+                                    </Button>
+                                    <Button variant="outline" size="sm" className="gap-2" onClick={() => { setDetailFile(null); handleShare(detailFile); }}>
+                                        <Link2 className="h-3.5 w-3.5" />
+                                        Share
+                                    </Button>
+                                    <Button variant="outline" size="sm" className="gap-2 text-destructive" onClick={() => { setDetailFile(null); openDeleteDialog(detailFile); }}>
+                                        <Trash2 className="h-3.5 w-3.5" />
+                                        Delete
+                                    </Button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            )}
         </div>
     )
 }

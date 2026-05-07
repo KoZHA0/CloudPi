@@ -102,6 +102,13 @@ try {
   // Column already exists, ignore error
 }
 
+// Add avatar_url field (stores filename of uploaded avatar)
+try {
+  db.exec(`ALTER TABLE users ADD COLUMN avatar_url TEXT DEFAULT NULL`);
+} catch (e) {
+  // Column already exists, ignore error
+}
+
 /**
  * PASSWORD RESET TOKENS
  * ---------------------
@@ -212,6 +219,14 @@ db.exec(`
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )
 `);
+
+// Add is_accessible column (system-controlled drive connectivity status)
+// Separate from is_active (admin-controlled). is_accessible tracks physical hardware state.
+try {
+  db.exec(`ALTER TABLE storage_sources ADD COLUMN is_accessible INTEGER DEFAULT 1`);
+} catch (e) {
+  // Column already exists, ignore
+}
 
 // Add storage_source_id to files table (for existing databases)
 try {

@@ -70,7 +70,26 @@ EOF
 chmod +x "$MOUNT_SCRIPT"
 echo -e "${GREEN}✓ Created custom USB mount script${NC}"
 
-# 2. Create systemd service to handle the mount/umount lifecycle
+# 2. Install the drive notification script
+NOTIFY_SCRIPT="/usr/local/bin/cloudpi-drive-notify"
+cp "$(dirname "$0")/cloudpi-drive-notify.sh" "$NOTIFY_SCRIPT"
+chmod +x "$NOTIFY_SCRIPT"
+echo -e "${GREEN}✓ Installed drive notification script${NC}"
+
+# 3. Generate udev webhook secret (if not already set)
+SECRET_FILE="/etc/cloudpi/udev-secret"
+if [ ! -f "$SECRET_FILE" ]; then
+    mkdir -p /etc/cloudpi
+    openssl rand -hex 32 > "$SECRET_FILE"
+    chmod 600 "$SECRET_FILE"
+    echo -e "${GREEN}✓ Generated udev webhook secret${NC}"
+    echo -e "${YELLOW}  → Add to backend .env: CLOUDPI_UDEV_SECRET=$(cat $SECRET_FILE)${NC}"
+else
+    echo -e "${GREEN}✓ Udev webhook secret already exists${NC}"
+fi
+
+# 4. Create systemd service to handle the mount/umount lifecycle
+# ExecStartPost/ExecStopPost: notify the backend after mount/unmount completes
 SERVICE_FILE="/etc/systemd/system/cloudpi-usb@.service"
 cat > "$SERVICE_FILE" << 'EOF'
 [Unit]
@@ -81,15 +100,19 @@ After=dev-%i.device
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+EnvironmentFile=-/etc/cloudpi/udev-secret
 ExecStart=/usr/local/bin/cloudpi-usbmount mount %i
+ExecStartPost=-/usr/local/bin/cloudpi-drive-notify add %i
 ExecStop=/usr/local/bin/cloudpi-usbmount umount %i
+ExecStopPost=-/usr/local/bin/cloudpi-drive-notify remove %i
 EOF
-echo -e "${GREEN}✓ Created systemd mount service${NC}"
+echo -e "${GREEN}✓ Created systemd mount service (with notification)${NC}"
 
-# 3. Create udev rule to trigger systemd on USB plug
+# 5. Create udev rule to trigger systemd on USB plug/unplug
 UDEV_RULE="/etc/udev/rules.d/99-cloudpi-usb.rules"
 cat > "$UDEV_RULE" << 'EOF'
 KERNEL=="sd[a-z][0-9]", SUBSYSTEMS=="usb", ACTION=="add", ENV{SYSTEMD_WANTS}="cloudpi-usb@%k.service"
+KERNEL=="sd[a-z][0-9]", SUBSYSTEMS=="usb", ACTION=="remove", RUN+="/usr/local/bin/cloudpi-drive-notify remove %k"
 EOF
 echo -e "${GREEN}✓ Created udev rule for auto-mounting${NC}"
 
@@ -110,12 +133,17 @@ echo -e "${GREEN}✓ Reloaded systemd and udev rules${NC}"
 
 echo ""
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}  ✓ USB mount hardening complete!${NC}"
+echo -e "${GREEN}  ✓ USB mount hardening + event notification complete!${NC}"
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 echo "Mount options applied: nosuid,nodev,noexec,noatime"
 echo "Mount points:          /media/pi/sda1, /media/pi/sdb1, etc."
+echo "Event notification:    udev → cloudpi-drive-notify → backend webhook"
 echo ""
-echo -e "${YELLOW}NOTE: Plug in a USB drive to test. Check with:${NC}"
+echo -e "${YELLOW}IMPORTANT: Add the webhook secret to your backend .env:${NC}"
+echo "  CLOUDPI_UDEV_SECRET=$(cat /etc/cloudpi/udev-secret 2>/dev/null || echo '<generate with: openssl rand -hex 32>')"
+echo ""
+echo -e "${YELLOW}Test drive events:${NC}"
 echo "  mount | grep /media/pi"
+echo "  journalctl -t cloudpi-udev -f"
 echo ""

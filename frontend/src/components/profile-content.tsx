@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import { useEffect, useState, useRef } from "react"
 import {
     Camera,
     Check,
@@ -11,6 +11,7 @@ import {
     ShieldCheck,
     ShieldOff,
     X,
+    Trash2,
 } from "lucide-react"
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar"
 import { Badge } from "@/components/ui/badge"
@@ -27,7 +28,7 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { changePassword, disable2FA, setup2FA, updateProfile, verify2FA } from "@/lib/api"
+import { changePassword, disable2FA, setup2FA, updateProfile, verify2FA, uploadAvatar, removeAvatar, getAvatarUrl } from "@/lib/api"
 import { useAuth } from "@/contexts/auth-context"
 
 type Message = { type: "success" | "error"; text: string }
@@ -74,6 +75,10 @@ export function ProfileContent() {
     const [disable2FAPassword, setDisable2FAPassword] = useState("")
     const [twoFactorCopied, setTwoFactorCopied] = useState(false)
     const [twoFactorMessage, setTwoFactorMessage] = useState<Message | null>(null)
+
+    // Avatar
+    const avatarInputRef = useRef<HTMLInputElement>(null)
+    const [isUploadingAvatar, setIsUploadingAvatar] = useState(false)
 
     const twoFactorEnabled = user?.two_factor_enabled === 1
     const emailChanged = email.trim() !== (user?.email || "")
@@ -214,19 +219,69 @@ export function ProfileContent() {
                     <div className="flex flex-col sm:flex-row items-start sm:items-center gap-6">
                         <div className="relative">
                             <Avatar className="h-24 w-24">
-                                <AvatarImage src="/diverse-user-avatars.png" />
+                                <AvatarImage src={user?.avatar_url ? getAvatarUrl(user.avatar_url) : undefined} />
                                 <AvatarFallback className="text-2xl bg-primary text-primary-foreground">
                                     {user?.username?.charAt(0).toUpperCase() || "U"}
                                 </AvatarFallback>
                             </Avatar>
-                            <Button size="icon" variant="secondary" className="absolute -bottom-2 -right-2 h-8 w-8 rounded-full">
-                                <Camera className="h-4 w-4" />
+                            <input
+                                ref={avatarInputRef}
+                                type="file"
+                                accept="image/jpeg,image/png,image/gif,image/webp"
+                                className="hidden"
+                                onChange={async (e) => {
+                                    const file = e.target.files?.[0]
+                                    if (!file) return
+                                    if (file.size > 2 * 1024 * 1024) {
+                                        setProfileMessage({ type: "error", text: "Avatar must be under 2MB" })
+                                        return
+                                    }
+                                    setIsUploadingAvatar(true)
+                                    try {
+                                        const result = await uploadAvatar(file)
+                                        updateUser({ ...user!, avatar_url: result.avatar_url })
+                                        setProfileMessage({ type: "success", text: "Avatar updated!" })
+                                    } catch (err) {
+                                        setProfileMessage({ type: "error", text: err instanceof Error ? err.message : "Failed to upload avatar" })
+                                    } finally {
+                                        setIsUploadingAvatar(false)
+                                        if (avatarInputRef.current) avatarInputRef.current.value = ""
+                                    }
+                                }}
+                            />
+                            <Button
+                                size="icon"
+                                variant="secondary"
+                                className="absolute -bottom-2 -right-2 h-8 w-8 rounded-full"
+                                onClick={() => avatarInputRef.current?.click()}
+                                disabled={isUploadingAvatar}
+                            >
+                                {isUploadingAvatar ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
                             </Button>
                         </div>
                         <div className="flex-1">
                             <h2 className="text-2xl font-bold text-card-foreground">{user?.username || "User"}</h2>
                             <p className="text-muted-foreground mt-1">{user?.is_admin ? "Administrator" : "User"}</p>
                             {user?.email && <p className="text-sm text-muted-foreground mt-1">{user.email}</p>}
+                            {user?.avatar_url && (
+                                <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    className="text-destructive mt-2 gap-1 h-7 px-2 text-xs"
+                                    onClick={async () => {
+                                        try {
+                                            await removeAvatar()
+                                            updateUser({ ...user!, avatar_url: null })
+                                            setProfileMessage({ type: "success", text: "Avatar removed" })
+                                        } catch (err) {
+                                            setProfileMessage({ type: "error", text: "Failed to remove avatar" })
+                                        }
+                                    }}
+                                >
+                                    <Trash2 className="h-3 w-3" />
+                                    Remove avatar
+                                </Button>
+                            )}
                         </div>
                     </div>
                 </CardContent>

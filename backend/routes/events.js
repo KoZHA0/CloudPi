@@ -129,14 +129,15 @@ const { computeDriveHmac, verifyDriveHmac } = require('../utils/drive-hmac');
  */
 router.post('/drive-change', (req, res) => {
     // Authenticate via shared secret
-    const secret = process.env.CLOUDPI_UDEV_SECRET;
+    // .trim() handles Windows CRLF in .env (Docker may include \r in values)
+    const secret = (process.env.CLOUDPI_UDEV_SECRET || '').trim();
     if (!secret) {
         console.error('❌ [EVENTS] CLOUDPI_UDEV_SECRET not configured — rejecting drive-change webhook');
         return res.status(500).json({ error: 'Webhook secret not configured' });
     }
 
-    const provided = req.headers['x-udev-secret'];
-    if (!provided || !crypto.timingSafeEqual(Buffer.from(secret), Buffer.from(String(provided)))) {
+    const provided = (req.headers['x-udev-secret'] || '').trim();
+    if (!provided || !crypto.timingSafeEqual(Buffer.from(secret), Buffer.from(provided))) {
         console.warn('⚠️ [SECURITY] Unauthorized drive-change webhook attempt');
         return res.status(403).json({ error: 'Invalid secret' });
     }

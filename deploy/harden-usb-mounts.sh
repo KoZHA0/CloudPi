@@ -64,7 +64,12 @@ if [ "$ACTION" == "mount" ]; then
     mount -o "$OPTIONS" "$DEVICE" "$MOUNT_POINT"
 elif [ "$ACTION" == "umount" ]; then
     umount -l "$MOUNT_POINT" || true
-    rmdir "$MOUNT_POINT" || true
+    # Clean up orphan files that may persist on root after lazy unmount.
+    # These are NOT user files — they are CloudPi metadata that was on the USB.
+    # After umount, the mount point dir reverts to root fs and may retain them.
+    rm -f "$MOUNT_POINT/.cloudpi-id" 2>/dev/null || true
+    rm -rf "$MOUNT_POINT/cloudpi-data" 2>/dev/null || true
+    rmdir "$MOUNT_POINT" 2>/dev/null || true
 fi
 EOF
 chmod +x "$MOUNT_SCRIPT"

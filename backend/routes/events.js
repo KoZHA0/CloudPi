@@ -303,10 +303,20 @@ function isDriveActuallyPresent(drivePath, expectedDriveId) {
     try {
         if (!fs.existsSync(drivePath)) return false;
 
+        // MOUNT POINT CHECK: Compare device IDs of path and parent.
+        // If they have the SAME device ID, this is NOT a real mount point —
+        // it's just a leftover directory on the root filesystem.
+        // A true mount point (USB drive) will have a DIFFERENT device ID.
+        const pathStat = fs.statSync(drivePath);
+        const parentStat = fs.statSync(path.dirname(drivePath));
+        if (pathStat.dev === parentStat.dev) {
+            // Same device = this is just a directory on root, not a mounted drive
+            return false;
+        }
+
         const idFile = path.join(drivePath, '.cloudpi-id');
         if (!fs.existsSync(idFile)) {
             // Path exists but no .cloudpi-id → this is NOT our registered drive
-            // (likely an internal partition at the same mount point)
             return false;
         }
 

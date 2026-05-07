@@ -1000,7 +1000,7 @@ export function FilesContent() {
                                             >
                                                 {file.type === "image" || file.type === "video" ? (
                                                     <div className="w-full h-20 sm:h-24 mb-2 sm:mb-3 rounded overflow-hidden bg-secondary flex items-center justify-center">
-                                                        {brokenThumbnails[file.id] ? (
+                                                        {!accessible || brokenThumbnails[file.id] ? (
                                                             <Icon className={cn("h-10 w-10 sm:h-12 sm:w-12", getFileColor(file.type))} />
                                                         ) : (
                                                             <img
@@ -1040,18 +1040,30 @@ export function FilesContent() {
                                                 <FolderOpen className="h-4 w-4 mr-2" />
                                                 Open
                                             </ContextMenuItem>
-                                            <ContextMenuItem onClick={() => handleDownload(file)}>
+                                            <ContextMenuItem
+                                                onClick={() => accessible && handleDownload(file)}
+                                                disabled={!accessible}
+                                                title={!accessible ? "Drive disconnected" : undefined}
+                                            >
                                                 <Download className="h-4 w-4 mr-2" />
                                                 Download as ZIP
                                             </ContextMenuItem>
                                         </>
                                     ) : (
                                         <>
-                                            <ContextMenuItem onClick={() => openPreview(file)}>
+                                            <ContextMenuItem
+                                                onClick={() => accessible && openPreview(file)}
+                                                disabled={!accessible}
+                                                title={!accessible ? "Drive disconnected" : undefined}
+                                            >
                                                 <Eye className="h-4 w-4 mr-2" />
                                                 Preview
                                             </ContextMenuItem>
-                                            <ContextMenuItem onClick={() => handleDownload(file)}>
+                                            <ContextMenuItem
+                                                onClick={() => accessible && handleDownload(file)}
+                                                disabled={!accessible}
+                                                title={!accessible ? "Drive disconnected" : undefined}
+                                            >
                                                 <Download className="h-4 w-4 mr-2" />
                                                 Download
                                             </ContextMenuItem>
@@ -1125,7 +1137,7 @@ export function FilesContent() {
                                     >
                                         {file.type === "image" || file.type === "video" ? (
                                             <div className="h-9 w-9 rounded overflow-hidden bg-secondary shrink-0 flex items-center justify-center">
-                                                {brokenThumbnails[file.id] ? (
+                                                {!accessible || brokenThumbnails[file.id] ? (
                                                     <Icon className={cn("h-5 w-5", getFileColor(file.type))} />
                                                 ) : (
                                                     <img
@@ -1180,18 +1192,30 @@ export function FilesContent() {
                                                             <FolderOpen className="h-4 w-4 mr-2" />
                                                             Open
                                                         </DropdownMenuItem>
-                                                        <DropdownMenuItem onClick={() => handleDownload(file)}>
+                                                        <DropdownMenuItem
+                                                            onClick={() => accessible && handleDownload(file)}
+                                                            disabled={!accessible}
+                                                            title={!accessible ? "Drive disconnected" : undefined}
+                                                        >
                                                             <Download className="h-4 w-4 mr-2" />
                                                             Download as ZIP
                                                         </DropdownMenuItem>
                                                     </>
                                                 ) : (
                                                     <>
-                                                        <DropdownMenuItem onClick={() => openPreview(file)}>
+                                                        <DropdownMenuItem
+                                                            onClick={() => accessible && openPreview(file)}
+                                                            disabled={!accessible}
+                                                            title={!accessible ? "Drive disconnected" : undefined}
+                                                        >
                                                             <Eye className="h-4 w-4 mr-2" />
                                                             Preview
                                                         </DropdownMenuItem>
-                                                        <DropdownMenuItem onClick={() => handleDownload(file)}>
+                                                        <DropdownMenuItem
+                                                            onClick={() => accessible && handleDownload(file)}
+                                                            disabled={!accessible}
+                                                            title={!accessible ? "Drive disconnected" : undefined}
+                                                        >
                                                             <Download className="h-4 w-4 mr-2" />
                                                             Download
                                                         </DropdownMenuItem>

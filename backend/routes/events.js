@@ -161,7 +161,13 @@ router.post('/drive-change', (req, res) => {
 });
 
 /**
- * Handle drive removal — mark storage source as inaccessible
+ * Handle drive removal — mark storage source as inaccessible.
+ *
+ * IMPORTANT: We verify drive identity, not just path existence.
+ * On some Raspberry Pi setups, an internal partition (e.g. boot)
+ * sits at the same /media/pi/sda1 path.  When the USB is unplugged
+ * the internal partition reappears → fs.existsSync still returns true.
+ * By checking .cloudpi-id we know the *registered* drive is truly gone.
  */
 function handleDriveRemove(drivePath) {
     // Find storage source by path
@@ -275,12 +281,55 @@ function handleDriveAdd(drivePath) {
 
 
 // ============================================
+// IDENTITY-AWARE DRIVE CHECK
+// ============================================
+
+/**
+ * Verify that the drive at `drivePath` actually belongs to the registered
+ * storage source with `expectedDriveId`.
+ *
+ * On Raspberry Pi, an internal partition (boot/root) can auto-mount at
+ * the same /media/pi/sda1 path.  fs.existsSync alone can't distinguish
+ * between the USB drive and this ghost partition.  Checking .cloudpi-id
+ * resolves this: if the file is absent or contains a different drive_id,
+ * the registered drive is NOT actually present.
+ *
+ * @param {string} drivePath - Mount point to check (e.g. /media/pi/sda1)
+ * @param {string} expectedDriveId - The registered storage source UUID
+ * @returns {boolean} True only if the path exists AND .cloudpi-id matches
+ */
+function isDriveActuallyPresent(drivePath, expectedDriveId) {
+    try {
+        if (!fs.existsSync(drivePath)) return false;
+
+        const idFile = path.join(drivePath, '.cloudpi-id');
+        if (!fs.existsSync(idFile)) {
+            // Path exists but no .cloudpi-id → this is NOT our registered drive
+            // (likely an internal partition at the same mount point)
+            return false;
+        }
+
+        const content = fs.readFileSync(idFile, 'utf8');
+        const match = content.match(/drive_id=(.+)/);
+        if (!match) return false;
+
+        return match[1].trim() === expectedDriveId;
+    } catch {
+        return false;
+    }
+}
+
+
+// ============================================
 // STARTUP RECONCILIATION
 // ============================================
 
 /**
  * Called once at module load to sync is_accessible with actual filesystem state.
  * Handles the case where drives were plugged/unplugged while the server was down.
+ *
+ * Uses identity-aware checking (isDriveActuallyPresent) instead of plain
+ * fs.existsSync to handle the ghost partition edge case on Raspberry Pi.
  */
 function reconcileDriveStates() {
     const sources = db.prepare(
@@ -288,12 +337,8 @@ function reconcileDriveStates() {
     ).all();
 
     for (const source of sources) {
-        let accessible = false;
-        try {
-            accessible = fs.existsSync(source.path);
-        } catch (e) {
-            accessible = false;
-        }
+        // Identity-aware check: verify .cloudpi-id matches, not just path exists
+        const accessible = isDriveActuallyPresent(source.path, source.id);
 
         const currentState = db.prepare('SELECT is_accessible FROM storage_sources WHERE id = ?').get(source.id);
         const wasAccessible = currentState?.is_accessible === 1;
@@ -306,8 +351,10 @@ function reconcileDriveStates() {
     }
 }
 
+// Export for use by admin.js storage listing cross-check
+module.exports = router;
+module.exports.isDriveActuallyPresent = isDriveActuallyPresent;
+
 // Run reconciliation on module load
 reconcileDriveStates();
 
-
-module.exports = router;

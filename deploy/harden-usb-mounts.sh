@@ -100,7 +100,6 @@ After=dev-%i.device
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-EnvironmentFile=-/etc/cloudpi/udev-secret
 ExecStart=/usr/local/bin/cloudpi-usbmount mount %i
 ExecStartPost=-/usr/local/bin/cloudpi-drive-notify add %i
 ExecStop=/usr/local/bin/cloudpi-usbmount umount %i

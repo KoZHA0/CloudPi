@@ -369,16 +369,28 @@ export interface FileItem {
     trashed_at?: string;
     is_accessible?: boolean | number;  // from JOIN with storage_sources
     storage_source_id?: string;
+    encrypted_metadata?: string | null;
+    storage_id?: string | null;
+    e2ee_iv?: string | null;
+    is_chunked?: number | boolean;
+    chunk_count?: number;
+    vault_root_id?: number | null;
+    is_secure_vault?: number | boolean;
 }
 
 export interface Breadcrumb {
     id: number;
     name: string;
+    encrypted_metadata?: string | null;
+    is_secure_vault?: number | boolean;
+    vault_root_id?: number | null;
 }
 
 export interface FilesResponse {
     files: FileItem[];
     breadcrumbs: Breadcrumb[];
+    currentFolder?: Breadcrumb | null;
+    currentVault?: Breadcrumb | null;
 }
 
 export interface StorageStats {
@@ -547,6 +559,152 @@ export async function permanentDeleteFile(fileId: number): Promise<{ message: st
     return apiRequest<{ message: string }>(`/files/${fileId}/permanent`, {
         method: 'DELETE',
     });
+}
+
+// ============= SECURE VAULTS =============
+
+export interface VaultEnvelopePayload {
+    salt: string;
+    encrypted_dek: string;
+    dek_iv: string;
+}
+
+export interface VaultMetadata extends VaultEnvelopePayload {
+    id: number;
+    name: string;
+    parent_id: number | null;
+    created_at: string;
+}
+
+export async function createSecureVault(
+    name: string,
+    parentId: number | null,
+    envelope: VaultEnvelopePayload,
+): Promise<{ message: string; folder: FileItem }> {
+    return apiRequest<{ message: string; folder: FileItem }>('/vaults', {
+        method: 'POST',
+        body: JSON.stringify({
+            name,
+            parent_id: parentId,
+            ...envelope,
+        }),
+    });
+}
+
+export async function getVaultMetadata(vaultId: number): Promise<{ vault: VaultMetadata }> {
+    return apiRequest<{ vault: VaultMetadata }>(`/vaults/${vaultId}`);
+}
+
+export async function changeVaultPin(
+    vaultId: number,
+    envelope: VaultEnvelopePayload,
+): Promise<{ message: string }> {
+    return apiRequest<{ message: string }>(`/vaults/${vaultId}/pin`, {
+        method: 'PUT',
+        body: JSON.stringify(envelope),
+    });
+}
+
+export async function createVaultFolder(
+    vaultId: number,
+    parentId: number,
+    encryptedMetadata: string,
+): Promise<{ message: string; folder: FileItem }> {
+    return apiRequest<{ message: string; folder: FileItem }>(`/vaults/${vaultId}/folders`, {
+        method: 'POST',
+        body: JSON.stringify({
+            parent_id: parentId,
+            encrypted_metadata: encryptedMetadata,
+        }),
+    });
+}
+
+export async function renameVaultItem(
+    itemId: number,
+    encryptedMetadata: string,
+): Promise<{ message: string }> {
+    return apiRequest<{ message: string }>(`/vaults/items/${itemId}`, {
+        method: 'PUT',
+        body: JSON.stringify({
+            encrypted_metadata: encryptedMetadata,
+        }),
+    });
+}
+
+export async function initVaultUpload(
+    vaultId: number,
+    payload: {
+        parent_id: number;
+        storage_id: string;
+        encrypted_metadata: string;
+        e2ee_iv: string;
+        chunk_count: number;
+        size: number;
+        mime_type: string;
+    },
+): Promise<{ upload: { id: string; chunk_count: number } }> {
+    return apiRequest<{ upload: { id: string; chunk_count: number } }>(`/vaults/${vaultId}/uploads/init`, {
+        method: 'POST',
+        body: JSON.stringify(payload),
+    });
+}
+
+export async function uploadVaultChunk(uploadId: string, index: number, bytes: Uint8Array): Promise<void> {
+    const token = getToken();
+    const body = new Uint8Array(bytes).buffer;
+    const response = await fetch(`${API_BASE}/vaults/uploads/${uploadId}/chunks/${index}`, {
+        method: 'PUT',
+        headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/octet-stream',
+        },
+        body,
+    });
+
+    if (!response.ok) {
+        let message = 'Secure chunk upload failed';
+        try {
+            const data = JSON.parse(await response.text());
+            message = data.error || message;
+        } catch {
+            // Ignore parse failures
+        }
+        throw new Error(message);
+    }
+}
+
+export async function completeVaultUpload(uploadId: string): Promise<{ message: string; file: FileItem }> {
+    return apiRequest<{ message: string; file: FileItem }>(`/vaults/uploads/${uploadId}/complete`, {
+        method: 'POST',
+    });
+}
+
+export async function abortVaultUpload(uploadId: string): Promise<{ message: string }> {
+    return apiRequest<{ message: string }>(`/vaults/uploads/${uploadId}`, {
+        method: 'DELETE',
+    });
+}
+
+export async function fetchVaultChunk(fileId: number, index: number): Promise<ArrayBuffer> {
+    const token = getToken();
+    const response = await fetch(`${API_BASE}/vaults/files/${fileId}/chunks/${index}`, {
+        headers: {
+            'Authorization': `Bearer ${token}`,
+        },
+    });
+
+    if (!response.ok) {
+        let message = 'Failed to fetch encrypted file chunk';
+        try {
+            const data = JSON.parse(await response.text());
+            message = data.error || message;
+        } catch {
+            // Ignore parse failures
+        }
+        throw new Error(message);
+    }
+
+    return response.arrayBuffer();
 }
 
 // ============= SHARES =============
@@ -819,46 +977,30 @@ export async function scanDrives(): Promise<DrivesScanResponse> {
     return apiRequest<DrivesScanResponse>('/admin/drives');
 }
 
-// ============= DRIVE KEY-WRAPPING (Encryption) =============
+// ============= LUKS LAYER 1 =============
 
-export interface KeyStatus {
-    source_id: string;
-    label: string;
-    has_key_blob: boolean;
-    unlocked: boolean;
-    path_accessible: boolean;
+export interface LuksStatus {
+    status: 'locked' | 'unlocked' | 'mounted' | 'no_device';
+    device: string;
+    mapperDevice: string;
+    mountPoint: string;
 }
 
-export async function getDriveKeyStatus(
-    sourceId: string
-): Promise<KeyStatus> {
-    return apiRequest<KeyStatus>(`/admin/storage/${sourceId}/key-status`);
+export async function getLuksStatus(): Promise<LuksStatus> {
+    return apiRequest<LuksStatus>('/luks/status');
 }
 
-export async function setupDriveKey(
-    sourceId: string,
+export async function unlockLuksDrive(
     passphrase: string
-): Promise<{ message: string; source_id: string; key_blob_path: string; migration_note: string }> {
-    return apiRequest(`/admin/storage/${sourceId}/setup-key`, {
+): Promise<{ message: string; mountPoint: string }> {
+    return apiRequest<{ message: string; mountPoint: string }>('/luks/unlock', {
         method: 'POST',
         body: JSON.stringify({ passphrase }),
     });
 }
 
-export async function unlockDrive(
-    sourceId: string,
-    passphrase: string
-): Promise<{ message: string; source_id: string; locked: boolean }> {
-    return apiRequest(`/admin/storage/${sourceId}/unlock`, {
-        method: 'POST',
-        body: JSON.stringify({ passphrase }),
-    });
-}
-
-export async function lockDrive(
-    sourceId: string
-): Promise<{ message: string; source_id: string; locked: boolean }> {
-    return apiRequest(`/admin/storage/${sourceId}/lock`, {
+export async function lockLuksDrive(): Promise<{ message: string }> {
+    return apiRequest<{ message: string }>('/luks/lock', {
         method: 'POST',
     });
 }

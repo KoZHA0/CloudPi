@@ -4,6 +4,7 @@ import { AuthProvider } from '@/contexts/auth-context'
 import { ThemeProvider } from '@/contexts/theme-context'
 import { UploadProvider } from '@/contexts/upload-context'
 import { DriveStatusProvider } from '@/contexts/drive-status-context'
+import { VaultProvider } from '@/contexts/vault-context'
 import { UploadManager } from '@/components/upload-manager'
 import { DashboardLayout } from '@/components/dashboard-layout'
 import { DashboardPage } from '@/pages/dashboard'
@@ -98,14 +99,16 @@ function App() {
     return (
         <ThemeProvider>
             <AuthProvider>
-                <UploadProvider>
-                    <DriveStatusProvider>
-                        <BrowserRouter>
-                            <AppContent />
-                            <UploadManager />
-                        </BrowserRouter>
-                    </DriveStatusProvider>
-                </UploadProvider>
+                <VaultProvider>
+                    <UploadProvider>
+                        <DriveStatusProvider>
+                            <BrowserRouter>
+                                <AppContent />
+                                <UploadManager />
+                            </BrowserRouter>
+                        </DriveStatusProvider>
+                    </UploadProvider>
+                </VaultProvider>
             </AuthProvider>
         </ThemeProvider>
     )

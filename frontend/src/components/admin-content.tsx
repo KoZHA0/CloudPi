@@ -73,15 +73,14 @@ import {
     disableUser,
     toggleUserRole,
     unlockUser,
-    getDriveKeyStatus,
-    setupDriveKey,
-    unlockDrive,
-    lockDrive,
+    getLuksStatus,
+    unlockLuksDrive,
+    lockLuksDrive,
     type User,
     type StorageSource,
     type DetectedDrive,
     type RegisteredSource,
-    type KeyStatus,
+    type LuksStatus,
 } from "@/lib/api"
 
 export function AdminContent() {
@@ -121,17 +120,14 @@ export function AdminContent() {
     const [editingQuotaUserId, setEditingQuotaUserId] = useState<number | null>(null)
     const [quotaInput, setQuotaInput] = useState("")
 
-    // Drive encryption state
-    const [keyStatuses, setKeyStatuses] = useState<Record<string, KeyStatus>>({})
-    const [encryptionDialogOpen, setEncryptionDialogOpen] = useState(false)
-    const [encryptionAction, setEncryptionAction] = useState<'setup' | 'unlock'>('setup')
-    const [encryptionTargetId, setEncryptionTargetId] = useState<string | null>(null)
-    const [encryptionTargetLabel, setEncryptionTargetLabel] = useState('')
-    const [passphrase, setPassphrase] = useState('')
-    const [passphraseConfirm, setPassphraseConfirm] = useState('')
-    const [showPassphrase, setShowPassphrase] = useState(false)
-    const [isEncrypting, setIsEncrypting] = useState(false)
-    const [encryptionMessage, setEncryptionMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null)
+    // Layer 1 LUKS state
+    const [luksStatus, setLuksStatus] = useState<LuksStatus | null>(null)
+    const [isLuksLoading, setIsLuksLoading] = useState(false)
+    const [luksDialogOpen, setLuksDialogOpen] = useState(false)
+    const [luksPassphrase, setLuksPassphrase] = useState('')
+    const [showLuksPassphrase, setShowLuksPassphrase] = useState(false)
+    const [isLuksSubmitting, setIsLuksSubmitting] = useState(false)
+    const [luksMessage, setLuksMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null)
 
     const loadUsers = async () => {
         try {
@@ -152,6 +148,27 @@ export function AdminContent() {
 
     useEffect(() => {
         loadUsers()
+    }, [])
+
+    const loadLuksLayerStatus = async () => {
+        try {
+            setIsLuksLoading(true)
+            const status = await getLuksStatus()
+            setLuksStatus(status)
+        } catch (err) {
+            setLuksMessage({ type: 'error', text: err instanceof Error ? err.message : 'Failed to load LUKS status' })
+        } finally {
+            setIsLuksLoading(false)
+        }
+    }
+
+    useEffect(() => {
+        loadLuksLayerStatus()
+        const timer = window.setInterval(() => {
+            loadLuksLayerStatus()
+        }, 15000)
+
+        return () => window.clearInterval(timer)
     }, [])
 
     const handleCreateUser = async (e: React.FormEvent) => {
@@ -318,84 +335,45 @@ export function AdminContent() {
         return `${(bytes / (1024 * 1024)).toFixed(0)} MB`
     }
 
-    // ===== Drive Encryption Handlers =====
+    // ===== Layer 1 LUKS Handlers =====
 
-    const loadKeyStatus = async (sourceId: string) => {
-        try {
-            const status = await getDriveKeyStatus(sourceId)
-            setKeyStatuses(prev => ({ ...prev, [sourceId]: status }))
-        } catch {
-            // Silently ignore — drive may not be accessible
-        }
+    const openLuksDialog = () => {
+        setLuksPassphrase('')
+        setShowLuksPassphrase(false)
+        setLuksMessage(null)
+        setLuksDialogOpen(true)
     }
 
-    const loadAllKeyStatuses = async () => {
-        for (const src of storageSources.filter(s => s.type === 'external')) {
-            loadKeyStatus(src.id)
-        }
-    }
-
-    useEffect(() => {
-        if (storageSources.length > 0) {
-            loadAllKeyStatuses()
-        }
-    }, [storageSources])
-
-    const openEncryptionDialog = (sourceId: string, label: string, action: 'setup' | 'unlock') => {
-        setEncryptionTargetId(sourceId)
-        setEncryptionTargetLabel(label)
-        setEncryptionAction(action)
-        setPassphrase('')
-        setPassphraseConfirm('')
-        setShowPassphrase(false)
-        setEncryptionMessage(null)
-        setEncryptionDialogOpen(true)
-    }
-
-    const handleEncryptionSubmit = async (e: React.FormEvent) => {
+    const handleLuksUnlock = async (e: React.FormEvent) => {
         e.preventDefault()
-        if (!encryptionTargetId) return
-        setIsEncrypting(true)
-        setEncryptionMessage(null)
+        if (!luksPassphrase.trim()) return
+
+        setIsLuksSubmitting(true)
+        setLuksMessage(null)
 
         try {
-            if (encryptionAction === 'setup') {
-                if (passphrase !== passphraseConfirm) {
-                    setEncryptionMessage({ type: 'error', text: 'Passphrases do not match' })
-                    setIsEncrypting(false)
-                    return
-                }
-                if (passphrase.length < 12) {
-                    setEncryptionMessage({ type: 'error', text: 'Passphrase must be at least 12 characters' })
-                    setIsEncrypting(false)
-                    return
-                }
-                await setupDriveKey(encryptionTargetId, passphrase)
-                setEncryptionMessage({ type: 'success', text: 'Encryption key created! Drive is now unlocked and ready.' })
-            } else {
-                await unlockDrive(encryptionTargetId, passphrase)
-                setEncryptionMessage({ type: 'success', text: 'Drive unlocked successfully! Files are now accessible.' })
-            }
-            // Refresh key status
-            await loadKeyStatus(encryptionTargetId)
-            setTimeout(() => setEncryptionDialogOpen(false), 2000)
+            const result = await unlockLuksDrive(luksPassphrase)
+            setLuksMessage({ type: 'success', text: result.message })
+            setLuksPassphrase('')
+            await loadLuksLayerStatus()
+            setTimeout(() => setLuksDialogOpen(false), 1200)
         } catch (err) {
-            setEncryptionMessage({
+            setLuksMessage({
                 type: 'error',
-                text: err instanceof Error ? err.message : 'Operation failed'
+                text: err instanceof Error ? err.message : 'Failed to unlock the LUKS drive'
             })
         } finally {
-            setIsEncrypting(false)
+            setIsLuksSubmitting(false)
         }
     }
 
-    const handleLockDrive = async (sourceId: string, label: string) => {
+    const handleLuksLock = async () => {
         try {
-            await lockDrive(sourceId)
-            setDriveMessage({ type: 'success', text: `Drive "${label}" locked. DEK cleared from memory.` })
-            await loadKeyStatus(sourceId)
+            const result = await lockLuksDrive()
+            setLuksMessage({ type: 'success', text: result.message })
+            await loadLuksLayerStatus()
         } catch (err) {
-            setDriveMessage({ type: 'error', text: err instanceof Error ? err.message : 'Failed to lock drive' })
+            setLuksMessage({ type: 'error', text: err instanceof Error ? err.message : 'Failed to lock the LUKS drive' })
         }
     }
 
@@ -917,155 +895,149 @@ export function AdminContent() {
                 </Card>
             )}
 
-            {/* Drive Encryption Manager — Super Admin only */}
-            {currentUser?.id === 1 && storageSources.filter(s => s.type === 'external').length > 0 && (
+            {/* Layer 1 LUKS Manager */}
+            {currentUser?.is_admin && (
                 <Card className="bg-card border-border">
                     <CardHeader>
                         <div>
                             <CardTitle className="flex items-center gap-2">
                                 <ShieldAlert className="h-5 w-5" />
-                                Drive Encryption
+                                Layer 1: LUKS Disk Encryption
                             </CardTitle>
                             <CardDescription>
-                                Protect USB drives with passphrase-based encryption. Files are encrypted with a per-drive key (DEK) wrapped by your passphrase — plug the drive into any CloudPi device and unlock with the same passphrase.
+                                Host-level full-disk encryption for the CloudPi storage device. This replaces the old app-level per-drive encryption model.
                             </CardDescription>
                         </div>
                     </CardHeader>
                     <CardContent className="space-y-3">
-                        {storageSources
-                            .filter(s => s.type === 'external')
-                            .map(source => {
-                                const ks = keyStatuses[source.id]
-                                const hasKey = ks?.has_key_blob ?? false
-                                const isUnlocked = ks?.unlocked ?? false
-                                const isAccessible = source.is_accessible ?? ks?.path_accessible ?? false
+                        {luksMessage && (
+                            <div className={`p-3 rounded-lg flex items-center gap-2 text-sm ${
+                                luksMessage.type === 'success'
+                                    ? 'bg-green-500/10 border border-green-500/50 text-green-400'
+                                    : 'bg-destructive/10 border border-destructive/50 text-destructive'
+                            }`}>
+                                {luksMessage.type === 'success' ? <Check className="h-4 w-4" /> : <X className="h-4 w-4" />}
+                                {luksMessage.text}
+                            </div>
+                        )}
 
-                                return (
-                                    <div
-                                        key={source.id}
-                                        className="p-4 rounded-lg bg-secondary flex flex-col sm:flex-row sm:items-center justify-between gap-3"
-                                    >
-                                        <div className="flex items-center gap-3">
-                                            <div className={`p-2 rounded-lg ${
-                                                !hasKey ? 'bg-amber-500/10' :
-                                                isUnlocked ? 'bg-green-500/10' : 'bg-red-500/10'
-                                            }`}>
-                                                {!hasKey ? (
-                                                    <ShieldOff className="h-5 w-5 text-amber-400" />
-                                                ) : isUnlocked ? (
-                                                    <Unlock className="h-5 w-5 text-green-400" />
-                                                ) : (
-                                                    <Lock className="h-5 w-5 text-red-400" />
-                                                )}
-                                            </div>
-                                            <div>
-                                                <div className="flex items-center gap-2 flex-wrap">
-                                                    <p className="font-medium text-sm">{source.label}</p>
-                                                    {!hasKey && (
-                                                        <Badge variant="outline" className="text-xs border-amber-500/50 text-amber-400">
-                                                            No encryption key
-                                                        </Badge>
-                                                    )}
-                                                    {hasKey && isUnlocked && (
-                                                        <Badge className="bg-green-500/20 text-green-400 text-xs">
-                                                            <Unlock className="h-3 w-3 mr-1" />Unlocked
-                                                        </Badge>
-                                                    )}
-                                                    {hasKey && !isUnlocked && (
-                                                        <Badge variant="outline" className="text-xs border-red-500/50 text-red-400">
-                                                            <Lock className="h-3 w-3 mr-1" />Locked
-                                                        </Badge>
-                                                    )}
-                                                    {!isAccessible && (
-                                                        <Badge variant="outline" className="text-xs border-muted-foreground/50 text-muted-foreground">
-                                                            Offline
-                                                        </Badge>
-                                                    )}
-                                                </div>
-                                                <p className="text-xs text-muted-foreground mt-1">
-                                                    {!hasKey
-                                                        ? 'No key.blob — set up encryption to protect files on this drive'
-                                                        : isUnlocked
-                                                            ? 'DEK is in memory — files can be encrypted/decrypted'
-                                                            : 'Drive is locked — enter passphrase to access encrypted files'
-                                                    }
-                                                </p>
-                                            </div>
-                                        </div>
-                                        <div className="flex items-center gap-2">
-                                            {!hasKey && isAccessible && (
-                                                <Button
-                                                    size="sm"
-                                                    className="gap-1"
-                                                    onClick={() => openEncryptionDialog(source.id, source.label, 'setup')}
-                                                >
-                                                    <KeyRound className="h-3 w-3" />
-                                                    Setup Key
-                                                </Button>
-                                            )}
-                                            {hasKey && !isUnlocked && isAccessible && (
-                                                <Button
-                                                    size="sm"
-                                                    variant="outline"
-                                                    className="gap-1"
-                                                    onClick={() => openEncryptionDialog(source.id, source.label, 'unlock')}
-                                                >
-                                                    <Unlock className="h-3 w-3" />
-                                                    Unlock
-                                                </Button>
-                                            )}
-                                            {hasKey && isUnlocked && (
-                                                <AlertDialog>
-                                                    <AlertDialogTrigger asChild>
-                                                        <Button
-                                                            size="sm"
-                                                            variant="outline"
-                                                            className="gap-1 border-red-500/30 text-red-400 hover:bg-red-500/10"
-                                                        >
-                                                            <Lock className="h-3 w-3" />
-                                                            Lock
-                                                        </Button>
-                                                    </AlertDialogTrigger>
-                                                    <AlertDialogContent>
-                                                        <AlertDialogHeader>
-                                                            <AlertDialogTitle>Lock Drive Encryption</AlertDialogTitle>
-                                                            <AlertDialogDescription>
-                                                                This will clear the encryption key from memory. Encrypted files on <strong>"{source.label}"</strong> will be inaccessible until the drive is unlocked again with the passphrase.
-                                                            </AlertDialogDescription>
-                                                        </AlertDialogHeader>
-                                                        <AlertDialogFooter>
-                                                            <AlertDialogCancel>Cancel</AlertDialogCancel>
-                                                            <AlertDialogAction
-                                                                onClick={() => handleLockDrive(source.id, source.label)}
-                                                                className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-                                                            >
-                                                                Lock Drive
-                                                            </AlertDialogAction>
-                                                        </AlertDialogFooter>
-                                                    </AlertDialogContent>
-                                                </AlertDialog>
-                                            )}
+                        <div className="p-4 rounded-lg bg-secondary flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                            <div className="flex items-start gap-3">
+                                <div className={`p-2 rounded-lg ${
+                                    luksStatus?.status === 'mounted'
+                                        ? 'bg-green-500/10'
+                                        : luksStatus?.status === 'unlocked'
+                                            ? 'bg-amber-500/10'
+                                            : luksStatus?.status === 'locked'
+                                                ? 'bg-red-500/10'
+                                                : 'bg-muted'
+                                }`}>
+                                    {luksStatus?.status === 'mounted' ? (
+                                        <Unlock className="h-5 w-5 text-green-400" />
+                                    ) : luksStatus?.status === 'unlocked' ? (
+                                        <AlertTriangle className="h-5 w-5 text-amber-400" />
+                                    ) : luksStatus?.status === 'locked' ? (
+                                        <Lock className="h-5 w-5 text-red-400" />
+                                    ) : (
+                                        <HardDrive className="h-5 w-5 text-muted-foreground" />
+                                    )}
+                                </div>
+                                <div className="space-y-2">
+                                    <div className="flex items-center gap-2 flex-wrap">
+                                        <p className="font-medium text-sm">CloudPi LUKS Device</p>
+                                        {luksStatus?.status === 'mounted' && (
+                                            <Badge className="bg-green-500/20 text-green-400 text-xs">
+                                                <Unlock className="h-3 w-3 mr-1" />Mounted
+                                            </Badge>
+                                        )}
+                                        {luksStatus?.status === 'unlocked' && (
+                                            <Badge variant="outline" className="text-xs border-amber-500/50 text-amber-400">
+                                                <AlertTriangle className="h-3 w-3 mr-1" />Opened, not mounted
+                                            </Badge>
+                                        )}
+                                        {luksStatus?.status === 'locked' && (
+                                            <Badge variant="outline" className="text-xs border-red-500/50 text-red-400">
+                                                <Lock className="h-3 w-3 mr-1" />Locked
+                                            </Badge>
+                                        )}
+                                        {luksStatus?.status === 'no_device' && (
+                                            <Badge variant="outline" className="text-xs border-muted-foreground/50 text-muted-foreground">
+                                                No device
+                                            </Badge>
+                                        )}
+                                    </div>
+                                    <p className="text-xs text-muted-foreground">
+                                        {luksStatus?.status === 'mounted' && 'The encrypted storage device is unlocked and mounted. Files, metadata, and the database are protected at rest by Layer 1.'}
+                                        {luksStatus?.status === 'unlocked' && 'The LUKS container is open but the filesystem is not mounted yet.'}
+                                        {luksStatus?.status === 'locked' && 'The encrypted drive is present but locked. Admin must provide the LUKS passphrase to mount it.'}
+                                        {luksStatus?.status === 'no_device' && 'No configured LUKS block device is available. This is expected on Windows dev machines or when the Pi storage device is disconnected.'}
+                                        {!luksStatus && 'Loading LUKS status...'}
+                                    </p>
+                                    <div className="text-xs text-muted-foreground space-y-1">
+                                        <p><strong>Device:</strong> {luksStatus?.device || '—'}</p>
+                                        <p><strong>Mapper:</strong> {luksStatus?.mapperDevice || '—'}</p>
+                                        <p><strong>Mount Point:</strong> {luksStatus?.mountPoint || '—'}</p>
+                                    </div>
+                                </div>
+                            </div>
+                            <div className="flex items-center gap-2">
+                                {luksStatus?.status !== 'mounted' && luksStatus?.status !== 'no_device' && (
+                                    <Button size="sm" className="gap-1" onClick={openLuksDialog}>
+                                        <Unlock className="h-3 w-3" />
+                                        Unlock
+                                    </Button>
+                                )}
+                                {luksStatus?.status === 'mounted' && (
+                                    <AlertDialog>
+                                        <AlertDialogTrigger asChild>
                                             <Button
                                                 size="sm"
-                                                variant="ghost"
-                                                className="h-8 w-8 p-0"
-                                                onClick={() => loadKeyStatus(source.id)}
-                                                title="Refresh encryption status"
+                                                variant="outline"
+                                                className="gap-1 border-red-500/30 text-red-400 hover:bg-red-500/10"
                                             >
-                                                <RefreshCw className="h-3 w-3" />
+                                                <Lock className="h-3 w-3" />
+                                                Lock
                                             </Button>
-                                        </div>
-                                    </div>
-                                )
-                            })}
+                                        </AlertDialogTrigger>
+                                        <AlertDialogContent>
+                                            <AlertDialogHeader>
+                                                <AlertDialogTitle>Lock LUKS Storage</AlertDialogTitle>
+                                                <AlertDialogDescription>
+                                                    This will unmount the CloudPi storage filesystem and close the LUKS container. Files and the database on the encrypted disk will be unavailable until an admin unlocks it again.
+                                                </AlertDialogDescription>
+                                            </AlertDialogHeader>
+                                            <AlertDialogFooter>
+                                                <AlertDialogCancel>Cancel</AlertDialogCancel>
+                                                <AlertDialogAction
+                                                    onClick={handleLuksLock}
+                                                    className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                                                >
+                                                    Lock LUKS Device
+                                                </AlertDialogAction>
+                                            </AlertDialogFooter>
+                                        </AlertDialogContent>
+                                    </AlertDialog>
+                                )}
+                                <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    className="h-8 w-8 p-0"
+                                    onClick={loadLuksLayerStatus}
+                                    title="Refresh LUKS status"
+                                    disabled={isLuksLoading}
+                                >
+                                    <RefreshCw className={`h-3 w-3 ${isLuksLoading ? 'animate-spin' : ''}`} />
+                                </Button>
+                            </div>
+                        </div>
 
                         {/* Info box */}
                         <div className="p-3 rounded-lg bg-primary/5 border border-primary/20 text-xs text-muted-foreground space-y-1">
-                            <p className="font-medium text-primary">How drive encryption works</p>
-                            <p>• Each drive gets a unique <strong>Data Encryption Key (DEK)</strong> stored in <code className="bg-secondary px-1 rounded">key.blob</code> on the drive root.</p>
-                            <p>• The DEK is wrapped (encrypted) using your passphrase via <strong>scrypt</strong> — the passphrase is never stored.</p>
-                            <p>• Plug the drive into any CloudPi device, enter the passphrase, and files are accessible.</p>
-                            <p>• After server restart, drives must be unlocked again.</p>
+                            <p className="font-medium text-primary">How Layer 1 works now</p>
+                            <p>• The Raspberry Pi storage device is encrypted at the block-device level with <strong>LUKS</strong>.</p>
+                            <p>• This protects the database, file blobs, salts, logs, and all other server-side data at rest.</p>
+                            <p>• The retired app-level per-drive key workflow has been removed from the Admin interface.</p>
+                            <p>• On Windows development machines, this will usually show <strong>No device</strong> because LUKS only works on the Linux host.</p>
                         </div>
                     </CardContent>
                 </Card>
@@ -1126,46 +1098,39 @@ export function AdminContent() {
                 </DialogContent>
             </Dialog>
 
-            {/* Encryption Passphrase Dialog */}
-            <Dialog open={encryptionDialogOpen} onOpenChange={setEncryptionDialogOpen}>
+            {/* LUKS Unlock Dialog */}
+            <Dialog open={luksDialogOpen} onOpenChange={setLuksDialogOpen}>
                 <DialogContent className="sm:max-w-md">
                     <DialogHeader>
                         <DialogTitle className="flex items-center gap-2">
-                            {encryptionAction === 'setup' ? (
-                                <><KeyRound className="h-5 w-5 text-primary" /> Set Up Drive Encryption</>
-                            ) : (
-                                <><Unlock className="h-5 w-5 text-primary" /> Unlock Drive</>
-                            )}
+                            <Unlock className="h-5 w-5 text-primary" />
+                            Unlock LUKS Drive
                         </DialogTitle>
                         <DialogDescription>
-                            {encryptionAction === 'setup'
-                                ? `Create a passphrase-protected encryption key for "${encryptionTargetLabel}". This passphrase will be needed to access files on any device.`
-                                : `Enter the passphrase to unlock "${encryptionTargetLabel}" and access its encrypted files.`
-                            }
+                            Enter the Raspberry Pi host passphrase to unlock and mount the Layer 1 LUKS storage device.
                         </DialogDescription>
                     </DialogHeader>
-                    <form onSubmit={handleEncryptionSubmit} className="space-y-4 mt-4">
-                        {encryptionMessage && (
+                    <form onSubmit={handleLuksUnlock} className="space-y-4 mt-4">
+                        {luksMessage && (
                             <div className={`p-3 rounded-lg flex items-center gap-2 text-sm ${
-                                encryptionMessage.type === 'success'
+                                luksMessage.type === 'success'
                                     ? 'bg-green-500/10 border border-green-500/50 text-green-400'
                                     : 'bg-destructive/10 border border-destructive/50 text-destructive'
                             }`}>
-                                {encryptionMessage.type === 'success' ? <Check className="h-4 w-4" /> : <X className="h-4 w-4" />}
-                                {encryptionMessage.text}
+                                {luksMessage.type === 'success' ? <Check className="h-4 w-4" /> : <X className="h-4 w-4" />}
+                                {luksMessage.text}
                             </div>
                         )}
                         <div className="space-y-2">
-                            <Label htmlFor="drive-passphrase">Passphrase</Label>
+                            <Label htmlFor="luks-passphrase">LUKS Passphrase</Label>
                             <div className="relative">
                                 <Input
-                                    id="drive-passphrase"
-                                    type={showPassphrase ? 'text' : 'password'}
-                                    placeholder={encryptionAction === 'setup' ? 'Minimum 12 characters' : 'Enter drive passphrase'}
-                                    value={passphrase}
-                                    onChange={(e) => setPassphrase(e.target.value)}
+                                    id="luks-passphrase"
+                                    type={showLuksPassphrase ? 'text' : 'password'}
+                                    placeholder="Enter the disk unlock passphrase"
+                                    value={luksPassphrase}
+                                    onChange={(e) => setLuksPassphrase(e.target.value)}
                                     required
-                                    minLength={encryptionAction === 'setup' ? 12 : 1}
                                     autoFocus
                                 />
                                 <Button
@@ -1173,58 +1138,37 @@ export function AdminContent() {
                                     variant="ghost"
                                     size="icon"
                                     className="absolute right-1 top-1/2 -translate-y-1/2 h-7 w-7"
-                                    onClick={() => setShowPassphrase(!showPassphrase)}
+                                    onClick={() => setShowLuksPassphrase(!showLuksPassphrase)}
                                 >
-                                    {showPassphrase ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                                    {showLuksPassphrase ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
                                 </Button>
                             </div>
-                            {encryptionAction === 'setup' && passphrase.length > 0 && passphrase.length < 12 && (
-                                <p className="text-xs text-destructive">Passphrase must be at least 12 characters ({12 - passphrase.length} more needed)</p>
-                            )}
                         </div>
-                        {encryptionAction === 'setup' && (
-                            <div className="space-y-2">
-                                <Label htmlFor="drive-passphrase-confirm">Confirm Passphrase</Label>
-                                <Input
-                                    id="drive-passphrase-confirm"
-                                    type={showPassphrase ? 'text' : 'password'}
-                                    placeholder="Re-enter passphrase"
-                                    value={passphraseConfirm}
-                                    onChange={(e) => setPassphraseConfirm(e.target.value)}
-                                    required
-                                />
-                                {passphraseConfirm.length > 0 && passphrase !== passphraseConfirm && (
-                                    <p className="text-xs text-destructive">Passphrases do not match</p>
-                                )}
-                            </div>
-                        )}
-                        {encryptionAction === 'setup' && (
-                            <div className="p-3 rounded-lg bg-amber-500/10 border border-amber-500/30 text-xs text-amber-400">
-                                <p className="font-medium flex items-center gap-1 mb-1">
-                                    <AlertTriangle className="h-3 w-3" /> Important
-                                </p>
-                                <p>If you lose this passphrase, encrypted files on this drive will be <strong>permanently unrecoverable</strong>. Store it safely.</p>
-                            </div>
-                        )}
+                        <div className="p-3 rounded-lg bg-amber-500/10 border border-amber-500/30 text-xs text-amber-400">
+                            <p className="font-medium flex items-center gap-1 mb-1">
+                                <AlertTriangle className="h-3 w-3" /> Important
+                            </p>
+                            <p>This is the host-level disk passphrase. On Windows dev machines, unlocking will not work because LUKS requires the Linux Raspberry Pi environment.</p>
+                        </div>
                         <div className="flex justify-end gap-2">
                             <Button
                                 type="button"
                                 variant="outline"
-                                onClick={() => setEncryptionDialogOpen(false)}
+                                onClick={() => setLuksDialogOpen(false)}
                             >
                                 Cancel
                             </Button>
                             <Button
                                 type="submit"
-                                disabled={isEncrypting || (encryptionAction === 'setup' && (passphrase.length < 12 || passphrase !== passphraseConfirm))}
+                                disabled={isLuksSubmitting || !luksPassphrase.trim()}
                             >
-                                {isEncrypting ? (
+                                {isLuksSubmitting ? (
                                     <>
                                         <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                                        {encryptionAction === 'setup' ? 'Setting up...' : 'Unlocking...'}
+                                        Unlocking...
                                     </>
                                 ) : (
-                                    encryptionAction === 'setup' ? 'Create Encryption Key' : 'Unlock Drive'
+                                    'Unlock LUKS Device'
                                 )}
                             </Button>
                         </div>

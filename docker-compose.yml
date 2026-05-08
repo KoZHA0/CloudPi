@@ -43,12 +43,16 @@ services:
       - LUKS_MAPPER_NAME=${LUKS_MAPPER_NAME:-cloudpi-data}
       - LUKS_MOUNT_POINT=${LUKS_MOUNT_POINT:-/media/cloudpi-data}
     volumes:
-      # Persist database (survives container rebuilds)
-      - cloudpi-db:/data
-      # Persist user uploads
-      - cloudpi-uploads:/app/backend/uploads
-      # Persist storage (internal file storage)
-      - cloudpi-storage:/app/backend/storage
+      # Persist database (survives container rebuilds).
+      # Default: named Docker volume.
+      # LUKS mode: set CLOUDPI_DB_MOUNT=/media/cloudpi-data/appdata in project-root .env
+      - ${CLOUDPI_DB_MOUNT:-cloudpi-db}:/data
+      # Persist user uploads / avatars.
+      # LUKS mode: set CLOUDPI_UPLOADS_MOUNT=/media/cloudpi-data/uploads
+      - ${CLOUDPI_UPLOADS_MOUNT:-cloudpi-uploads}:/app/backend/uploads
+      # Persist internal file storage.
+      # LUKS mode: set CLOUDPI_STORAGE_MOUNT=/media/cloudpi-data/storage
+      - ${CLOUDPI_STORAGE_MOUNT:-cloudpi-storage}:/app/backend/storage
       # Access host CPU temperature (Raspberry Pi)
       - /sys/class/thermal:/sys/class/thermal:ro
       # USB drive access — host OS handles mounting via udisks2/usbmount
@@ -116,7 +120,7 @@ services:
       - cloudpi-net
 
 # ── Persistent Volumes ──────────────────────────────────────
-# Docker manages these volumes. Data survives container rebuilds.
+# Docker manages these volumes when no LUKS bind mounts are configured.
 # View: docker volume ls | grep cloudpi
 # Backup: docker run --rm -v cloudpi_cloudpi-uploads:/data -v $(pwd):/bak alpine tar czf /bak/uploads.tar.gz /data
 volumes:

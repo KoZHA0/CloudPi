@@ -23,6 +23,92 @@ db.pragma("foreign_keys = ON");
 db.pragma("journal_mode = WAL");
 db.pragma("synchronous = NORMAL");
 
+const FILES_TABLE_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    path TEXT NOT NULL,
+    type TEXT NOT NULL,
+    size INTEGER DEFAULT 0,
+    mime_type TEXT,
+    parent_id INTEGER,
+    starred INTEGER DEFAULT 0,
+    trashed INTEGER DEFAULT 0,
+    trashed_at DATETIME,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    modified_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    storage_source_id TEXT REFERENCES storage_sources(id),
+    sha256_hash TEXT DEFAULT NULL,
+    encrypted INTEGER DEFAULT 0,
+    storage_id TEXT DEFAULT NULL,
+    encrypted_metadata TEXT DEFAULT NULL,
+    e2ee_iv TEXT DEFAULT NULL,
+    is_chunked INTEGER DEFAULT 0,
+    chunk_count INTEGER DEFAULT 0,
+    vault_root_id INTEGER REFERENCES files(id),
+    is_secure_vault INTEGER DEFAULT 0,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (parent_id) REFERENCES files(id) ON DELETE CASCADE
+  )
+`;
+
+function hasColumn(tableName, columnName) {
+  const columns = db.prepare(`PRAGMA table_info(${tableName})`).all();
+  return columns.some((column) => column.name === columnName);
+}
+
+function syncAutoincrementSequence(tableName) {
+  const row = db.prepare(`SELECT COALESCE(MAX(id), 0) AS maxId FROM ${tableName}`).get();
+  const maxId = row?.maxId || 0;
+  const updated = db.prepare("UPDATE sqlite_sequence SET seq = ? WHERE name = ?").run(maxId, tableName);
+  if (updated.changes === 0) {
+    db.prepare("INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)").run(tableName, maxId);
+  }
+}
+
+function migrateLegacyFilesTable() {
+  if (!hasColumn("files", "key_wrapped")) {
+    return;
+  }
+
+  console.log("🛠️ Migrating files table to remove legacy per-drive encryption metadata...");
+
+  db.pragma("foreign_keys = OFF");
+  try {
+    db.transaction(() => {
+      db.exec(`
+        ALTER TABLE files RENAME TO files_legacy;
+        ${FILES_TABLE_SCHEMA.replace("IF NOT EXISTS ", "")};
+        INSERT INTO files (
+          id, user_id, name, path, type, size, mime_type, parent_id, starred,
+          trashed, trashed_at, created_at, modified_at, storage_source_id,
+          sha256_hash, encrypted, storage_id, encrypted_metadata, e2ee_iv,
+          is_chunked, chunk_count, vault_root_id, is_secure_vault
+        )
+        SELECT
+          id, user_id, name, path, type, size, mime_type, parent_id, starred,
+          trashed, trashed_at, created_at, modified_at, storage_source_id,
+          sha256_hash, encrypted, storage_id, encrypted_metadata, e2ee_iv,
+          is_chunked, chunk_count, vault_root_id, is_secure_vault
+        FROM files_legacy;
+        DROP TABLE files_legacy;
+      `);
+
+      syncAutoincrementSequence("files");
+    })();
+  } finally {
+    db.pragma("foreign_keys = ON");
+  }
+
+  const foreignKeyIssues = db.prepare("PRAGMA foreign_key_check").all();
+  if (foreignKeyIssues.length > 0) {
+    throw new Error(`files table migration failed foreign key check: ${JSON.stringify(foreignKeyIssues[0])}`);
+  }
+
+  console.log("✅ Files table migration complete. Legacy key_wrapped column removed.");
+}
+
 /**
  * USERS TABLE
  * -----------
@@ -139,23 +225,40 @@ db.exec(`
  * - starred: For quick access feature
  * - trashed: Soft delete (moves to trash instead of permanent delete)
  */
+db.exec(FILES_TABLE_SCHEMA);
+
 db.exec(`
-  CREATE TABLE IF NOT EXISTS files (
+  CREATE TABLE IF NOT EXISTS folder_locks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    folder_id INTEGER NOT NULL UNIQUE,
     user_id INTEGER NOT NULL,
-    name TEXT NOT NULL,
-    path TEXT NOT NULL,
-    type TEXT NOT NULL,
-    size INTEGER DEFAULT 0,
-    mime_type TEXT,
-    parent_id INTEGER,
-    starred INTEGER DEFAULT 0,
-    trashed INTEGER DEFAULT 0,
-    trashed_at DATETIME,
+    salt TEXT NOT NULL,
+    encrypted_dek TEXT NOT NULL,
+    dek_iv TEXT NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    modified_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-    FOREIGN KEY (parent_id) REFERENCES files(id) ON DELETE CASCADE
+    FOREIGN KEY (folder_id) REFERENCES files(id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  )
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS vault_upload_sessions (
+    id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    vault_root_id INTEGER NOT NULL,
+    parent_id INTEGER NOT NULL,
+    storage_source_id TEXT NOT NULL,
+    storage_id TEXT NOT NULL,
+    mime_type TEXT,
+    size INTEGER NOT NULL,
+    chunk_count INTEGER NOT NULL,
+    encrypted_metadata TEXT NOT NULL,
+    e2ee_iv TEXT NOT NULL,
+    temp_path TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (vault_root_id) REFERENCES files(id) ON DELETE CASCADE,
+    FOREIGN KEY (parent_id) REFERENCES files(id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   )
 `);
 
@@ -258,7 +361,6 @@ const defaultSettings = [
   ["rate_limit_auth_window", "15", "Auth rate limit window in minutes"],
   ["rate_limit_upload_max", "10", "Max file uploads per 15 minutes per IP"],
   ["rate_limit_upload_window", "15", "Upload rate limit window in minutes"],
-  ["encryption_enabled", "1", "Enable AES-256-GCM file encryption at rest (1 = on, 0 = off)"],
   ["password_min_length", "8", "Minimum password length"],
   ["account_lockout_attempts", "5", "Failed login attempts before account lockout"],
   ["account_lockout_duration", "15", "Account lockout duration in minutes"],
@@ -275,6 +377,8 @@ const insertSetting = db.prepare(
 for (const [key, value, desc] of defaultSettings) {
   insertSetting.run(key, value, desc);
 }
+
+db.prepare("DELETE FROM settings WHERE key = ?").run("encryption_enabled");
 
 // Seed internal storage source (the existing backend/storage/ directory)
 const internalStoragePath = path.join(__dirname, "..", "storage");
@@ -318,21 +422,56 @@ try {
   // Column already exists, ignore
 }
 
-// Add encrypted flag to track which files are encrypted at rest
+// Add encrypted flag for client-side vault ciphertext records
 try {
   db.exec(`ALTER TABLE files ADD COLUMN encrypted INTEGER DEFAULT 0`);
 } catch (e) {
   // Column already exists, ignore
 }
 
-// Add key_wrapped flag to distinguish per-drive DEK encryption from master-key encryption.
-// 0 = encrypted with the server-side master key (CLOUDPI_ENCRYPTION_KEY in .env)
-// 1 = encrypted with a per-drive DEK (wrapped in key.blob via key-wrap.js)
 try {
-  db.exec(`ALTER TABLE files ADD COLUMN key_wrapped INTEGER DEFAULT 0`);
+  db.exec(`ALTER TABLE files ADD COLUMN storage_id TEXT DEFAULT NULL`);
 } catch (e) {
   // Column already exists, ignore
 }
+
+try {
+  db.exec(`ALTER TABLE files ADD COLUMN encrypted_metadata TEXT DEFAULT NULL`);
+} catch (e) {
+  // Column already exists, ignore
+}
+
+try {
+  db.exec(`ALTER TABLE files ADD COLUMN e2ee_iv TEXT DEFAULT NULL`);
+} catch (e) {
+  // Column already exists, ignore
+}
+
+try {
+  db.exec(`ALTER TABLE files ADD COLUMN is_chunked INTEGER DEFAULT 0`);
+} catch (e) {
+  // Column already exists, ignore
+}
+
+try {
+  db.exec(`ALTER TABLE files ADD COLUMN chunk_count INTEGER DEFAULT 0`);
+} catch (e) {
+  // Column already exists, ignore
+}
+
+try {
+  db.exec(`ALTER TABLE files ADD COLUMN vault_root_id INTEGER REFERENCES files(id)`);
+} catch (e) {
+  // Column already exists, ignore
+}
+
+try {
+  db.exec(`ALTER TABLE files ADD COLUMN is_secure_vault INTEGER DEFAULT 0`);
+} catch (e) {
+  // Column already exists, ignore
+}
+
+migrateLegacyFilesTable();
 
 // Export the database connection so other files can use it
 module.exports = db;

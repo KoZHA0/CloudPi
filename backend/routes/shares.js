@@ -128,6 +128,10 @@ router.get('/file/:fileId/access', requireAuth, (req, res) => {
             return res.status(404).json({ error: 'File not found' });
         }
 
+        if (file.is_secure_vault === 1 || file.vault_root_id !== null) {
+            return res.status(400).json({ error: 'Encrypted vault items cannot be shared yet' });
+        }
+
         const accessList = db.prepare(`
             SELECT s.id, s.file_id, s.shared_with, s.permission, s.created_at, s.share_link,
                    u.username as shared_with_name
@@ -311,6 +315,10 @@ router.get('/shared-folder/:shareId/download/:fileId', requireAuth, async (req, 
             return res.status(404).json({ error: 'File not found' });
         }
 
+        if (file.is_secure_vault === 1 || file.vault_root_id !== null) {
+            return res.status(400).json({ error: 'Encrypted vault items cannot be downloaded through shares' });
+        }
+
         // Verify the file is inside the shared folder (walk up)
         if (String(file.id) !== String(share.file_id)) {
             let currentId = file.parent_id;
@@ -440,6 +448,10 @@ router.get('/shared-folder/:shareId/preview/:fileId', requireAuth, async (req, r
             return res.status(404).json({ error: 'File not found' });
         }
 
+        if (file.is_secure_vault === 1 || file.vault_root_id !== null) {
+            return res.status(400).json({ error: 'Encrypted vault items cannot be previewed through shares' });
+        }
+
         // Verify scope
         let currentId = file.parent_id;
         let isDescendant = String(file.id) === String(share.file_id);
@@ -509,6 +521,10 @@ router.post('/', requireAuth, (req, res) => {
 
         if (!file) {
             return res.status(404).json({ error: 'File not found' });
+        }
+
+        if (file.is_secure_vault === 1 || file.vault_root_id !== null) {
+            return res.status(400).json({ error: 'Encrypted vault items cannot be shared yet' });
         }
 
         // Verify target user exists
@@ -587,7 +603,7 @@ router.get('/public/:link', (req, res) => {
 
         const share = db.prepare(`
             SELECT s.permission, s.created_at,
-                   f.name, f.type, f.size, f.mime_type,
+                   f.name, f.type, f.size, f.mime_type, f.is_secure_vault, f.vault_root_id,
                    u.username as shared_by
             FROM shares s
             JOIN files f ON s.file_id = f.id
@@ -597,6 +613,10 @@ router.get('/public/:link', (req, res) => {
 
         if (!share) {
             return res.status(404).json({ error: 'Share link not found' });
+        }
+
+        if (share.is_secure_vault === 1 || share.vault_root_id !== null) {
+            return res.status(400).json({ error: 'Encrypted vault items cannot be shared publicly' });
         }
 
         res.json({
@@ -626,7 +646,8 @@ router.get('/public/:link/download', async (req, res) => {
 
         const share = db.prepare(`
             SELECT s.*, f.name as file_name, f.type as file_type, 
-                   f.path as file_path, f.mime_type, f.encrypted, f.storage_source_id, f.user_id, s.shared_by
+                   f.path as file_path, f.mime_type, f.encrypted, f.storage_source_id, f.user_id,
+                   f.is_secure_vault, f.vault_root_id, s.shared_by
             FROM shares s
             JOIN files f ON s.file_id = f.id
             WHERE s.share_link = ? AND f.type != 'folder' AND f.trashed = 0
@@ -634,6 +655,10 @@ router.get('/public/:link/download', async (req, res) => {
 
         if (!share) {
             return res.status(404).json({ error: 'Share link not found' });
+        }
+
+        if (share.is_secure_vault === 1 || share.vault_root_id !== null) {
+            return res.status(400).json({ error: 'Encrypted vault items cannot be downloaded publicly' });
         }
 
         const filePath = resolveSharedFilePath({
@@ -665,7 +690,8 @@ router.get('/public/:link/preview', async (req, res) => {
 
         const share = db.prepare(`
             SELECT s.*, f.name as file_name, f.type as file_type, 
-                   f.path as file_path, f.mime_type, f.encrypted, f.storage_source_id, f.user_id, s.shared_by
+                   f.path as file_path, f.mime_type, f.encrypted, f.storage_source_id, f.user_id,
+                   f.is_secure_vault, f.vault_root_id, s.shared_by
             FROM shares s
             JOIN files f ON s.file_id = f.id
             WHERE s.share_link = ? AND f.type != 'folder' AND f.trashed = 0
@@ -673,6 +699,10 @@ router.get('/public/:link/preview', async (req, res) => {
 
         if (!share) {
             return res.status(404).json({ error: 'Shared file not found' });
+        }
+
+        if (share.is_secure_vault === 1 || share.vault_root_id !== null) {
+            return res.status(400).json({ error: 'Encrypted vault items cannot be previewed publicly' });
         }
 
         const filePath = resolveSharedFilePath({

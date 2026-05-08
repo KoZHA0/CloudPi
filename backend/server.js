@@ -168,6 +168,10 @@ app.use('/api/admin', adminRoutes);
 const fileRoutes = require('./routes/files');
 app.use('/api/files', fileRoutes);
 
+// Secure vault routes (client-side E2EE metadata + chunked ciphertext storage)
+const vaultRoutes = require('./routes/vaults');
+app.use('/api/vaults', vaultRoutes);
+
 // Share routes (share links, public access)
 const shareRoutes = require('./routes/shares');
 app.use('/api/shares', shareRoutes);

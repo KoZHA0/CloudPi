@@ -523,7 +523,6 @@ router.put('/settings', requireAdmin, (req, res) => {
             'rate_limit_api_max', 'rate_limit_api_window',
             'rate_limit_auth_max', 'rate_limit_auth_window',
             'rate_limit_upload_max', 'rate_limit_upload_window',
-            'encryption_enabled',
             'password_min_length',
             'account_lockout_attempts', 'account_lockout_duration',
         ];

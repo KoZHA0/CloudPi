@@ -35,6 +35,7 @@ const { v4: uuidv4 } = require('uuid');
 const db = require('../database/db');
 const { JWT_SECRET, SALT_ROUNDS } = require('../utils/auth-config');
 const { sendEmail } = require('../utils/mailer');
+const { isInternalStorageAccessible, syncInternalStorageState } = require('../utils/storage-status');
 
 const router = express.Router();
 const LUKS_MOUNT_POINT = path.resolve(process.env.LUKS_MOUNT_POINT || '/media/cloudpi-data');
@@ -44,6 +45,69 @@ function isReservedLuksStoragePath(candidatePath) {
     const normalizedCandidate = path.resolve(candidatePath);
     return normalizedCandidate === LUKS_MOUNT_POINT
         || normalizedCandidate.startsWith(`${LUKS_MOUNT_POINT}${path.sep}`);
+}
+
+function getMountSourceForPath(targetPath) {
+    try {
+        const normalizedTarget = path.resolve(targetPath);
+        const mountInfo = fs.readFileSync('/proc/self/mountinfo', 'utf8');
+        const lines = mountInfo.trim().split('\n');
+        let bestMatch = null;
+
+        for (const line of lines) {
+            const parts = line.split(' - ');
+            if (parts.length !== 2) continue;
+
+            const left = parts[0].split(' ');
+            const right = parts[1].split(' ');
+            if (left.length < 5 || right.length < 2) continue;
+
+            const mountPoint = left[4].replace(/\\040/g, ' ');
+            const source = right[1];
+
+            if (normalizedTarget === mountPoint || normalizedTarget.startsWith(`${mountPoint}/`)) {
+                if (!bestMatch || mountPoint.length > bestMatch.mountPoint.length) {
+                    bestMatch = { mountPoint, source };
+                }
+            }
+        }
+
+        return bestMatch?.source || null;
+    } catch {
+        return null;
+    }
+}
+
+function getParentBlockDeviceName(deviceName) {
+    if (!deviceName) return null;
+    if (/^nvme\d+n\d+p\d+$/.test(deviceName)) return deviceName.replace(/p\d+$/, '');
+    if (/^mmcblk\d+p\d+$/.test(deviceName)) return deviceName.replace(/p\d+$/, '');
+    if (/^[a-z]+[0-9]+$/.test(deviceName)) return deviceName.replace(/[0-9]+$/, '');
+    return deviceName;
+}
+
+function isUsbRemovableDrivePath(drivePath) {
+    try {
+        const source = getMountSourceForPath(drivePath);
+        if (!source || !source.startsWith('/dev/')) return false;
+
+        const deviceName = path.basename(source);
+        const parentDeviceName = getParentBlockDeviceName(deviceName);
+        if (!parentDeviceName) return false;
+
+        const removablePath = `/sys/class/block/${parentDeviceName}/removable`;
+        const deviceRealPath = fs.realpathSync(`/sys/class/block/${parentDeviceName}/device`);
+
+        const removable = fs.existsSync(removablePath)
+            ? fs.readFileSync(removablePath, 'utf8').trim() === '1'
+            : false;
+
+        const isUsb = deviceRealPath.includes('/usb');
+
+        return removable && isUsb;
+    } catch {
+        return false;
+    }
 }
 
 // HMAC helpers for .cloudpi-id integrity (shared utility)
@@ -676,6 +740,8 @@ router.post('/settings/test-smtp', requireAdmin, async (req, res) => {
  */
 router.get('/storage', requireAdmin, (req, res) => {
     try {
+        syncInternalStorageState({ emitOnChange: false });
+
         const sources = db.prepare(`
             SELECT s.*,
                    COALESCE(SUM(f.size), 0) as used_bytes,
@@ -694,7 +760,9 @@ router.get('/storage', requireAdmin, (req, res) => {
             // Primary source: the is_accessible column (updated by udev events)
             // Cross-check: verify filesystem agrees with DB state
             let is_accessible = !!source.is_accessible;
-            if (source.type !== 'internal') {
+            if (source.type === 'internal') {
+                is_accessible = isInternalStorageAccessible();
+            } else {
                 try {
                     // Identity-aware: check .cloudpi-id matches, not just path exists
                     const fsAccessible = isDriveActuallyPresent(source.path, source.id);
@@ -714,7 +782,7 @@ router.get('/storage', requireAdmin, (req, res) => {
             // Get total disk space if accessible
             let total_bytes = source.total_bytes;
             let free_bytes = 0;
-            if (is_accessible && source.type !== 'internal') {
+            if (is_accessible) {
                 try {
                     const stats = fs.statfsSync(source.path);
                     total_bytes = stats.bsize * stats.blocks;
@@ -1039,6 +1107,7 @@ router.get('/drives', requireAdmin, async (req, res) => {
 
             const drivePath = path.join(EXTERNAL_DRIVES_PATH, entry.name);
             if (isReservedLuksStoragePath(drivePath)) continue;
+            if (!isUsbRemovableDrivePath(drivePath)) continue;
 
             // Check if registered in our DB
             let isRegistered = false;

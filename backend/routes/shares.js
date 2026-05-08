@@ -22,6 +22,7 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const db = require('../database/db');
 const { JWT_SECRET } = require('../utils/auth-config');
+const { ensureProtectedInternalStorageAvailable } = require('../utils/protected-storage');
 
 const router = express.Router();
 
@@ -34,6 +35,7 @@ function resolveSharedFilePath(file) {
             return path.join(source.path, 'cloudpi-data', String(file.user_id), file.path);
         }
     }
+    ensureProtectedInternalStorageAvailable();
     return path.join(STORAGE_DIR, String(file.user_id), file.path);
 }
 

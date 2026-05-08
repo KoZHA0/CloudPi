@@ -5,6 +5,7 @@ const jwt = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
 const db = require('../database/db');
 const { JWT_SECRET } = require('../utils/auth-config');
+const { ensureProtectedInternalStorageAvailable } = require('../utils/protected-storage');
 
 const router = express.Router();
 
@@ -56,14 +57,38 @@ function normalizeParentId(parentId) {
     return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
 }
 
-function getStorageBasePath(storageSourceId, userId) {
-    if (!storageSourceId || storageSourceId === 'internal') {
-        return path.join(DEFAULT_STORAGE_DIR, String(userId));
+function getInternalStorageBasePath(userId) {
+    ensureProtectedInternalStorageAvailable();
+    return path.join(DEFAULT_STORAGE_DIR, String(userId));
+}
+
+function isExternalStorageUsable(storageSourceId, source, userId) {
+    if (!source || !source.is_active || !source.is_accessible) {
+        return false;
     }
 
-    const source = db.prepare('SELECT path, is_active FROM storage_sources WHERE id = ?').get(storageSourceId);
-    if (!source || !source.is_active) {
-        return path.join(DEFAULT_STORAGE_DIR, String(userId));
+    try {
+        const { isDriveActuallyPresent } = require('./events');
+        const present = isDriveActuallyPresent(source.path, storageSourceId);
+        if (!present) {
+            db.prepare('UPDATE storage_sources SET is_accessible = 0 WHERE id = ?').run(storageSourceId);
+            console.warn(`[VAULT] User ${userId} assigned to drive "${source.label || storageSourceId}" at ${source.path}, but it is not actually mounted. Falling back to internal storage.`);
+        }
+        return present;
+    } catch (error) {
+        console.warn(`[VAULT] Could not verify drive "${source.label || storageSourceId}" for user ${userId}: ${error.message}. Falling back to internal storage.`);
+        return false;
+    }
+}
+
+function getStorageBasePath(storageSourceId, userId) {
+    if (!storageSourceId || storageSourceId === 'internal') {
+        return getInternalStorageBasePath(userId);
+    }
+
+    const source = db.prepare('SELECT path, label, is_active, is_accessible FROM storage_sources WHERE id = ?').get(storageSourceId);
+    if (!isExternalStorageUsable(storageSourceId, source, userId)) {
+        return getInternalStorageBasePath(userId);
     }
 
     return path.join(source.path, 'cloudpi-data', String(userId));
@@ -73,9 +98,14 @@ function getUserStorageId(userId) {
     const user = db.prepare('SELECT default_storage_id FROM users WHERE id = ?').get(userId);
     const storageId = (user && user.default_storage_id) || 'internal';
 
+    if (storageId === 'internal') {
+        ensureProtectedInternalStorageAvailable();
+    }
+
     if (storageId !== 'internal') {
-        const source = db.prepare('SELECT path, is_active, is_accessible FROM storage_sources WHERE id = ?').get(storageId);
-        if (!source || !source.is_active || !source.is_accessible) {
+        const source = db.prepare('SELECT path, label, is_active, is_accessible FROM storage_sources WHERE id = ?').get(storageId);
+        if (!isExternalStorageUsable(storageId, source, userId)) {
+            ensureProtectedInternalStorageAvailable();
             return 'internal';
         }
     }
@@ -148,7 +178,54 @@ function removePathRecursive(targetPath) {
     fs.rmSync(targetPath, { recursive: true, force: true });
 }
 
-router.post('/', requireAuth, (req, res) => {
+function isVaultTempPath(targetPath) {
+    if (!targetPath) return false;
+    return targetPath.includes(`/${SECURE_UPLOAD_TEMP_ROOT}/`)
+        || targetPath.includes(`\\${SECURE_UPLOAD_TEMP_ROOT}\\`);
+}
+
+function cleanupStaleVaultUploadSessions(maxAgeHours = 24) {
+    try {
+        const staleSessions = db.prepare(
+            "SELECT id, temp_path FROM vault_upload_sessions WHERE created_at < datetime('now', ?)"
+        ).all(`-${maxAgeHours} hours`);
+
+        for (const session of staleSessions) {
+            if (isVaultTempPath(session.temp_path)) {
+                removePathRecursive(session.temp_path);
+            } else {
+                console.warn(`[VAULT] Refusing to remove stale upload path outside ${SECURE_UPLOAD_TEMP_ROOT}: ${session.temp_path}`);
+            }
+        }
+
+        if (staleSessions.length > 0) {
+            db.prepare("DELETE FROM vault_upload_sessions WHERE created_at < datetime('now', ?)").run(`-${maxAgeHours} hours`);
+            console.log(`[VAULT] Cleaned ${staleSessions.length} stale secure upload session(s).`);
+        }
+    } catch (error) {
+        console.error('[VAULT] Stale upload cleanup failed:', error.message);
+    }
+}
+
+function requireProtectedVaultStorage(req, res, next) {
+    try {
+        ensureProtectedInternalStorageAvailable();
+        next();
+    } catch (error) {
+        if (error.code === 'LUKS_STORAGE_UNAVAILABLE') {
+            return res.status(503).json({ error: error.message });
+        }
+        console.error('Vault protected storage gate error:', error);
+        return res.status(500).json({ error: 'Server error' });
+    }
+}
+
+cleanupStaleVaultUploadSessions();
+
+router.use(requireAuth);
+router.use(requireProtectedVaultStorage);
+
+router.post('/', (req, res) => {
     try {
         const userId = req.user.userId;
         const parentId = normalizeParentId(req.body.parent_id);
@@ -212,7 +289,7 @@ router.post('/', requireAuth, (req, res) => {
     }
 });
 
-router.get('/:id', requireAuth, (req, res) => {
+router.get('/:id', (req, res) => {
     try {
         const vault = loadVault(req.user.userId, Number(req.params.id));
         if (!vault) {
@@ -236,7 +313,7 @@ router.get('/:id', requireAuth, (req, res) => {
     }
 });
 
-router.put('/:id/pin', requireAuth, (req, res) => {
+router.put('/:id/pin', (req, res) => {
     try {
         const userId = req.user.userId;
         const vaultId = Number(req.params.id);
@@ -261,7 +338,7 @@ router.put('/:id/pin', requireAuth, (req, res) => {
     }
 });
 
-router.post('/:vaultId/folders', requireAuth, (req, res) => {
+router.post('/:vaultId/folders', (req, res) => {
     try {
         const userId = req.user.userId;
         const vaultId = Number(req.params.vaultId);
@@ -307,7 +384,7 @@ router.post('/:vaultId/folders', requireAuth, (req, res) => {
     }
 });
 
-router.put('/items/:id', requireAuth, (req, res) => {
+router.put('/items/:id', (req, res) => {
     try {
         const userId = req.user.userId;
         const itemId = Number(req.params.id);
@@ -332,7 +409,7 @@ router.put('/items/:id', requireAuth, (req, res) => {
     }
 });
 
-router.post('/:vaultId/uploads/init', requireAuth, (req, res) => {
+router.post('/:vaultId/uploads/init', (req, res) => {
     try {
         const userId = req.user.userId;
         const vaultId = Number(req.params.vaultId);
@@ -408,7 +485,6 @@ router.post('/:vaultId/uploads/init', requireAuth, (req, res) => {
 
 router.put(
     '/uploads/:uploadId/chunks/:index',
-    requireAuth,
     express.raw({ type: 'application/octet-stream', limit: `${MAX_CHUNK_UPLOAD_BYTES}b` }),
     (req, res) => {
         try {
@@ -440,7 +516,7 @@ router.put(
     },
 );
 
-router.post('/uploads/:uploadId/complete', requireAuth, (req, res) => {
+router.post('/uploads/:uploadId/complete', (req, res) => {
     try {
         const userId = req.user.userId;
         const uploadId = String(req.params.uploadId);
@@ -498,7 +574,7 @@ router.post('/uploads/:uploadId/complete', requireAuth, (req, res) => {
     }
 });
 
-router.delete('/uploads/:uploadId', requireAuth, (req, res) => {
+router.delete('/uploads/:uploadId', (req, res) => {
     try {
         const userId = req.user.userId;
         const uploadId = String(req.params.uploadId);
@@ -518,7 +594,7 @@ router.delete('/uploads/:uploadId', requireAuth, (req, res) => {
     }
 });
 
-router.get('/files/:id/chunks/:index', requireAuth, (req, res) => {
+router.get('/files/:id/chunks/:index', (req, res) => {
     try {
         const userId = req.user.userId;
         const fileId = Number(req.params.id);

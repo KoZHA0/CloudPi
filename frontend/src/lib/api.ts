@@ -1020,11 +1020,11 @@ export interface SSEConnectedEvent {
 }
 
 /**
- * Create an EventSource connection for real-time drive status updates.
+ * Create an EventSource connection for real-time storage status updates.
  * Uses SSE (Server-Sent Events) — no polling needed.
  *
- * @param onStatusChange - Called when a drive's status changes
- * @param onConnected - Called with initial drive states on connection
+ * @param onStatusChange - Called when a storage source status changes
+ * @param onConnected - Called with initial storage source states on connection
  * @returns cleanup function to close the connection
  */
 export function subscribeToDriveEvents(

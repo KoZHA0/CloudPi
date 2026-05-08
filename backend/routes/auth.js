@@ -22,6 +22,7 @@ const { JWT_SECRET, SALT_ROUNDS } = require('../utils/auth-config');
 const { sendEmail } = require('../utils/mailer');
 const { generateSecret, generateURI, verify } = require('otplib');
 const qrcode = require('qrcode');
+const { ensureProtectedInternalStorageAvailable } = require('../utils/protected-storage');
 
 const router = express.Router();
 
@@ -972,12 +973,23 @@ const path = require('path');
 const fs = require('fs');
 
 const AVATAR_DIR = path.join(__dirname, '..', 'uploads', 'avatars');
-if (!fs.existsSync(AVATAR_DIR)) {
-    fs.mkdirSync(AVATAR_DIR, { recursive: true });
+
+function ensureAvatarDir() {
+    ensureProtectedInternalStorageAvailable();
+    if (!fs.existsSync(AVATAR_DIR)) {
+        fs.mkdirSync(AVATAR_DIR, { recursive: true });
+    }
 }
 
 const avatarStorage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, AVATAR_DIR),
+    destination: (req, file, cb) => {
+        try {
+            ensureAvatarDir();
+            cb(null, AVATAR_DIR);
+        } catch (error) {
+            cb(error);
+        }
+    },
     filename: (req, file, cb) => {
         const ext = path.extname(file.originalname).toLowerCase();
         cb(null, `avatar-${req.user.userId}-${Date.now()}${ext}`);
@@ -1002,6 +1014,7 @@ const avatarUpload = multer({
  */
 router.post('/avatar', requireAuth, avatarUpload.single('avatar'), (req, res) => {
     try {
+        ensureAvatarDir();
         if (!req.file) {
             return res.status(400).json({ error: 'No file uploaded' });
         }
@@ -1036,6 +1049,7 @@ router.post('/avatar', requireAuth, avatarUpload.single('avatar'), (req, res) =>
  */
 router.delete('/avatar', requireAuth, (req, res) => {
     try {
+        ensureAvatarDir();
         const userId = req.user.userId;
         const existing = db.prepare('SELECT avatar_url FROM users WHERE id = ?').get(userId);
 
@@ -1059,6 +1073,7 @@ router.delete('/avatar', requireAuth, (req, res) => {
  * Serve avatar image (public within authenticated context)
  */
 router.get('/avatar/:filename', (req, res) => {
+    ensureAvatarDir();
     const filePath = path.join(AVATAR_DIR, path.basename(req.params.filename));
     if (!fs.existsSync(filePath)) {
         return res.status(404).json({ error: 'Avatar not found' });

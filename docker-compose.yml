@@ -41,9 +41,10 @@ services:
       # via the host OS (via a privileged sudoers-wrapped helper or host scripts).
       # If you manage LUKS unlocking purely at host level before Docker starts,
       # only LUKS_MOUNT_POINT is strictly needed here.
-      - LUKS_DEVICE=${LUKS_DEVICE:-/dev/sda1}
+      - LUKS_DEVICE=${LUKS_DEVICE:-UNSET_RUN_LUKS_SETUP}
       - LUKS_MAPPER_NAME=${LUKS_MAPPER_NAME:-cloudpi-data}
       - LUKS_MOUNT_POINT=${LUKS_MOUNT_POINT:-/media/cloudpi-data}
+      - CLOUDPI_INTERNAL_STORAGE_REQUIRES_LUKS=${CLOUDPI_INTERNAL_STORAGE_REQUIRES_LUKS:-1}
     volumes:
       # Persist database (survives container rebuilds).
       # Default: named Docker volume.

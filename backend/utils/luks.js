@@ -41,7 +41,7 @@ const { execFile } = require('child_process');
 const fs           = require('fs');
 
 // ── Configuration (read from environment, with safe defaults) ─────────────────
-const LUKS_DEVICE      = process.env.LUKS_DEVICE      || '/dev/sda1';
+const LUKS_DEVICE      = process.env.LUKS_DEVICE      || 'UNSET_RUN_LUKS_SETUP';
 const MAPPER_NAME      = process.env.LUKS_MAPPER_NAME || 'cloudpi-data';
 const MOUNT_POINT      = process.env.LUKS_MOUNT_POINT || '/media/cloudpi-data';
 const MAPPER_DEVICE    = `/dev/mapper/${MAPPER_NAME}`;
@@ -63,7 +63,7 @@ function run(cmd, args = []) {
     execFile(cmd, args, { timeout: 30_000 }, (err, stdout, stderr) => {
       if (err) {
         const message = stderr.trim() || err.message;
-        return reject(new Error(`[luks] ${cmd} ${args.join(' ')}: ${message}`));
+        return reject(new Error(`[luks] ${cmd} failed: ${message}`));
       }
       resolve({ stdout: stdout.trim(), stderr: stderr.trim() });
     });

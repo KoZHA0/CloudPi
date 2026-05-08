@@ -34,6 +34,7 @@ const archiver = require('archiver');
 const { spawn } = require('child_process');
 const { computeFileHash, verifyFileHash } = require('../utils/crypto-utils');
 const { JWT_SECRET } = require('../utils/auth-config');
+const { ensureProtectedInternalStorageAvailable } = require('../utils/protected-storage');
 
 const router = express.Router();
 
@@ -73,6 +74,7 @@ if (!fs.existsSync(THUMBNAILS_DIR)) {
  */
 function getStorageBasePath(storageSourceId, userId) {
     if (!storageSourceId || storageSourceId === 'internal') {
+        ensureProtectedInternalStorageAvailable();
         return path.join(DEFAULT_STORAGE_DIR, String(userId));
     }
     const source = db.prepare('SELECT path, is_active FROM storage_sources WHERE id = ?').get(storageSourceId);
@@ -143,6 +145,10 @@ function getUserStorageId(userId) {
     const user = db.prepare('SELECT default_storage_id FROM users WHERE id = ?').get(userId);
     const storageId = (user && user.default_storage_id) || 'internal';
 
+    if (storageId === 'internal') {
+        ensureProtectedInternalStorageAvailable();
+    }
+
     if (storageId !== 'internal') {
         const source = db.prepare('SELECT path, is_active, is_accessible, label FROM storage_sources WHERE id = ?').get(storageId);
         if (!source || !source.is_active || !source.is_accessible) {
@@ -182,6 +188,7 @@ const multerStorage = multer.diskStorage({
             if (!source || !source.is_active || !isDriveActuallyPresent(source.path, source.id)) {
                 // Fallback to internal if external drive unavailable
                 req._storageSourceId = 'internal';
+                ensureProtectedInternalStorageAvailable();
                 const userDir = path.join(DEFAULT_STORAGE_DIR, String(userId));
                 if (!fs.existsSync(userDir)) fs.mkdirSync(userDir, { recursive: true });
                 return cb(null, userDir);
@@ -539,10 +546,12 @@ router.get('/', requireAuth, (req, res) => {
         // Uses the is_accessible column (updated by udev events) instead of polling fs.existsSync
         const userRow = db.prepare('SELECT default_storage_id FROM users WHERE id = ?').get(userId);
         let storageWarning = null;
-        if (userRow && userRow.default_storage_id && userRow.default_storage_id !== 'internal') {
-            const source = db.prepare('SELECT label, is_active, is_accessible FROM storage_sources WHERE id = ?').get(userRow.default_storage_id);
+        if (userRow && userRow.default_storage_id) {
+            const source = db.prepare('SELECT label, type, is_active, is_accessible FROM storage_sources WHERE id = ?').get(userRow.default_storage_id);
             if (source && (!source.is_active || !source.is_accessible)) {
-                storageWarning = `Your assigned storage drive "${source.label}" is not currently attached. New files will be saved to internal storage until the drive is reconnected.`;
+                storageWarning = source.type === 'internal'
+                    ? `CloudPi internal encrypted storage is locked or unavailable. Unlock the LUKS drive before opening, previewing, or uploading internal files.`
+                    : `Your assigned storage drive "${source.label}" is not currently attached. New files will be saved to internal storage until the drive is reconnected.`;
             }
         }
 
@@ -1606,6 +1615,7 @@ router.delete('/:id/permanent', requireAuth, (req, res) => {
  */
 router.get('/storage-stats', requireAuth, (req, res) => {
     try {
+        ensureProtectedInternalStorageAvailable();
         const sources = db.prepare('SELECT id, path, type, total_bytes FROM storage_sources WHERE is_active = 1').all();
         
         let totalSystemBytes = 0;
@@ -1656,6 +1666,9 @@ router.get('/storage-stats', requireAuth, (req, res) => {
 
     } catch (error) {
         console.error('Storage stats error:', error);
+        if (error.code === 'LUKS_STORAGE_UNAVAILABLE') {
+            return res.status(503).json({ error: error.message });
+        }
         res.status(500).json({ error: 'Server error' });
     }
 });

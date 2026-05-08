@@ -22,6 +22,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 COMPOSE_ENV_FILE="${PROJECT_DIR}/.env"
 
+# LUKS_DEVICE should ideally be a persistent path like
+# /dev/disk/by-uuid/<luks-uuid>. The bootstrap script writes that automatically.
 LUKS_DEVICE="${LUKS_DEVICE:-/dev/sda1}"
 LUKS_MAPPER_NAME="${LUKS_MAPPER_NAME:-cloudpi-data}"
 LUKS_MOUNT_POINT="${LUKS_MOUNT_POINT:-/media/cloudpi-data}"

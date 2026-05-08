@@ -366,6 +366,36 @@ export function FilesContent() {
         setDetailFile(null)
     }
 
+    function getStorageDisconnectTitle(source: { source_id: string; label: string }) {
+        return source.source_id === "internal" ? "Internal Storage Unavailable" : "Storage Drive Disconnected"
+    }
+
+    function getStorageDisconnectMessage(source: { source_id: string; label: string }) {
+        if (source.source_id === "internal") {
+            return "CloudPi's encrypted internal storage is locked or unavailable. Internal files cannot be opened until the LUKS drive is unlocked again."
+        }
+        return `Drive "${source.label}" is not currently attached. Files on this drive are temporarily unavailable.`
+    }
+
+    function getDisconnectBannerMessage(sources: { source_id: string; label: string }[]) {
+        const internalSource = sources.find((source) => source.source_id === "internal")
+        const externalSources = sources.filter((source) => source.source_id !== "internal")
+
+        if (internalSource && externalSources.length === 0) {
+            return getStorageDisconnectMessage(internalSource)
+        }
+
+        if (!internalSource && externalSources.length === 1) {
+            return getStorageDisconnectMessage(externalSources[0])
+        }
+
+        if (!internalSource) {
+            return `${externalSources.length} drives are disconnected: ${externalSources.map(d => `"${d.label}"`).join(", ")}. Files on these drives are temporarily unavailable.`
+        }
+
+        return `CloudPi's encrypted internal storage is unavailable, and ${externalSources.length} external drive${externalSources.length === 1 ? "" : "s"} ${externalSources.map(d => `"${d.label}"`).join(", ")} ${externalSources.length === 1 ? "is" : "are"} also offline.`
+    }
+
     // Navigation
     function navigateToFolder(folderId: number | null) {
         clearOverlays()
@@ -1161,8 +1191,12 @@ export function FilesContent() {
                     )}
                     <span className="text-sm font-medium">
                         {notification.type === "disconnect"
-                            ? `Drive "${notification.label}" disconnected`
-                            : `Drive "${notification.label}" is back online`}
+                            ? (notification.source_id === "internal"
+                                ? "Internal encrypted storage became unavailable"
+                                : `Drive "${notification.label}" disconnected`)
+                            : (notification.source_id === "internal"
+                                ? "Internal encrypted storage is back online"
+                                : `Drive "${notification.label}" is back online`)}
                     </span>
                 </div>
             )}
@@ -1173,11 +1207,13 @@ export function FilesContent() {
                     <CardContent className="py-3 flex items-start gap-3">
                         <AlertCircle className="h-5 w-5 text-yellow-500 flex-shrink-0 mt-0.5" />
                         <div>
-                            <p className="text-sm font-medium text-yellow-500">Storage Drive Disconnected</p>
-                            <p className="text-sm text-yellow-500/80 mt-0.5">
+                            <p className="text-sm font-medium text-yellow-500">
                                 {disconnectedDrives.length === 1
-                                    ? `Drive "${disconnectedDrives[0].label}" is not currently attached. Files on this drive are temporarily unavailable.`
-                                    : `${disconnectedDrives.length} drives are disconnected: ${disconnectedDrives.map(d => `"${d.label}"`).join(", ")}. Files on these drives are temporarily unavailable.`}
+                                    ? getStorageDisconnectTitle(disconnectedDrives[0])
+                                    : "Storage Unavailable"}
+                            </p>
+                            <p className="text-sm text-yellow-500/80 mt-0.5">
+                                {getDisconnectBannerMessage(disconnectedDrives)}
                             </p>
                         </div>
                     </CardContent>

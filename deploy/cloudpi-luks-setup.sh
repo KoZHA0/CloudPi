@@ -270,6 +270,7 @@ main() {
     write_env_setting "LUKS_DEVICE" "${persistent_luks_device}"
     write_env_setting "LUKS_MAPPER_NAME" "${mapper_name}"
     write_env_setting "LUKS_MOUNT_POINT" "${mount_point}"
+    write_env_setting "CLOUDPI_INTERNAL_STORAGE_REQUIRES_LUKS" "1"
     write_env_setting "CLOUDPI_DB_MOUNT" "${mount_point}/${APPDATA_SUBDIR}"
     write_env_setting "CLOUDPI_STORAGE_MOUNT" "${mount_point}/${STORAGE_SUBDIR}"
     write_env_setting "CLOUDPI_UPLOADS_MOUNT" "${mount_point}/${UPLOADS_SUBDIR}"

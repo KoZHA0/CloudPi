@@ -22,6 +22,10 @@ const crypto = require('crypto');
 const db = require('../database/db');
 const eventBus = require('../utils/event-bus');
 const { JWT_SECRET } = require('../utils/auth-config');
+const {
+    startInternalStorageMonitor,
+    syncInternalStorageState,
+} = require('../utils/storage-status');
 
 const router = express.Router();
 
@@ -73,8 +77,10 @@ router.get('/', (req, res) => {
     });
 
     // Send initial connection event with current drive statuses
+    syncInternalStorageState({ emitOnChange: false });
+
     const sources = db.prepare(
-        "SELECT id, label, is_accessible FROM storage_sources WHERE type = 'external'"
+        'SELECT id, label, is_accessible FROM storage_sources'
     ).all();
 
     res.write(`event: connected\ndata: ${JSON.stringify({
@@ -343,6 +349,8 @@ function isDriveActuallyPresent(drivePath, expectedDriveId) {
  * fs.existsSync to handle the ghost partition edge case on Raspberry Pi.
  */
 function reconcileDriveStates() {
+    syncInternalStorageState({ emitOnChange: false });
+
     const sources = db.prepare(
         "SELECT id, label, path, is_active FROM storage_sources WHERE type = 'external'"
     ).all();
@@ -365,7 +373,9 @@ function reconcileDriveStates() {
 // Export for use by admin.js storage listing cross-check
 module.exports = router;
 module.exports.isDriveActuallyPresent = isDriveActuallyPresent;
+module.exports.syncInternalStorageState = syncInternalStorageState;
 
 // Run reconciliation on module load
 reconcileDriveStates();
+startInternalStorageMonitor();
 

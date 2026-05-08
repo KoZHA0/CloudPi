@@ -30,14 +30,14 @@ interface DriveInfo {
 }
 
 interface DriveStatusContextType {
-    /** Map of source_id → drive info */
+    /** Map of storage source id → live availability info */
     drives: Map<string, DriveInfo>
-    /** All currently disconnected drives */
+    /** All currently unavailable storage sources */
     disconnectedDrives: DriveInfo[]
-    /** Check if a file is accessible (drive connected) */
+    /** Check if a file is accessible (its storage source is online) */
     isFileAccessible: (file: FileItem) => boolean
     /** Latest notification message (auto-clears after timeout) */
-    notification: { type: "connect" | "disconnect"; label: string } | null
+    notification: { type: "connect" | "disconnect"; source_id: string; label: string } | null
 }
 
 const DriveStatusContext = createContext<DriveStatusContextType>({
@@ -57,9 +57,9 @@ export function DriveStatusProvider({ children }: { children: React.ReactNode })
     const notificationTimeout = useRef<ReturnType<typeof setTimeout> | null>(null)
 
     // Show a notification and auto-clear after 5 seconds
-    const showNotification = useCallback((type: "connect" | "disconnect", label: string) => {
+    const showNotification = useCallback((type: "connect" | "disconnect", source_id: string, label: string) => {
         if (notificationTimeout.current) clearTimeout(notificationTimeout.current)
-        setNotification({ type, label })
+        setNotification({ type, source_id, label })
         notificationTimeout.current = setTimeout(() => setNotification(null), 5000)
     }, [])
 
@@ -90,9 +90,9 @@ export function DriveStatusProvider({ children }: { children: React.ReactNode })
 
         // Show notification
         if (data.status === "offline") {
-            showNotification("disconnect", data.label)
+            showNotification("disconnect", data.source_id, data.label)
         } else {
-            showNotification("connect", data.label)
+            showNotification("connect", data.source_id, data.label)
         }
     }, [showNotification])
 
@@ -108,13 +108,12 @@ export function DriveStatusProvider({ children }: { children: React.ReactNode })
     // Compute disconnected drives list
     const disconnectedDrives = Array.from(drives.values()).filter(d => d.status === "offline")
 
-    // Check if a file's storage drive is accessible
+    // Check if a file's storage source is accessible
     const isFileAccessible = useCallback((file: FileItem): boolean => {
-        // Files on internal storage or without a source are always accessible
-        if (!file.storage_source_id || file.storage_source_id === "internal") return true
+        const sourceId = file.storage_source_id || "internal"
 
         // Use the SSE-tracked status if available
-        const driveInfo = drives.get(file.storage_source_id)
+        const driveInfo = drives.get(sourceId)
         if (driveInfo) return driveInfo.status === "online"
 
         // Fall back to the is_accessible field from the API response

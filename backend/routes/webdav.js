@@ -41,8 +41,12 @@ const jwt        = require('jsonwebtoken');
 const db                              = require('../database/db');
 const { JWT_SECRET }                  = require('../utils/auth-config');
 const { getLuksStatus, unlockAndMount, luksClose, MOUNT_POINT } = require('../utils/luks');
+const { syncInternalStorageState }    = require('../utils/storage-status');
 
 const router = express.Router();
+const LUKS_UNLOCK_WINDOW_MS = 5 * 60 * 1000;
+const LUKS_UNLOCK_MAX_FAILURES = 3;
+const luksUnlockFailures = new Map();
 
 // ── webdav-server v2 ──────────────────────────────────────────────────────────
 const webdav = require('webdav-server').v2;
@@ -141,6 +145,43 @@ async function requireAdmin(req, res, next) {
   next();
 }
 
+function getUnlockRateLimitKey(req) {
+  return `${req.user?.id || req.user?.username || 'unknown'}:${req.ip || 'unknown'}`;
+}
+
+function checkUnlockRateLimit(req, res, next) {
+  const key = getUnlockRateLimitKey(req);
+  const now = Date.now();
+  const current = luksUnlockFailures.get(key);
+
+  if (current && current.lockedUntil && current.lockedUntil > now) {
+    const retryAfterSeconds = Math.ceil((current.lockedUntil - now) / 1000);
+    res.set('Retry-After', String(retryAfterSeconds));
+    return res.status(429).json({
+      error: `Too many failed unlock attempts. Try again in ${retryAfterSeconds} seconds.`,
+    });
+  }
+
+  next();
+}
+
+function recordUnlockFailure(req) {
+  const key = getUnlockRateLimitKey(req);
+  const now = Date.now();
+  const current = luksUnlockFailures.get(key);
+  const attempts = current && current.resetAt > now ? current.attempts + 1 : 1;
+  const next = {
+    attempts,
+    resetAt: now + LUKS_UNLOCK_WINDOW_MS,
+    lockedUntil: attempts >= LUKS_UNLOCK_MAX_FAILURES ? now + LUKS_UNLOCK_WINDOW_MS : 0,
+  };
+  luksUnlockFailures.set(key, next);
+}
+
+function clearUnlockFailures(req) {
+  luksUnlockFailures.delete(getUnlockRateLimitKey(req));
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // LUKS Status & Control API (mounted at /api/luks/*)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -170,7 +211,7 @@ router.get('/api/luks/status', async (req, res) => {
  * Request body: { passphrase: string }
  * Response:     { message: string, mountPoint: string }
  */
-router.post('/api/luks/unlock', requireAdmin, async (req, res) => {
+router.post('/api/luks/unlock', requireAdmin, checkUnlockRateLimit, async (req, res) => {
   const { passphrase } = req.body || {};
 
   if (!passphrase) {
@@ -181,14 +222,18 @@ router.post('/api/luks/unlock', requireAdmin, async (req, res) => {
     const current = await getLuksStatus();
 
     if (current.status === 'mounted') {
+      clearUnlockFailures(req);
       return res.json({ message: 'Drive is already mounted', mountPoint: MOUNT_POINT });
     }
 
     await unlockAndMount(passphrase);
+    clearUnlockFailures(req);
+    syncInternalStorageState({ emitOnChange: true, forceEmit: true });
 
     console.log(`✅ [luks] Drive unlocked and mounted at ${MOUNT_POINT} by admin ${req.user.username}`);
     res.json({ message: 'Drive unlocked and mounted successfully', mountPoint: MOUNT_POINT });
   } catch (err) {
+    recordUnlockFailure(req);
     console.error('[luks] Unlock failed:', err.message);
 
     // Distinguish wrong passphrase (403) from other errors (500)
@@ -205,6 +250,7 @@ router.post('/api/luks/unlock', requireAdmin, async (req, res) => {
 router.post('/api/luks/lock', requireAdmin, async (req, res) => {
   try {
     await luksClose();
+    syncInternalStorageState({ emitOnChange: true, forceEmit: true });
     console.log(`🔒 [luks] Drive locked by admin ${req.user.username}`);
     res.json({ message: 'Drive locked successfully' });
   } catch (err) {
@@ -275,10 +321,19 @@ function buildWebDAVHandler() {
       return next();
     }
 
-    const userId = user.uid;  // set to String(user.id) in getUserByNamePassword
+    const userId = Number.parseInt(String(user.uid), 10);  // set from DB id in getUserByNamePassword
+    if (!Number.isInteger(userId) || userId < 1) {
+      console.error('[webdav] Invalid authenticated user id:', user.uid);
+      return next();
+    }
 
     // Where this user's files live on the LUKS mount
-    const userRoot = path.join(MOUNT_POINT, 'users', userId);
+    const usersRoot = path.resolve(MOUNT_POINT, 'users');
+    const userRoot = path.resolve(usersRoot, String(userId));
+    if (userRoot !== usersRoot && !userRoot.startsWith(`${usersRoot}${path.sep}`)) {
+      console.error('[webdav] Refusing unsafe user root:', userRoot);
+      return next();
+    }
 
     // Create the directory if it doesn't exist yet (first login / new user)
     try {

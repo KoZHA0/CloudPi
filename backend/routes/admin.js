@@ -86,28 +86,64 @@ function getParentBlockDeviceName(deviceName) {
     return deviceName;
 }
 
-function isUsbRemovableDrivePath(drivePath) {
+function getBlockMountInfo(drivePath) {
+    const source = getMountSourceForPath(drivePath);
+    if (!source || !source.startsWith('/dev/')) {
+        return { source, reason: source ? `mount source is ${source}` : 'no block-device mount source found' };
+    }
+
+    const deviceName = path.basename(source);
+    const parentDeviceName = getParentBlockDeviceName(deviceName);
+    if (!parentDeviceName) {
+        return { source, deviceName, reason: 'could not determine parent block device' };
+    }
+
+    let removable = false;
+    let isUsb = false;
     try {
-        const source = getMountSourceForPath(drivePath);
-        if (!source || !source.startsWith('/dev/')) return false;
-
-        const deviceName = path.basename(source);
-        const parentDeviceName = getParentBlockDeviceName(deviceName);
-        if (!parentDeviceName) return false;
-
         const removablePath = `/sys/class/block/${parentDeviceName}/removable`;
-        const deviceRealPath = fs.realpathSync(`/sys/class/block/${parentDeviceName}/device`);
-
-        const removable = fs.existsSync(removablePath)
+        removable = fs.existsSync(removablePath)
             ? fs.readFileSync(removablePath, 'utf8').trim() === '1'
             : false;
-
-        const isUsb = deviceRealPath.includes('/usb');
-
-        return removable && isUsb;
     } catch {
-        return false;
+        removable = false;
     }
+
+    try {
+        const deviceRealPath = fs.realpathSync(`/sys/class/block/${parentDeviceName}/device`);
+        isUsb = deviceRealPath.includes('/usb');
+    } catch {
+        isUsb = false;
+    }
+
+    return {
+        source,
+        deviceName,
+        parentDeviceName,
+        removable,
+        isUsb,
+    };
+}
+
+function classifyExternalDrivePath(drivePath) {
+    if (isReservedLuksStoragePath(drivePath)) {
+        return { eligible: false, reason: 'reserved CloudPi LUKS internal storage mount' };
+    }
+
+    const info = getBlockMountInfo(drivePath);
+    if (info.reason) {
+        return { eligible: false, ...info };
+    }
+
+    if (/^mmcblk\d+$/.test(info.parentDeviceName)) {
+        return { eligible: false, reason: 'Raspberry Pi SD-card partition', ...info };
+    }
+
+    if (info.isUsb || info.removable || /^sd[a-z]+$/.test(info.parentDeviceName)) {
+        return { eligible: true, ...info };
+    }
+
+    return { eligible: false, reason: 'not a removable or USB-style block device', ...info };
 }
 
 // HMAC helpers for .cloudpi-id integrity (shared utility)
@@ -1084,6 +1120,7 @@ router.get('/drives', requireAdmin, async (req, res) => {
         }
 
         const drives = [];
+        const skippedCandidates = [];
 
         // Scan the external drives directory for auto-mounted USB drives
         let entries = [];
@@ -1106,8 +1143,17 @@ router.get('/drives', requireAdmin, async (req, res) => {
             if (!entry.isDirectory()) continue;
 
             const drivePath = path.join(EXTERNAL_DRIVES_PATH, entry.name);
-            if (isReservedLuksStoragePath(drivePath)) continue;
-            if (!isUsbRemovableDrivePath(drivePath)) continue;
+            const classification = classifyExternalDrivePath(drivePath);
+            if (!classification.eligible) {
+                skippedCandidates.push({
+                    name: entry.name,
+                    path: drivePath,
+                    reason: classification.reason || 'not eligible for registration',
+                    source: classification.source || null,
+                    device: classification.parentDeviceName || classification.deviceName || null,
+                });
+                continue;
+            }
 
             // Check if registered in our DB
             let isRegistered = false;
@@ -1163,6 +1209,7 @@ router.get('/drives', requireAdmin, async (req, res) => {
                 isRegistered,
                 registeredId,
                 hmac_verified: hmacValid,  // false if .cloudpi-id has no/bad HMAC
+                source: classification.source,
             });
         }
 
@@ -1192,6 +1239,9 @@ router.get('/drives', requireAdmin, async (req, res) => {
 
         // Audit log: record scan event
         console.log(`🔍 [AUDIT] Drive scan by admin (user_id=${currentUserId}): found ${drives.length} drive(s), ${enrichedSources.length} registered source(s)`);
+        if (skippedCandidates.length > 0) {
+            console.log(`🔍 [AUDIT] Skipped drive candidate(s): ${skippedCandidates.map(d => `${d.path} (${d.reason})`).join(', ')}`);
+        }
 
         // Log unknown drives (not in allow-list)
         const unknownDrives = drives.filter(d => !d.isRegistered);
@@ -1207,6 +1257,7 @@ router.get('/drives', requireAdmin, async (req, res) => {
 
         res.json({
             drives,
+            skippedCandidates,
             registeredSources: enrichedSources,
             platform: process.platform,
         });

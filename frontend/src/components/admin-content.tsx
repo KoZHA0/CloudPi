@@ -273,11 +273,22 @@ export function AdminContent() {
             const result = await scanDrives()
             setDetectedDrives(result.drives)
             setRegisteredDriveSources(result.registeredSources)
+            const skippedCandidates = result.skippedCandidates ?? []
             if (result.message) {
                 setPlatformMessage(result.message)
             }
+            if (skippedCandidates.length > 0 && !result.message) {
+                const skippedSummary = skippedCandidates
+                    .slice(0, 3)
+                    .map((drive) => `${drive.name}: ${drive.reason}`)
+                    .join('; ')
+                setPlatformMessage(`Skipped ${skippedCandidates.length} mount candidate${skippedCandidates.length === 1 ? '' : 's'}: ${skippedSummary}`)
+            }
             if (result.drives.length === 0 && !result.message) {
-                setDriveMessage({ type: 'success', text: 'Scan complete. No removable drives detected.' })
+                setDriveMessage({
+                    type: 'success',
+                    text: 'Scan complete. No assignable external drives detected. The LUKS disk is CloudPi internal storage and is hidden from drive registration.'
+                })
             }
         } catch (err) {
             setDriveMessage({ type: 'error', text: err instanceof Error ? err.message : 'Failed to scan drives' })

@@ -153,7 +153,7 @@ async function requireAdmin(req, res, next) {
  * Response:
  *   { status: 'locked' | 'unlocked' | 'mounted' | 'no_device', device, mountPoint }
  */
-router.get('/luks/status', async (req, res) => {
+router.get('/api/luks/status', async (req, res) => {
   try {
     const status = await getLuksStatus();
     res.json(status);
@@ -170,7 +170,7 @@ router.get('/luks/status', async (req, res) => {
  * Request body: { passphrase: string }
  * Response:     { message: string, mountPoint: string }
  */
-router.post('/luks/unlock', requireAdmin, async (req, res) => {
+router.post('/api/luks/unlock', requireAdmin, async (req, res) => {
   const { passphrase } = req.body || {};
 
   if (!passphrase) {
@@ -202,7 +202,7 @@ router.post('/luks/unlock', requireAdmin, async (req, res) => {
  * Admin-only.  Unmounts the filesystem and closes the LUKS container.
  * After this, /media/cloudpi-data is inaccessible until unlocked again.
  */
-router.post('/luks/lock', requireAdmin, async (req, res) => {
+router.post('/api/luks/lock', requireAdmin, async (req, res) => {
   try {
     await luksClose();
     console.log(`🔒 [luks] Drive locked by admin ${req.user.username}`);

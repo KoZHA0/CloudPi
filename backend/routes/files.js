@@ -89,6 +89,48 @@ function resolveFilePath(file) {
     return path.join(basePath, file.path);
 }
 
+function isVaultItem(file) {
+    return !!file && (file.is_secure_vault === 1 || Number.isInteger(file.vault_root_id));
+}
+
+function deleteStoredItem(file) {
+    if (!file || !file.path) return;
+    const filePath = resolveFilePath(file);
+    if (!fs.existsSync(filePath)) return;
+
+    if (isVaultItem(file)) {
+        fs.rmSync(filePath, { recursive: true, force: true });
+        return;
+    }
+
+    fs.unlinkSync(filePath);
+}
+
+function getCurrentFolderContext(userId, folderId) {
+    if (!folderId) return null;
+
+    const folder = db.prepare(`
+        SELECT id, name, parent_id, encrypted_metadata, is_secure_vault, vault_root_id
+        FROM files
+        WHERE id = ? AND user_id = ? AND type = 'folder' AND trashed = 0
+    `).get(folderId, userId);
+
+    if (!folder) return null;
+
+    const vaultId = folder.is_secure_vault === 1 ? folder.id : folder.vault_root_id;
+    if (!vaultId) {
+        return { folder, vault: null };
+    }
+
+    const vault = db.prepare(`
+        SELECT id, name, parent_id, encrypted_metadata, is_secure_vault, vault_root_id
+        FROM files
+        WHERE id = ? AND user_id = ? AND type = 'folder' AND is_secure_vault = 1 AND trashed = 0
+    `).get(vaultId, userId);
+
+    return { folder, vault: vault || null };
+}
+
 /**
  * Get the user's default storage source ID.
  * Falls back to 'internal' if not set.
@@ -253,11 +295,11 @@ async function uploadWorker(task, callback) {
                 console.error('Hash computation failed:', hashErr.message);
             }
 
-            // Files are stored as plaintext — LUKS provides disk-level encryption.
-            // Cryptomator provides per-vault client-side encryption for WebDAV users.
+            // Files are stored as plaintext in app logic; Layer 1 LUKS protects the disk.
+            // Secure vaults use separate client-side encryption flows.
             const result = db.prepare(`
-                INSERT INTO files (user_id, name, path, type, size, mime_type, parent_id, storage_source_id, sha256_hash, encrypted, key_wrapped)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)
+                INSERT INTO files (user_id, name, path, type, size, mime_type, parent_id, storage_source_id, sha256_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             `).run(
                 userId,
                 file.originalname,
@@ -448,6 +490,8 @@ router.get('/', requireAuth, (req, res) => {
         let query = `
             SELECT f.id, f.name, f.type, f.size, f.mime_type, f.parent_id, f.starred,
                    f.created_at, f.modified_at, f.storage_source_id,
+                   f.encrypted_metadata, f.storage_id, f.e2ee_iv, f.is_chunked,
+                   f.chunk_count, f.vault_root_id, f.is_secure_vault,
                    COALESCE(ss.is_accessible, 1) as is_accessible
             FROM files f
             LEFT JOIN storage_sources ss ON f.storage_source_id = ss.id
@@ -474,10 +518,16 @@ router.get('/', requireAuth, (req, res) => {
             let currentId = parentId;
             while (currentId) {
                 const folder = db.prepare(
-                    'SELECT id, name, parent_id FROM files WHERE id = ? AND user_id = ?'
+                    'SELECT id, name, parent_id, encrypted_metadata, is_secure_vault, vault_root_id FROM files WHERE id = ? AND user_id = ?'
                 ).get(currentId, userId);
                 if (folder) {
-                    breadcrumbs.unshift({ id: folder.id, name: folder.name });
+                    breadcrumbs.unshift({
+                        id: folder.id,
+                        name: folder.name,
+                        encrypted_metadata: folder.encrypted_metadata,
+                        is_secure_vault: folder.is_secure_vault,
+                        vault_root_id: folder.vault_root_id,
+                    });
                     currentId = folder.parent_id;
                 } else {
                     break;
@@ -496,7 +546,15 @@ router.get('/', requireAuth, (req, res) => {
             }
         }
 
-        res.json({ files, breadcrumbs, ...(storageWarning && { storageWarning }) });
+        const currentContext = getCurrentFolderContext(userId, parentId ? Number(parentId) : null);
+
+        res.json({
+            files,
+            breadcrumbs,
+            currentFolder: currentContext?.folder || null,
+            currentVault: currentContext?.vault || null,
+            ...(storageWarning && { storageWarning }),
+        });
     } catch (error) {
         console.error('List files error:', error);
         res.status(500).json({ error: 'Server error' });
@@ -646,10 +704,13 @@ router.post('/folder', requireAuth, (req, res) => {
         // Validate parent folder exists and belongs to user
         if (parent_id) {
             const parentFolder = db.prepare(
-                "SELECT id FROM files WHERE id = ? AND user_id = ? AND type = 'folder'"
+                "SELECT id, is_secure_vault, vault_root_id FROM files WHERE id = ? AND user_id = ? AND type = 'folder'"
             ).get(parent_id, userId);
             if (!parentFolder) {
                 return res.status(400).json({ error: 'Parent folder not found' });
+            }
+            if (parentFolder.is_secure_vault === 1 || parentFolder.vault_root_id !== null) {
+                return res.status(400).json({ error: 'Use the secure vault folder flow for encrypted folders' });
             }
         }
 
@@ -723,10 +784,13 @@ router.post('/upload', uploadLimiter, requireAuth, upload.array('files', 10), as
         // Validate parent folder if specified
         if (parentId) {
             const parentFolder = db.prepare(
-                "SELECT id FROM files WHERE id = ? AND user_id = ? AND type = 'folder'"
+                "SELECT id, is_secure_vault, vault_root_id FROM files WHERE id = ? AND user_id = ? AND type = 'folder'"
             ).get(parentId, userId);
             if (!parentFolder) {
                 return res.status(400).json({ error: 'Parent folder not found' });
+            }
+            if (parentFolder.is_secure_vault === 1 || parentFolder.vault_root_id !== null) {
+                return res.status(400).json({ error: 'Encrypted vault uploads must use the secure vault uploader' });
             }
         }
 
@@ -971,6 +1035,10 @@ router.get('/:id/preview', async (req, res) => {
             return res.status(404).json({ error: 'File not found' });
         }
 
+        if (isVaultItem(file)) {
+            return res.status(400).json({ error: 'Thumbnails are unavailable for encrypted vault files' });
+        }
+
         // Check if the file's storage source is ACTUALLY mounted (not just DB flag)
         if (file.storage_source_id && file.storage_source_id !== 'internal') {
             const source = db.prepare('SELECT is_accessible, label, path FROM storage_sources WHERE id = ?')
@@ -1034,6 +1102,10 @@ router.get('/:id/download', requireAuth, async (req, res) => {
             return res.status(404).json({ error: 'File not found' });
         }
 
+        if (isVaultItem(file)) {
+            return res.status(400).json({ error: 'Preview is unavailable for encrypted vault files' });
+        }
+
         // Check if the file's storage source is ACTUALLY mounted (not just DB flag)
         if (file.storage_source_id && file.storage_source_id !== 'internal') {
             const source = db.prepare('SELECT is_accessible, label, path FROM storage_sources WHERE id = ?')
@@ -1091,9 +1163,6 @@ router.get('/:id/download', requireAuth, async (req, res) => {
                         collected.push({
                             diskPath,
                             archivePath: childPath,
-                            encrypted: child.encrypted === 1,
-                            keyWrapped: child.key_wrapped === 1,
-                            storageSourceId: child.storage_source_id || 'internal'
                         });
                     }
                 }
@@ -1152,6 +1221,13 @@ router.put('/:id', requireAuth, (req, res) => {
 
         if (!file) {
             return res.status(404).json({ error: 'File not found' });
+        }
+
+        if (isVaultItem(file)) {
+            if (file.type === 'folder') {
+                return res.status(400).json({ error: 'Vault folders cannot be exported as ZIP archives from the server' });
+            }
+            return res.status(400).json({ error: 'Encrypted vault files must be downloaded through the vault client' });
         }
 
         // Check for duplicate name in same folder
@@ -1246,10 +1322,13 @@ router.put('/:id/move', requireAuth, (req, res) => {
         // Validate destination folder
         if (destinationParentId) {
             const destFolder = db.prepare(
-                "SELECT id FROM files WHERE id = ? AND user_id = ? AND type = 'folder' AND trashed = 0"
+                "SELECT id, is_secure_vault, vault_root_id FROM files WHERE id = ? AND user_id = ? AND type = 'folder' AND trashed = 0"
             ).get(destinationParentId, userId);
             if (!destFolder) {
                 return res.status(400).json({ error: 'Destination folder not found' });
+            }
+            if (destFolder.is_secure_vault === 1 || destFolder.vault_root_id !== null) {
+                return res.status(400).json({ error: 'Use the secure vault flow to manage encrypted vault contents' });
             }
 
             // Prevent moving folder into itself or its children
@@ -1297,16 +1376,23 @@ router.post('/:id/copy', requireAuth, (req, res) => {
             return res.status(404).json({ error: 'Source file not found' });
         }
 
+        if (isVaultItem(source)) {
+            return res.status(400).json({ error: 'Copying encrypted vault items is not supported yet' });
+        }
+
         if (destinationParentId && Number(destinationParentId) === Number(source.id)) {
             return res.status(400).json({ error: 'Cannot copy an item into itself' });
         }
 
         if (destinationParentId) {
             const destFolder = db.prepare(
-                "SELECT id FROM files WHERE id = ? AND user_id = ? AND type = 'folder' AND trashed = 0"
+                "SELECT id, is_secure_vault, vault_root_id FROM files WHERE id = ? AND user_id = ? AND type = 'folder' AND trashed = 0"
             ).get(destinationParentId, userId);
             if (!destFolder) {
                 return res.status(400).json({ error: 'Destination folder not found' });
+            }
+            if (destFolder.is_secure_vault === 1 || destFolder.vault_root_id !== null) {
+                return res.status(400).json({ error: 'Use the secure vault flow to manage encrypted vault contents' });
             }
 
             if (source.type === 'folder' && isFolderDescendant(userId, source.id, destinationParentId)) {
@@ -1350,8 +1436,8 @@ router.post('/:id/copy', requireAuth, (req, res) => {
             fs.copyFileSync(sourcePath, destinationPath);
 
             const insertedFile = db.prepare(`
-                INSERT INTO files (user_id, name, path, type, size, mime_type, parent_id, storage_source_id, sha256_hash, encrypted, key_wrapped)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO files (user_id, name, path, type, size, mime_type, parent_id, storage_source_id, sha256_hash, encrypted)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `).run(
                 userId,
                 safeName,
@@ -1362,8 +1448,7 @@ router.post('/:id/copy', requireAuth, (req, res) => {
                 targetParentId,
                 storageId,
                 item.sha256_hash || null,
-                item.encrypted || 0,
-                item.key_wrapped || 0
+                item.encrypted || 0
             );
 
             return db.prepare('SELECT * FROM files WHERE id = ?').get(insertedFile.lastInsertRowid);
@@ -1486,24 +1571,18 @@ router.delete('/:id/permanent', requireAuth, (req, res) => {
 
         // Delete physical file if it's not a folder
         if (file.type !== 'folder' && file.path) {
-            const filePath = resolveFilePath(file);
-            if (fs.existsSync(filePath)) {
-                fs.unlinkSync(filePath);
-            }
+            deleteStoredItem(file);
         }
 
         // If folder, delete all children first
         if (file.type === 'folder') {
             const deleteChildren = (parentId) => {
-                const children = db.prepare('SELECT id, type, path, storage_source_id FROM files WHERE parent_id = ?').all(parentId);
+                const children = db.prepare('SELECT id, type, path, storage_source_id, vault_root_id, is_secure_vault FROM files WHERE parent_id = ?').all(parentId);
                 for (const child of children) {
                     if (child.type === 'folder') {
                         deleteChildren(child.id);
                     } else if (child.path) {
-                        const childPath = resolveFilePath({ ...child, user_id: userId, storage_source_id: child.storage_source_id });
-                        if (fs.existsSync(childPath)) {
-                            fs.unlinkSync(childPath);
-                        }
+                        deleteStoredItem({ ...child, user_id: userId, storage_source_id: child.storage_source_id });
                     }
                     db.prepare('DELETE FROM files WHERE id = ?').run(child.id);
                 }

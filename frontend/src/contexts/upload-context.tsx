@@ -16,11 +16,14 @@ export interface UploadEntry {
     folderId: number | null
 }
 
+export type UploadProgressCallback = (uploadedBytes: number, totalBytes: number) => void
+export type UploadExecutor = (files: File[], folderId: number | null, onProgress: UploadProgressCallback) => Promise<void>
+
 interface UploadContextType {
     uploads: UploadEntry[]
     isMinimized: boolean
     setIsMinimized: (v: boolean) => void
-    addUpload: (files: File[], folderId: number | null, onComplete?: () => void) => void
+    addUpload: (files: File[], folderId: number | null, onComplete?: () => void, executor?: UploadExecutor) => void
     clearCompleted: () => void
     totalActive: number
 }
@@ -41,7 +44,7 @@ export function UploadProvider({ children }: { children: ReactNode }) {
 
     const totalActive = uploads.filter(u => u.status === "pending" || u.status === "uploading").length
 
-    const addUpload = useCallback((files: File[], folderId: number | null, onComplete?: () => void) => {
+    const addUpload = useCallback((files: File[], folderId: number | null, onComplete?: () => void, executor?: UploadExecutor) => {
         // Create one entry per batch (since the API sends all files together)
         const batchId = `upload-${Date.now()}-${++idCounter.current}`
         const totalSize = files.reduce((sum, f) => sum + f.size, 0)
@@ -58,26 +61,39 @@ export function UploadProvider({ children }: { children: ReactNode }) {
 
         setUploads(prev => [entry, ...prev])
 
-        // Simulate progress while uploading
-        let progressVal = 0
-        const progressInterval = setInterval(() => {
-            progressVal = Math.min(progressVal + Math.random() * 15, 90)
+        let progressInterval: number | null = null
+        if (!executor) {
+            let progressVal = 0
+            progressInterval = window.setInterval(() => {
+                progressVal = Math.min(progressVal + Math.random() * 15, 90)
+                setUploads(prev =>
+                    prev.map(u => u.id === batchId ? { ...u, progress: progressVal } : u)
+                )
+            }, 300)
+        }
+
+        const updateProgress: UploadProgressCallback = (uploadedBytes, totalBytesBytes) => {
+            const ratio = totalBytesBytes > 0 ? (uploadedBytes / totalBytesBytes) * 100 : 0
             setUploads(prev =>
-                prev.map(u => u.id === batchId ? { ...u, progress: progressVal } : u)
+                prev.map(u => u.id === batchId ? { ...u, progress: Math.max(0, Math.min(100, ratio)) } : u)
             )
-        }, 300)
+        }
 
         // Fire the actual upload
-        apiUploadFiles(files, folderId)
+        const runUpload = executor
+            ? executor(files, folderId, updateProgress)
+            : apiUploadFiles(files, folderId).then(() => undefined)
+
+        runUpload
             .then(() => {
-                clearInterval(progressInterval)
+                if (progressInterval !== null) window.clearInterval(progressInterval)
                 setUploads(prev =>
                     prev.map(u => u.id === batchId ? { ...u, status: "done", progress: 100 } : u)
                 )
                 onComplete?.()
             })
             .catch(err => {
-                clearInterval(progressInterval)
+                if (progressInterval !== null) window.clearInterval(progressInterval)
                 setUploads(prev =>
                     prev.map(u => u.id === batchId ? {
                         ...u,

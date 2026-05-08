@@ -76,12 +76,26 @@ import {
     Scissors,
     Copy,
     ArrowLeft,
+    Lock,
+    ShieldAlert,
+    KeyRound,
+    RefreshCw,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import {
     getFiles,
     createFolder,
+    createSecureVault,
+    createVaultFolder,
     downloadFile,
+    fetchVaultChunk,
+    getVaultMetadata,
+    changeVaultPin,
+    initVaultUpload,
+    uploadVaultChunk,
+    completeVaultUpload,
+    abortVaultUpload,
+    renameVaultItem,
     renameFile,
     toggleStar,
     moveFile,
@@ -97,6 +111,19 @@ import {
 } from "@/lib/api"
 import { useUpload } from "@/contexts/upload-context"
 import { useDriveStatus } from "@/contexts/drive-status-context"
+import { useVaults } from "@/contexts/vault-context"
+import {
+    CHUNK_SIZE_BYTES,
+    createFileIv,
+    createStorageId,
+    createVaultEnvelope,
+    decryptChunk,
+    decryptMetadata,
+    encryptChunk,
+    encryptMetadata,
+    rewrapVaultDek,
+    unwrapVaultDek,
+} from "@/lib/vault-crypto"
 
 const getFileIcon = (type: FileItem["type"]) => {
     const icons = {
@@ -145,10 +172,14 @@ function formatDate(dateString: string): string {
 export function FilesContent() {
     const { addUpload } = useUpload()
     const { isFileAccessible, disconnectedDrives, notification } = useDriveStatus()
+    const { isVaultUnlocked, getVaultKey, unlockVault, lockVault, touchVault } = useVaults()
     const [view, setView] = useState<"grid" | "list">("grid")
     const [files, setFiles] = useState<FileItem[]>([])
     const [breadcrumbs, setBreadcrumbs] = useState<Breadcrumb[]>([])
+    const [displayNames, setDisplayNames] = useState<Record<number, string>>({})
     const [currentFolderId, setCurrentFolderId] = useState<number | null>(null)
+    const [currentFolder, setCurrentFolder] = useState<Breadcrumb | null>(null)
+    const [currentVault, setCurrentVault] = useState<Breadcrumb | null>(null)
     const [selectedFiles, setSelectedFiles] = useState<number[]>([])
     const [isSelecting, setIsSelecting] = useState(false)
     const [searchQuery, setSearchQuery] = useState("")
@@ -167,10 +198,20 @@ export function FilesContent() {
 
     // Dialogs
     const [showNewFolderDialog, setShowNewFolderDialog] = useState(false)
+    const [showSecureVaultDialog, setShowSecureVaultDialog] = useState(false)
+    const [showUnlockVaultDialog, setShowUnlockVaultDialog] = useState(false)
+    const [showChangePinDialog, setShowChangePinDialog] = useState(false)
     const [showRenameDialog, setShowRenameDialog] = useState(false)
     const [showDeleteDialog, setShowDeleteDialog] = useState(false)
     const [showLocationDialog, setShowLocationDialog] = useState(false)
     const [newFolderName, setNewFolderName] = useState("")
+    const [newSecureVaultName, setNewSecureVaultName] = useState("")
+    const [secureVaultPin, setSecureVaultPin] = useState("")
+    const [secureVaultPinConfirm, setSecureVaultPinConfirm] = useState("")
+    const [unlockPin, setUnlockPin] = useState("")
+    const [changePinCurrent, setChangePinCurrent] = useState("")
+    const [changePinNext, setChangePinNext] = useState("")
+    const [changePinConfirm, setChangePinConfirm] = useState("")
     const [renameValue, setRenameValue] = useState("")
     const [selectedItem, setSelectedItem] = useState<FileItem | null>(null)
     const [locationMode, setLocationMode] = useState<"move" | "copy">("move")
@@ -201,11 +242,20 @@ export function FilesContent() {
     const [selectedShareUsers, setSelectedShareUsers] = useState<number[]>([])
     const [shareStatus, setShareStatus] = useState<{ type: 'success' | 'warning' | 'error'; message: string } | null>(null)
     const [isSharing, setIsSharing] = useState(false)
+    const [vaultBusy, setVaultBusy] = useState(false)
 
     // Load files
     useEffect(() => {
         loadFiles()
     }, [currentFolderId])
+
+    const activeVaultId = currentVault?.id ?? null
+    const isInsideVault = activeVaultId !== null
+    const isActiveVaultUnlocked = isVaultUnlocked(activeVaultId)
+
+    function getDisplayName(item: { id: number; name: string }) {
+        return displayNames[item.id] ?? item.name
+    }
 
     async function loadFiles() {
         setIsLoading(true)
@@ -214,6 +264,8 @@ export function FilesContent() {
             const data = await getFiles(currentFolderId) as any
             setFiles(data.files)
             setBreadcrumbs(data.breadcrumbs)
+            setCurrentFolder(data.currentFolder || null)
+            setCurrentVault(data.currentVault || null)
             // Show warning if user's assigned drive is disconnected
             if (data.storageWarning) {
                 setStorageWarning(data.storageWarning)
@@ -227,8 +279,46 @@ export function FilesContent() {
         }
     }
 
+    useEffect(() => {
+        let cancelled = false
+
+        async function resolveEncryptedNames() {
+            const nextNames: Record<number, string> = {}
+            const activeKey = getVaultKey(activeVaultId)
+
+            const allItems = [
+                ...files,
+                ...breadcrumbs,
+                ...(currentFolder ? [currentFolder] : []),
+                ...(currentVault ? [currentVault] : []),
+            ]
+
+            for (const item of allItems) {
+                if (item.encrypted_metadata && activeKey) {
+                    try {
+                        nextNames[item.id] = await decryptMetadata(activeKey, item.encrypted_metadata)
+                    } catch {
+                        nextNames[item.id] = item.name
+                    }
+                } else {
+                    nextNames[item.id] = item.name
+                }
+            }
+
+            if (!cancelled) {
+                setDisplayNames(nextNames)
+            }
+        }
+
+        resolveEncryptedNames()
+
+        return () => {
+            cancelled = true
+        }
+    }, [files, breadcrumbs, currentFolder, currentVault, activeVaultId, getVaultKey])
+
     const filteredFiles = files
-        .filter((file) => file.name.toLowerCase().includes(searchQuery.toLowerCase()))
+        .filter((file) => getDisplayName(file).toLowerCase().includes(searchQuery.toLowerCase()))
         .filter((file) => {
             if (!filterType) return true
             if (filterType === "starred") return file.starred === 1
@@ -242,7 +332,7 @@ export function FilesContent() {
             let cmp = 0
             switch (sortKey) {
                 case "name":
-                    cmp = a.name.localeCompare(b.name)
+                    cmp = getDisplayName(a).localeCompare(getDisplayName(b))
                     break
                 case "modified":
                     cmp = new Date(a.modified_at).getTime() - new Date(b.modified_at).getTime()
@@ -266,8 +356,19 @@ export function FilesContent() {
         }
     }
 
+    function isSecureItem(file: FileItem | Breadcrumb | null | undefined) {
+        if (!file) return false
+        return Boolean(file.is_secure_vault) || Number.isInteger(file.vault_root_id)
+    }
+
+    function clearOverlays() {
+        closePreview()
+        setDetailFile(null)
+    }
+
     // Navigation
     function navigateToFolder(folderId: number | null) {
+        clearOverlays()
         setCurrentFolderId(folderId)
         setSelectedFiles([])
         setIsSelecting(false)
@@ -290,7 +391,21 @@ export function FilesContent() {
     async function handleCreateFolder() {
         if (!newFolderName.trim()) return
         try {
-            await createFolder(newFolderName.trim(), currentFolderId)
+            if (isInsideVault) {
+                const targetFolderId = currentFolderId ?? activeVaultId
+                if (!activeVaultId || !targetFolderId) {
+                    throw new Error("Vault folder context is unavailable")
+                }
+                const dek = getVaultKey(activeVaultId)
+                if (!dek) {
+                    throw new Error("Unlock this vault before creating encrypted folders")
+                }
+                touchVault(activeVaultId)
+                await createVaultFolder(activeVaultId, targetFolderId, await encryptMetadata(dek, newFolderName.trim()))
+            } else {
+                await createFolder(newFolderName.trim(), currentFolderId)
+            }
+            setError(null)
             setNewFolderName("")
             setShowNewFolderDialog(false)
             loadFiles()
@@ -299,13 +414,225 @@ export function FilesContent() {
         }
     }
 
+    async function handleCreateSecureVault() {
+        if (!newSecureVaultName.trim()) return
+        if (secureVaultPin.length < 4) {
+            setError("Choose a vault PIN with at least 4 characters")
+            return
+        }
+        if (secureVaultPin !== secureVaultPinConfirm) {
+            setError("Vault PIN confirmation does not match")
+            return
+        }
+
+        setVaultBusy(true)
+        setError(null)
+
+        try {
+            const envelope = await createVaultEnvelope(secureVaultPin)
+            const result = await createSecureVault(newSecureVaultName.trim(), currentFolderId, {
+                salt: envelope.salt,
+                encrypted_dek: envelope.encryptedDek,
+                dek_iv: envelope.dekIv,
+            })
+            unlockVault(result.folder.id, envelope.dek)
+            setShowSecureVaultDialog(false)
+            setNewSecureVaultName("")
+            setSecureVaultPin("")
+            setSecureVaultPinConfirm("")
+            await loadFiles()
+        } catch (err) {
+            setError(err instanceof Error ? err.message : "Failed to create secure vault")
+        } finally {
+            setVaultBusy(false)
+        }
+    }
+
+    async function handleUnlockVault() {
+        if (!activeVaultId || !unlockPin.trim()) return
+
+        setVaultBusy(true)
+        setError(null)
+
+        try {
+            const response = await getVaultMetadata(activeVaultId)
+            const dek = await unwrapVaultDek(
+                unlockPin,
+                response.vault.salt,
+                response.vault.encrypted_dek,
+                response.vault.dek_iv,
+            )
+            unlockVault(activeVaultId, dek)
+            setUnlockPin("")
+            setShowUnlockVaultDialog(false)
+        } catch (err) {
+            setError(err instanceof Error ? err.message : "Failed to unlock vault")
+        } finally {
+            setVaultBusy(false)
+        }
+    }
+
+    async function handleChangeVaultPin() {
+        if (!activeVaultId) return
+        if (!isActiveVaultUnlocked && !changePinCurrent.trim()) {
+            setError("Current PIN is required to unlock the vault before changing it")
+            return
+        }
+        if (changePinNext.length < 4) {
+            setError("Choose a new vault PIN with at least 4 characters")
+            return
+        }
+        if (changePinNext !== changePinConfirm) {
+            setError("New vault PIN confirmation does not match")
+            return
+        }
+
+        setVaultBusy(true)
+        setError(null)
+
+        try {
+            let dek = getVaultKey(activeVaultId)
+            if (!dek) {
+                const response = await getVaultMetadata(activeVaultId)
+                dek = await unwrapVaultDek(
+                    changePinCurrent,
+                    response.vault.salt,
+                    response.vault.encrypted_dek,
+                    response.vault.dek_iv,
+                )
+                unlockVault(activeVaultId, dek)
+            }
+            const updatedEnvelope = await rewrapVaultDek(dek, changePinNext)
+            await changeVaultPin(activeVaultId, {
+                salt: updatedEnvelope.salt,
+                encrypted_dek: updatedEnvelope.encryptedDek,
+                dek_iv: updatedEnvelope.dekIv,
+            })
+            setShowChangePinDialog(false)
+            setChangePinCurrent("")
+            setChangePinNext("")
+            setChangePinConfirm("")
+        } catch (err) {
+            setError(err instanceof Error ? err.message : "Failed to change vault PIN")
+        } finally {
+            setVaultBusy(false)
+        }
+    }
+
+    async function uploadFilesToVault(filesToUpload: File[], folderId: number | null, onProgress: (uploadedBytes: number, totalBytes: number) => void) {
+        if (!activeVaultId || !folderId) {
+            throw new Error("Vault destination is unavailable")
+        }
+
+        const dek = getVaultKey(activeVaultId)
+        if (!dek) {
+            throw new Error("Unlock this vault before uploading files")
+        }
+
+        const totalBytes = filesToUpload.reduce((sum, file) => sum + file.size, 0)
+        let uploadedBytes = 0
+
+        for (const file of filesToUpload) {
+            const storageId = createStorageId()
+            const encryptedMetadata = await encryptMetadata(dek, file.name)
+            const baseIv = createFileIv()
+            const chunkCount = Math.max(1, Math.ceil(file.size / CHUNK_SIZE_BYTES))
+            const init = await initVaultUpload(activeVaultId, {
+                parent_id: folderId,
+                storage_id: storageId,
+                encrypted_metadata: encryptedMetadata,
+                e2ee_iv: baseIv,
+                chunk_count: chunkCount,
+                size: file.size,
+                mime_type: file.type || "application/octet-stream",
+            })
+
+            try {
+                for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
+                    const start = chunkIndex * CHUNK_SIZE_BYTES
+                    const end = Math.min(file.size, start + CHUNK_SIZE_BYTES)
+                    const chunkBuffer = await file.slice(start, end).arrayBuffer()
+                    const encryptedChunk = await encryptChunk(dek, chunkBuffer, baseIv, chunkIndex)
+                    await uploadVaultChunk(init.upload.id, chunkIndex, encryptedChunk)
+                    uploadedBytes += end - start
+                    onProgress(uploadedBytes, totalBytes)
+                    touchVault(activeVaultId)
+                }
+
+                await completeVaultUpload(init.upload.id)
+            } catch (error) {
+                await abortVaultUpload(init.upload.id).catch(() => undefined)
+                throw error
+            }
+        }
+    }
+
+    async function downloadVaultFile(file: FileItem) {
+        if (!file.e2ee_iv || !file.chunk_count || !activeVaultId) {
+            throw new Error("Encrypted file metadata is incomplete")
+        }
+
+        const dek = getVaultKey(activeVaultId)
+        if (!dek) {
+            throw new Error("Unlock this vault before downloading files")
+        }
+
+        const fileName = getDisplayName(file)
+        touchVault(activeVaultId)
+
+        const picker = "showSaveFilePicker" in window
+            ? await (window as typeof window & {
+                showSaveFilePicker?: (options: {
+                    suggestedName: string
+                }) => Promise<FileSystemFileHandle>
+            }).showSaveFilePicker?.({ suggestedName: fileName })
+            : null
+
+        if (picker) {
+            const writable = await picker.createWritable()
+            try {
+                for (let chunkIndex = 0; chunkIndex < file.chunk_count; chunkIndex += 1) {
+                    const encryptedChunk = await fetchVaultChunk(file.id, chunkIndex)
+                    const plaintextChunk = await decryptChunk(dek, encryptedChunk, file.e2ee_iv, chunkIndex)
+                    await writable.write(new Uint8Array(plaintextChunk).buffer)
+                    touchVault(activeVaultId)
+                }
+            } finally {
+                await writable.close()
+            }
+            return
+        }
+
+        const blobParts: BlobPart[] = []
+        for (let chunkIndex = 0; chunkIndex < file.chunk_count; chunkIndex += 1) {
+            const encryptedChunk = await fetchVaultChunk(file.id, chunkIndex)
+            const plaintextChunk = await decryptChunk(dek, encryptedChunk, file.e2ee_iv, chunkIndex)
+            blobParts.push(new Uint8Array(plaintextChunk).buffer)
+            touchVault(activeVaultId)
+        }
+
+        const url = window.URL.createObjectURL(new Blob(blobParts, { type: file.mime_type || "application/octet-stream" }))
+        const anchor = document.createElement("a")
+        anchor.href = url
+        anchor.download = fileName
+        document.body.appendChild(anchor)
+        anchor.click()
+        anchor.remove()
+        window.URL.revokeObjectURL(url)
+    }
+
     // Upload
     async function handleUpload(e: React.ChangeEvent<HTMLInputElement>) {
         const fileList = e.target.files
         if (!fileList || fileList.length === 0) return
 
         const filesArray = Array.from(fileList)
-        addUpload(filesArray, currentFolderId, () => loadFiles())
+        addUpload(
+            filesArray,
+            currentFolderId,
+            () => loadFiles(),
+            isInsideVault ? uploadFilesToVault : undefined,
+        )
 
         // Reset input
         if (fileInputRef.current) {
@@ -317,6 +644,7 @@ export function FilesContent() {
     function handleDragEnter(e: React.DragEvent) {
         e.preventDefault()
         e.stopPropagation()
+        if (isInsideVault && !isActiveVaultUnlocked) return
         dragCounter.current++
         if (e.dataTransfer.items && e.dataTransfer.items.length > 0) {
             setIsDragging(true)
@@ -343,17 +671,35 @@ export function FilesContent() {
         setIsDragging(false)
         dragCounter.current = 0
 
+        if (isInsideVault && !isActiveVaultUnlocked) {
+            setError("Unlock this vault before uploading files")
+            return
+        }
+
         const droppedFiles = e.dataTransfer.files
         if (!droppedFiles || droppedFiles.length === 0) return
 
         const filesArray = Array.from(droppedFiles)
-        addUpload(filesArray, currentFolderId, () => loadFiles())
+        addUpload(
+            filesArray,
+            currentFolderId,
+            () => loadFiles(),
+            isInsideVault ? uploadFilesToVault : undefined,
+        )
     }
 
     // Download (supports both files and folders — folders download as ZIP)
     async function handleDownload(file: FileItem) {
         try {
-            const fileName = file.type === 'folder' ? `${file.name}.zip` : file.name
+            if (isSecureItem(file)) {
+                if (file.type === "folder") {
+                    throw new Error("Vault folders cannot be downloaded as server-side ZIP archives yet")
+                }
+                await downloadVaultFile(file)
+                return
+            }
+            const displayName = getDisplayName(file)
+            const fileName = file.type === 'folder' ? `${displayName}.zip` : displayName
             await downloadFile(file.id, fileName)
         } catch (err) {
             setError(err instanceof Error ? err.message : "Download failed")
@@ -362,6 +708,10 @@ export function FilesContent() {
 
     // Share
     async function handleShare(file: FileItem) {
+        if (isSecureItem(file)) {
+            setError("Encrypted vault items cannot be shared yet")
+            return
+        }
         setShareFile(file)
         setShowShareDialog(true)
         setShareLoading(true)
@@ -439,14 +789,26 @@ export function FilesContent() {
     // Rename
     function openRenameDialog(file: FileItem) {
         setSelectedItem(file)
-        setRenameValue(file.name)
+        setRenameValue(getDisplayName(file))
         setShowRenameDialog(true)
     }
 
     async function handleRename() {
         if (!selectedItem || !renameValue.trim()) return
         try {
-            await renameFile(selectedItem.id, renameValue.trim())
+            if (isSecureItem(selectedItem) && !selectedItem.is_secure_vault) {
+                if (!activeVaultId) {
+                    throw new Error("Vault context is unavailable")
+                }
+                const dek = getVaultKey(activeVaultId)
+                if (!dek) {
+                    throw new Error("Unlock this vault before renaming encrypted items")
+                }
+                await renameVaultItem(selectedItem.id, await encryptMetadata(dek, renameValue.trim()))
+                touchVault(activeVaultId)
+            } else {
+                await renameFile(selectedItem.id, renameValue.trim())
+            }
             setShowRenameDialog(false)
             loadFiles()
         } catch (err) {
@@ -469,6 +831,10 @@ export function FilesContent() {
     }
 
     async function openLocationDialog(file: FileItem, mode: "move" | "copy") {
+        if (isSecureItem(file)) {
+            setError(`${mode === "move" ? "Moving" : "Copying"} encrypted vault items is not supported yet`)
+            return
+        }
         setLocationTarget(file)
         setLocationMode(mode)
         setShowLocationDialog(true)
@@ -544,6 +910,11 @@ export function FilesContent() {
 
     // Preview
     function openPreview(file: FileItem) {
+        if (isSecureItem(file)) {
+            clearOverlays()
+            setError("Encrypted vault files cannot be previewed in the browser yet. Download them to decrypt locally.")
+            return
+        }
         setPreviewFile(file)
         setPreviewTextContent(null)
         setPdfBlobUrl(null)
@@ -625,7 +996,7 @@ export function FilesContent() {
                             onClick={() => navigateToFolder(crumb.id)}
                             className="truncate max-w-[100px] sm:max-w-none"
                         >
-                            {crumb.name}
+                            {getDisplayName(crumb)}
                         </Button>
                     </div>
                 ))}
@@ -643,10 +1014,24 @@ export function FilesContent() {
                     />
                 </div>
                 <div className="flex items-center gap-2">
+                    {!isInsideVault && (
+                        <Button
+                            variant="outline"
+                            className="gap-2"
+                            onClick={() => setShowSecureVaultDialog(true)}
+                        >
+                            <Lock className="h-4 w-4" />
+                            Secure Vault
+                        </Button>
+                    )}
                     <Button
                         variant="outline"
                         size="icon"
-                        onClick={() => setShowNewFolderDialog(true)}
+                            onClick={() => {
+                            clearOverlays()
+                            setShowNewFolderDialog(true)
+                        }}
+                        disabled={isInsideVault && !isActiveVaultUnlocked}
                     >
                         <FolderPlus className="h-4 w-4" />
                     </Button>
@@ -660,10 +1045,30 @@ export function FilesContent() {
                     <Button
                         className="gap-2"
                         onClick={() => fileInputRef.current?.click()}
+                        disabled={isInsideVault && !isActiveVaultUnlocked}
                     >
                         <Upload className="h-4 w-4" />
                         Upload
                     </Button>
+                    {isInsideVault && (
+                        <>
+                            {isActiveVaultUnlocked ? (
+                                <>
+                                    <Button variant="outline" size="icon" onClick={() => setShowChangePinDialog(true)} title="Change vault PIN">
+                                        <RefreshCw className="h-4 w-4" />
+                                    </Button>
+                                    <Button variant="outline" size="icon" onClick={() => activeVaultId && lockVault(activeVaultId)} title="Lock vault">
+                                        <Lock className="h-4 w-4" />
+                                    </Button>
+                                </>
+                            ) : (
+                                <Button variant="outline" className="gap-2" onClick={() => setShowUnlockVaultDialog(true)}>
+                                    <KeyRound className="h-4 w-4" />
+                                    Unlock
+                                </Button>
+                            )}
+                        </>
+                    )}
                     <Button
                         variant={isSelecting ? "default" : "outline"}
                         size="icon"
@@ -792,6 +1197,44 @@ export function FilesContent() {
                 </Card>
             )}
 
+            {isInsideVault && (
+                <Card className={cn(
+                    isActiveVaultUnlocked ? "bg-emerald-500/10 border-emerald-500/30" : "bg-amber-500/10 border-amber-500/30"
+                )}>
+                    <CardContent className="py-4 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                        <div className="flex items-start gap-3">
+                            {isActiveVaultUnlocked ? (
+                                <Lock className="h-5 w-5 text-emerald-500 mt-0.5 shrink-0" />
+                            ) : (
+                                <ShieldAlert className="h-5 w-5 text-amber-500 mt-0.5 shrink-0" />
+                            )}
+                            <div>
+                                <p className={cn(
+                                    "text-sm font-medium",
+                                    isActiveVaultUnlocked ? "text-emerald-500" : "text-amber-500",
+                                )}>
+                                    {isActiveVaultUnlocked ? "Vault unlocked" : "Vault locked"}
+                                </p>
+                                <p className={cn(
+                                    "text-sm mt-0.5",
+                                    isActiveVaultUnlocked ? "text-emerald-500/80" : "text-amber-500/80",
+                                )}>
+                                    {isActiveVaultUnlocked
+                                        ? `${getDisplayName(currentVault || { id: 0, name: "Vault" })} is using end-to-end encryption. The DEK will be evicted from memory after 15 minutes of inactivity.`
+                                        : "Enter the vault PIN to decrypt filenames and access file contents. If you lose the PIN, the data cannot be recovered."}
+                                </p>
+                            </div>
+                        </div>
+                        {!isActiveVaultUnlocked && (
+                            <Button className="gap-2 self-start md:self-auto" onClick={() => setShowUnlockVaultDialog(true)}>
+                                <KeyRound className="h-4 w-4" />
+                                Unlock Vault
+                            </Button>
+                        )}
+                    </CardContent>
+                </Card>
+            )}
+
             {/* Error Message */}
             {error && (
                 <Card className="bg-destructive/10 border-destructive">
@@ -850,14 +1293,32 @@ export function FilesContent() {
                 </Card>
             )}
 
+            {isInsideVault && !isActiveVaultUnlocked && !isLoading && (
+                <Card className="py-12">
+                    <CardContent className="flex flex-col items-center justify-center text-center">
+                        <Lock className="h-16 w-16 text-muted-foreground mb-4" />
+                        <h3 className="text-lg font-medium">Vault is locked</h3>
+                        <p className="text-muted-foreground mt-1">
+                            Unlock this vault to reveal encrypted filenames and access file contents.
+                        </p>
+                        <Button className="mt-4 gap-2" onClick={() => setShowUnlockVaultDialog(true)}>
+                            <KeyRound className="h-4 w-4" />
+                            Unlock Vault
+                        </Button>
+                    </CardContent>
+                </Card>
+            )}
+
             {/* Empty State */}
-            {filteredFiles.length === 0 && !isLoading && (
+            {(!isInsideVault || isActiveVaultUnlocked) && filteredFiles.length === 0 && !isLoading && (
                 <Card className="py-12">
                     <CardContent className="flex flex-col items-center justify-center text-center">
                         <FolderOpen className="h-16 w-16 text-muted-foreground mb-4" />
                         <h3 className="text-lg font-medium">No files yet</h3>
                         <p className="text-muted-foreground mt-1">
-                            Upload files or create a folder to get started
+                            {isInsideVault
+                                ? "Upload encrypted files or create encrypted folders to get started"
+                                : "Upload files or create a folder to get started"}
                         </p>
                         <div className="flex gap-2 mt-4">
                             <Button
@@ -877,11 +1338,12 @@ export function FilesContent() {
             )}
 
             {/* Files Grid */}
-            {view === "grid" && filteredFiles.length > 0 && (
+            {(!isInsideVault || isActiveVaultUnlocked) && view === "grid" && filteredFiles.length > 0 && (
                 <div className="grid gap-3 grid-cols-1 xs:grid-cols-2 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
                     {filteredFiles.map((file) => {
                         const Icon = getFileIcon(file.type)
                         const accessible = isFileAccessible(file)
+                        const previewAllowed = !isSecureItem(file) && file.type !== "folder"
                         return (
                             <ContextMenu key={file.id}>
                                 <ContextMenuTrigger asChild>
@@ -896,10 +1358,13 @@ export function FilesContent() {
                                     >
                                         <CardContent className="p-4">
                                             <div className="absolute right-2 top-2 flex items-center gap-1">
+                                                {isSecureItem(file) && (
+                                                    <Lock className="h-4 w-4 text-sky-400" />
+                                                )}
                                                 {file.starred === 1 && (
                                                     <Star className="h-4 w-4 fill-yellow-400 text-yellow-400" />
                                                 )}
-                                                {file.type !== 'folder' && (
+                                                {previewAllowed && (
                                                     <Button
                                                         variant="ghost"
                                                         size="icon"
@@ -939,11 +1404,11 @@ export function FilesContent() {
                                                             <>
                                                                 <DropdownMenuItem
                                                                     onClick={() => accessible && openPreview(file)}
-                                                                    disabled={!accessible}
+                                                                    disabled={!accessible || !previewAllowed}
                                                                     title={!accessible ? "Drive disconnected" : undefined}
                                                                 >
                                                                     <Eye className="h-4 w-4 mr-2" />
-                                                                    Preview
+                                                                    {previewAllowed ? "Preview" : "Preview unavailable"}
                                                                 </DropdownMenuItem>
                                                                 <DropdownMenuItem
                                                                     onClick={() => accessible && handleDownload(file)}
@@ -995,17 +1460,18 @@ export function FilesContent() {
                                                 onClick={() => {
                                                     if (!accessible) return
                                                     if (file.type === "folder") handleFileClick(file)
-                                                    else openPreview(file)
+                                                    else if (previewAllowed) openPreview(file)
+                                                    else handleDownload(file)
                                                 }}
                                             >
-                                                {file.type === "image" || file.type === "video" ? (
+                                                {(file.type === "image" || file.type === "video") && !isSecureItem(file) ? (
                                                     <div className="w-full h-20 sm:h-24 mb-2 sm:mb-3 rounded overflow-hidden bg-secondary flex items-center justify-center">
                                                         {!accessible || brokenThumbnails[file.id] ? (
                                                             <Icon className={cn("h-10 w-10 sm:h-12 sm:w-12", getFileColor(file.type))} />
                                                         ) : (
                                                             <img
                                                                 src={getThumbnailUrl(file.id, 256)}
-                                                                alt={file.name}
+                                                                alt={getDisplayName(file)}
                                                                 className="w-full h-full object-cover"
                                                                 loading="lazy"
                                                                 onError={(e) => {
@@ -1023,8 +1489,8 @@ export function FilesContent() {
                                                 ) : (
                                                     <Icon className={cn("h-10 w-10 sm:h-12 sm:w-12 mb-2 sm:mb-3", getFileColor(file.type))} />
                                                 )}
-                                                <p className="text-xs sm:text-sm font-medium text-card-foreground text-center line-clamp-2 w-full px-1" title={file.name}>
-                                                    {file.name}
+                                                <p className="text-xs sm:text-sm font-medium text-card-foreground text-center line-clamp-2 w-full px-1" title={getDisplayName(file)}>
+                                                    {getDisplayName(file)}
                                                 </p>
                                                 <p className="text-xs text-muted-foreground mt-1">
                                                     {formatFileSize(file.size)}
@@ -1053,11 +1519,11 @@ export function FilesContent() {
                                         <>
                                             <ContextMenuItem
                                                 onClick={() => accessible && openPreview(file)}
-                                                disabled={!accessible}
+                                                disabled={!accessible || !previewAllowed}
                                                 title={!accessible ? "Drive disconnected" : undefined}
                                             >
                                                 <Eye className="h-4 w-4 mr-2" />
-                                                Preview
+                                                {previewAllowed ? "Preview" : "Preview unavailable"}
                                             </ContextMenuItem>
                                             <ContextMenuItem
                                                 onClick={() => accessible && handleDownload(file)}
@@ -1107,7 +1573,7 @@ export function FilesContent() {
             )}
 
             {/* Files List */}
-            {view === "list" && filteredFiles.length > 0 && (
+            {(!isInsideVault || isActiveVaultUnlocked) && view === "list" && filteredFiles.length > 0 && (
                 <Card className="bg-card border-border overflow-hidden">
                     <CardHeader className="border-b border-border py-3 hidden sm:block">
                         <div className="grid grid-cols-12 gap-4 text-xs font-medium text-muted-foreground">
@@ -1121,6 +1587,7 @@ export function FilesContent() {
                         {filteredFiles.map((file) => {
                             const Icon = getFileIcon(file.type)
                             const accessible = isFileAccessible(file)
+                            const previewAllowed = !isSecureItem(file) && file.type !== "folder"
                             return (
                                 <div
                                     key={file.id}
@@ -1135,14 +1602,14 @@ export function FilesContent() {
                                     <div
                                         className="flex-1 sm:col-span-7 md:col-span-6 flex items-center gap-3 min-w-0"
                                     >
-                                        {file.type === "image" || file.type === "video" ? (
+                                        {(file.type === "image" || file.type === "video") && !isSecureItem(file) ? (
                                             <div className="h-9 w-9 rounded overflow-hidden bg-secondary shrink-0 flex items-center justify-center">
                                                 {!accessible || brokenThumbnails[file.id] ? (
                                                     <Icon className={cn("h-5 w-5", getFileColor(file.type))} />
                                                 ) : (
                                                     <img
                                                         src={getThumbnailUrl(file.id, 96)}
-                                                        alt={file.name}
+                                                        alt={getDisplayName(file)}
                                                         className="h-full w-full object-cover"
                                                         loading="lazy"
                                                         onError={(e) => {
@@ -1162,7 +1629,7 @@ export function FilesContent() {
                                         )}
                                         <div className="min-w-0 flex-1">
                                             <span className="text-sm font-medium text-card-foreground truncate block">
-                                                {file.name}
+                                                {getDisplayName(file)}
                                             </span>
                                             <span className="text-xs text-muted-foreground sm:hidden">
                                                 {formatFileSize(file.size)}
@@ -1170,6 +1637,9 @@ export function FilesContent() {
                                         </div>
                                         {file.starred === 1 && (
                                             <Star className="h-4 w-4 fill-yellow-400 text-yellow-400 flex-shrink-0" />
+                                        )}
+                                        {isSecureItem(file) && (
+                                            <Lock className="h-4 w-4 text-sky-400 flex-shrink-0" />
                                         )}
                                     </div>
                                     <div className="hidden sm:block sm:col-span-2 text-sm text-muted-foreground">
@@ -1205,11 +1675,11 @@ export function FilesContent() {
                                                     <>
                                                         <DropdownMenuItem
                                                             onClick={() => accessible && openPreview(file)}
-                                                            disabled={!accessible}
+                                                            disabled={!accessible || !previewAllowed}
                                                             title={!accessible ? "Drive disconnected" : undefined}
                                                         >
                                                             <Eye className="h-4 w-4 mr-2" />
-                                                            Preview
+                                                            {previewAllowed ? "Preview" : "Preview unavailable"}
                                                         </DropdownMenuItem>
                                                         <DropdownMenuItem
                                                             onClick={() => accessible && handleDownload(file)}
@@ -1263,11 +1733,150 @@ export function FilesContent() {
                 </Card>
             )}
 
+            <Dialog open={showSecureVaultDialog} onOpenChange={setShowSecureVaultDialog}>
+                <DialogContent>
+                    <DialogHeader>
+                        <DialogTitle>Create Secure Vault</DialogTitle>
+                    </DialogHeader>
+                    <div className="py-4 space-y-4">
+                        <div>
+                            <Label htmlFor="secureVaultName">Vault name</Label>
+                            <Input
+                                id="secureVaultName"
+                                value={newSecureVaultName}
+                                onChange={(e) => setNewSecureVaultName(e.target.value)}
+                                placeholder="Private files"
+                                className="mt-2"
+                            />
+                        </div>
+                        <div>
+                            <Label htmlFor="secureVaultPin">Vault PIN</Label>
+                            <Input
+                                id="secureVaultPin"
+                                type="password"
+                                value={secureVaultPin}
+                                onChange={(e) => setSecureVaultPin(e.target.value)}
+                                placeholder="At least 4 characters"
+                                className="mt-2"
+                            />
+                        </div>
+                        <div>
+                            <Label htmlFor="secureVaultPinConfirm">Confirm PIN</Label>
+                            <Input
+                                id="secureVaultPinConfirm"
+                                type="password"
+                                value={secureVaultPinConfirm}
+                                onChange={(e) => setSecureVaultPinConfirm(e.target.value)}
+                                className="mt-2"
+                                onKeyDown={(e) => e.key === "Enter" && handleCreateSecureVault()}
+                            />
+                        </div>
+                        <p className="text-xs text-muted-foreground">
+                            This PIN is never stored on the server. If you lose it, the encrypted data cannot be recovered.
+                        </p>
+                    </div>
+                    <DialogFooter>
+                        <Button variant="outline" onClick={() => setShowSecureVaultDialog(false)}>
+                            Cancel
+                        </Button>
+                        <Button onClick={handleCreateSecureVault} disabled={vaultBusy || !newSecureVaultName.trim()}>
+                            {vaultBusy ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Lock className="h-4 w-4 mr-2" />}
+                            Create Vault
+                        </Button>
+                    </DialogFooter>
+                </DialogContent>
+            </Dialog>
+
+            <Dialog open={showUnlockVaultDialog} onOpenChange={setShowUnlockVaultDialog}>
+                <DialogContent>
+                    <DialogHeader>
+                        <DialogTitle>Unlock Secure Vault</DialogTitle>
+                    </DialogHeader>
+                    <div className="py-4 space-y-4">
+                        <p className="text-sm text-muted-foreground">
+                            Enter the PIN for "{currentVault ? getDisplayName(currentVault) : "this vault"}" to decrypt filenames and access file contents.
+                        </p>
+                        <div>
+                            <Label htmlFor="unlockVaultPin">Vault PIN</Label>
+                            <Input
+                                id="unlockVaultPin"
+                                type="password"
+                                value={unlockPin}
+                                onChange={(e) => setUnlockPin(e.target.value)}
+                                className="mt-2"
+                                onKeyDown={(e) => e.key === "Enter" && handleUnlockVault()}
+                            />
+                        </div>
+                    </div>
+                    <DialogFooter>
+                        <Button variant="outline" onClick={() => setShowUnlockVaultDialog(false)}>
+                            Cancel
+                        </Button>
+                        <Button onClick={handleUnlockVault} disabled={vaultBusy || !unlockPin.trim()}>
+                            {vaultBusy ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <KeyRound className="h-4 w-4 mr-2" />}
+                            Unlock
+                        </Button>
+                    </DialogFooter>
+                </DialogContent>
+            </Dialog>
+
+            <Dialog open={showChangePinDialog} onOpenChange={setShowChangePinDialog}>
+                <DialogContent>
+                    <DialogHeader>
+                        <DialogTitle>Change Vault PIN</DialogTitle>
+                    </DialogHeader>
+                    <div className="py-4 space-y-4">
+                        {!isActiveVaultUnlocked && (
+                            <div>
+                                <Label htmlFor="changePinCurrent">Current PIN</Label>
+                                <Input
+                                    id="changePinCurrent"
+                                    type="password"
+                                    value={changePinCurrent}
+                                    onChange={(e) => setChangePinCurrent(e.target.value)}
+                                    className="mt-2"
+                                />
+                            </div>
+                        )}
+                        <div>
+                            <Label htmlFor="changePinNext">New PIN</Label>
+                            <Input
+                                id="changePinNext"
+                                type="password"
+                                value={changePinNext}
+                                onChange={(e) => setChangePinNext(e.target.value)}
+                                className="mt-2"
+                            />
+                        </div>
+                        <div>
+                            <Label htmlFor="changePinConfirm">Confirm new PIN</Label>
+                            <Input
+                                id="changePinConfirm"
+                                type="password"
+                                value={changePinConfirm}
+                                onChange={(e) => setChangePinConfirm(e.target.value)}
+                                className="mt-2"
+                                onKeyDown={(e) => e.key === "Enter" && handleChangeVaultPin()}
+                            />
+                        </div>
+                    </div>
+                    <DialogFooter>
+                        <Button variant="outline" onClick={() => setShowChangePinDialog(false)}>
+                            Cancel
+                        </Button>
+                        <Button onClick={handleChangeVaultPin} disabled={vaultBusy || !changePinNext.trim()}>
+                            {vaultBusy ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <RefreshCw className="h-4 w-4 mr-2" />}
+                            Update PIN
+                        </Button>
+                    </DialogFooter>
+                </DialogContent>
+            </Dialog>
+
             {/* New Folder Dialog */}
             <Dialog open={showNewFolderDialog} onOpenChange={setShowNewFolderDialog}>
                 <DialogContent>
                     <DialogHeader>
-                        <DialogTitle>Create New Folder</DialogTitle>
+                        <DialogTitle>{isInsideVault ? "Create Encrypted Folder" : "Create New Folder"}</DialogTitle>
                     </DialogHeader>
                     <div className="py-4">
                         <Label htmlFor="folderName">Folder name</Label>
@@ -1315,7 +1924,7 @@ export function FilesContent() {
                     <div className="space-y-4">
                         <div className="text-sm text-muted-foreground">
                             {locationMode === "move" ? "Moving" : "Copying"}{" "}
-                            <span className="font-medium text-foreground">"{locationTarget?.name}"</span>
+                            <span className="font-medium text-foreground">"{locationTarget ? getDisplayName(locationTarget) : ""}"</span>
                         </div>
 
                         <div className="rounded-lg border border-border p-3 space-y-3">
@@ -1356,7 +1965,7 @@ export function FilesContent() {
                                                     className={cn("h-7 px-2", destinationFolderId === crumb.id && "text-primary")}
                                                     onClick={() => handleDestinationNavigate(crumb.id)}
                                                 >
-                                                    {crumb.name}
+                                                    {getDisplayName(crumb)}
                                                 </Button>
                                             </div>
                                         ))}
@@ -1368,7 +1977,7 @@ export function FilesContent() {
                                 Destination:{" "}
                                 <span className="text-foreground font-medium">
                                     {destinationBreadcrumbs.length > 0
-                                        ? destinationBreadcrumbs[destinationBreadcrumbs.length - 1].name
+                                        ? getDisplayName(destinationBreadcrumbs[destinationBreadcrumbs.length - 1])
                                         : "Root"}
                                 </span>
                             </div>
@@ -1387,15 +1996,15 @@ export function FilesContent() {
                                 destinationFolders
                                     .filter((folder) => folder.id !== locationTarget?.id)
                                     .map((folder) => (
-                                        <Button
-                                            key={folder.id}
-                                            variant="ghost"
-                                            className="w-full justify-between h-auto py-2.5 px-3"
+                                            <Button
+                                                key={folder.id}
+                                                variant="ghost"
+                                                className="w-full justify-between h-auto py-2.5 px-3"
                                             onClick={() => handleDestinationNavigate(folder.id)}
                                         >
                                             <span className="flex items-center gap-2 min-w-0">
                                                 <Folder className="h-4 w-4 text-blue-400 shrink-0" />
-                                                <span className="truncate">{folder.name}</span>
+                                                <span className="truncate">{getDisplayName(folder)}</span>
                                             </span>
                                             <ChevronRight className="h-4 w-4 text-muted-foreground" />
                                         </Button>
@@ -1457,7 +2066,7 @@ export function FilesContent() {
                     <AlertDialogHeader>
                         <AlertDialogTitle>Move to Trash?</AlertDialogTitle>
                         <AlertDialogDescription>
-                            "{selectedItem?.name}" will be moved to trash. You can restore it later from the Trash page.
+                            "{selectedItem ? getDisplayName(selectedItem) : ""}" will be moved to trash. You can restore it later from the Trash page.
                         </AlertDialogDescription>
                     </AlertDialogHeader>
                     <AlertDialogFooter>
@@ -1481,7 +2090,7 @@ export function FilesContent() {
                         <div className="flex items-center gap-3 min-w-0">
                             <FileIcon className="h-5 w-5 text-white/70 shrink-0" />
                             <div className="min-w-0">
-                                <p className="text-white text-sm font-medium truncate">{previewFile.name}</p>
+                                <p className="text-white text-sm font-medium truncate">{getDisplayName(previewFile)}</p>
                                 <p className="text-white/50 text-xs">{formatFileSize(previewFile.size)}</p>
                             </div>
                         </div>
@@ -1514,7 +2123,7 @@ export function FilesContent() {
                         {previewFile.type === 'image' && (
                             <img
                                 src={getPreviewUrl(previewFile.id)}
-                                alt={previewFile.name}
+                                alt={getDisplayName(previewFile)}
                                 className="max-w-full max-h-[85vh] object-contain rounded-lg"
                             />
                         )}
@@ -1531,7 +2140,7 @@ export function FilesContent() {
                                 <div className="w-24 h-24 rounded-full bg-primary/10 flex items-center justify-center">
                                     <Music className="h-12 w-12 text-primary" />
                                 </div>
-                                <p className="text-card-foreground font-medium text-center">{previewFile.name}</p>
+                                <p className="text-card-foreground font-medium text-center">{getDisplayName(previewFile)}</p>
                                 <audio
                                     src={getPreviewUrl(previewFile.id)}
                                     controls
@@ -1558,7 +2167,7 @@ export function FilesContent() {
                                 {pdfBlobUrl === 'error' && (
                                     <div className="bg-card rounded-2xl p-8 flex flex-col items-center gap-4 w-[400px]">
                                         <FileIcon className="h-16 w-16 text-red-400" />
-                                        <p className="text-card-foreground font-medium text-center">{previewFile.name}</p>
+                                        <p className="text-card-foreground font-medium text-center">{getDisplayName(previewFile)}</p>
                                         <p className="text-muted-foreground text-sm text-center">
                                             Could not load PDF preview
                                         </p>
@@ -1588,7 +2197,7 @@ export function FilesContent() {
                         {previewFile.type === 'archive' && (
                             <div className="bg-card rounded-2xl p-8 flex flex-col items-center gap-4">
                                 <Archive className="h-16 w-16 text-amber-400" />
-                                <p className="text-card-foreground font-medium">{previewFile.name}</p>
+                                <p className="text-card-foreground font-medium">{getDisplayName(previewFile)}</p>
                                 <p className="text-muted-foreground text-sm">Archive files cannot be previewed</p>
                                 <Button onClick={(e) => { e.stopPropagation(); handleDownload(previewFile) }} className="gap-2">
                                     <Download className="h-4 w-4" />
@@ -1611,7 +2220,7 @@ export function FilesContent() {
                     <DialogHeader>
                         <DialogTitle className="flex items-center gap-2">
                             <Users className="h-5 w-5" />
-                            Share "{shareFile?.name}"
+                            Share "{shareFile ? getDisplayName(shareFile) : ""}"
                         </DialogTitle>
                     </DialogHeader>
 
@@ -1716,11 +2325,11 @@ export function FilesContent() {
                         <div className="p-5 space-y-6">
                             {/* File icon + name */}
                             <div className="flex flex-col items-center text-center gap-3">
-                                {detailFile.type === "image" ? (
+                                {detailFile.type === "image" && !isSecureItem(detailFile) ? (
                                     <div className="w-32 h-32 rounded-lg overflow-hidden bg-secondary">
                                         <img
                                             src={getPreviewUrl(detailFile.id)}
-                                            alt={detailFile.name}
+                                            alt={getDisplayName(detailFile)}
                                             className="w-full h-full object-cover"
                                             onError={(e) => {
                                                 const target = e.target as HTMLImageElement
@@ -1736,7 +2345,7 @@ export function FilesContent() {
                                         })()}
                                     </div>
                                 )}
-                                <p className="text-sm font-semibold text-card-foreground break-all">{detailFile.name}</p>
+                                <p className="text-sm font-semibold text-card-foreground break-all">{getDisplayName(detailFile)}</p>
                             </div>
 
                             {/* Metadata grid */}

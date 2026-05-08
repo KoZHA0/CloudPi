@@ -955,6 +955,15 @@ export interface DetectedDrive {
     isMounted: boolean;
     isRegistered: boolean;
     registeredId: string | null;
+    source?: string | null;
+}
+
+export interface SkippedDriveCandidate {
+    name: string;
+    path: string;
+    reason: string;
+    source?: string | null;
+    device?: string | null;
 }
 
 export interface RegisteredSource {
@@ -968,6 +977,7 @@ export interface RegisteredSource {
 
 export interface DrivesScanResponse {
     drives: DetectedDrive[];
+    skippedCandidates?: SkippedDriveCandidate[];
     registeredSources: RegisteredSource[];
     platform: string;
     message?: string;

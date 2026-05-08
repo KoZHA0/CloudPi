@@ -207,6 +207,27 @@ function cleanupStaleVaultUploadSessions(maxAgeHours = 24) {
     }
 }
 
+function cleanupEmptyOrphanVaultRoots() {
+    try {
+        const result = db.prepare(`
+            DELETE FROM files
+            WHERE is_secure_vault = 1
+              AND NOT EXISTS (
+                SELECT 1 FROM folder_locks WHERE folder_locks.folder_id = files.id
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM files child WHERE child.parent_id = files.id
+              )
+        `).run();
+
+        if (result.changes > 0) {
+            console.log(`[VAULT] Removed ${result.changes} empty orphan vault root(s) left by incomplete creation.`);
+        }
+    } catch (error) {
+        console.error('[VAULT] Orphan vault cleanup failed:', error.message);
+    }
+}
+
 function requireProtectedVaultStorage(req, res, next) {
     try {
         ensureProtectedInternalStorageAvailable();
@@ -221,6 +242,7 @@ function requireProtectedVaultStorage(req, res, next) {
 }
 
 cleanupStaleVaultUploadSessions();
+cleanupEmptyOrphanVaultRoots();
 
 router.use(requireAuth);
 router.use(requireProtectedVaultStorage);
@@ -266,19 +288,22 @@ router.post('/', (req, res) => {
             return res.status(400).json({ error: 'Folder with this name already exists' });
         }
 
-        const inserted = db.prepare(`
-            INSERT INTO files (user_id, name, path, type, parent_id, storage_source_id, is_secure_vault)
-            VALUES (?, ?, '', 'folder', ?, ?, 1)
-        `).run(userId, String(name).trim(), parentId, storageSourceId);
+        const vault = db.transaction(() => {
+            const inserted = db.prepare(`
+                INSERT INTO files (user_id, name, path, type, parent_id, storage_source_id, is_secure_vault)
+                VALUES (?, ?, '', 'folder', ?, ?, 1)
+            `).run(userId, String(name).trim(), parentId, storageSourceId);
 
-        const vaultId = inserted.lastInsertRowid;
-        db.prepare('UPDATE files SET vault_root_id = ? WHERE id = ?').run(vaultId, vaultId);
-        db.prepare(`
-            INSERT INTO folder_locks (folder_id, user_id, salt, encrypted_dek, dek_iv)
-            VALUES (?, ?, ?, ?, ?)
-        `).run(vaultId, userId, salt, encryptedDek, dekIv);
+            const vaultId = inserted.lastInsertRowid;
+            db.prepare('UPDATE files SET vault_root_id = ? WHERE id = ?').run(vaultId, vaultId);
+            db.prepare(`
+                INSERT INTO folder_locks (folder_id, user_id, salt, encrypted_dek, dek_iv)
+                VALUES (?, ?, ?, ?, ?)
+            `).run(vaultId, userId, salt, encryptedDek, dekIv);
 
-        const vault = db.prepare('SELECT * FROM files WHERE id = ?').get(vaultId);
+            return db.prepare('SELECT * FROM files WHERE id = ?').get(vaultId);
+        })();
+
         return res.status(201).json({
             message: 'Secure vault created successfully',
             folder: vault,

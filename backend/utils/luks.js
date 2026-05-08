@@ -45,6 +45,7 @@ const LUKS_DEVICE      = process.env.LUKS_DEVICE      || '/dev/sda1';
 const MAPPER_NAME      = process.env.LUKS_MAPPER_NAME || 'cloudpi-data';
 const MOUNT_POINT      = process.env.LUKS_MOUNT_POINT || '/media/cloudpi-data';
 const MAPPER_DEVICE    = `/dev/mapper/${MAPPER_NAME}`;
+const MOUNT_MARKER     = process.env.LUKS_MOUNT_MARKER || '.cloudpi-luks-ready';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -91,6 +92,16 @@ async function getLuksStatus() {
     mapperDevice: MAPPER_DEVICE,
     mountPoint:   MOUNT_POINT,
   };
+
+  const markerPath = `${MOUNT_POINT}/${MOUNT_MARKER}`;
+
+  // Docker deployments often manage LUKS on the host and only bind-mount the
+  // decrypted filesystem into the container. In that case the container may
+  // not see /dev/disk/by-uuid/... at all, so the mount itself becomes the
+  // source of truth.
+  if (fs.existsSync(markerPath)) {
+    return { ...base, status: 'mounted' };
+  }
 
   // 1. Does the raw block device exist?
   if (!fs.existsSync(LUKS_DEVICE)) {

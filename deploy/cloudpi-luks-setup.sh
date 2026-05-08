@@ -58,7 +58,7 @@ require_root() {
 
 require_commands() {
     local missing=()
-    local commands=(cryptsetup lsblk findmnt mount umount mkfs.ext4 docker awk sed grep)
+    local commands=(cryptsetup lsblk blkid findmnt mount umount mkfs.ext4 docker awk sed grep)
     for cmd in "${commands[@]}"; do
         if ! command -v "${cmd}" >/dev/null 2>&1; then
             missing+=("${cmd}")
@@ -219,7 +219,7 @@ main() {
 
     show_devices
 
-    local luks_device mapper_name mount_point mapper_device
+    local luks_device mapper_name mount_point mapper_device luks_uuid persistent_luks_device
     luks_device="$(prompt_value 'Target LUKS partition' "${DEFAULT_LUKS_DEVICE}")"
     mapper_name="$(prompt_value 'LUKS mapper name' "${DEFAULT_MAPPER_NAME}")"
     mount_point="$(prompt_value 'LUKS mount point' "${DEFAULT_MOUNT_POINT}")"
@@ -244,6 +244,14 @@ main() {
     printf '%s' "${LUKS_PASSPHRASE}" | cryptsetup luksFormat --type luks2 --batch-mode "${luks_device}" -
     print_ok "LUKS container created"
 
+    luks_uuid="$(blkid -s UUID -o value "${luks_device}")"
+    if [ -z "${luks_uuid}" ]; then
+        print_err "Failed to read the new LUKS UUID from ${luks_device}"
+        exit 1
+    fi
+    persistent_luks_device="/dev/disk/by-uuid/${luks_uuid}"
+    print_ok "Persistent LUKS device path: ${persistent_luks_device}"
+
     print_step "Opening encrypted device"
     printf '%s' "${LUKS_PASSPHRASE}" | cryptsetup luksOpen "${luks_device}" "${mapper_name}" --key-file=-
     print_ok "Mapper opened at ${mapper_device}"
@@ -259,7 +267,7 @@ main() {
     print_ok "Mounted at ${mount_point}"
 
     print_step "Configuring Docker bind mounts in project .env"
-    write_env_setting "LUKS_DEVICE" "${luks_device}"
+    write_env_setting "LUKS_DEVICE" "${persistent_luks_device}"
     write_env_setting "LUKS_MAPPER_NAME" "${mapper_name}"
     write_env_setting "LUKS_MOUNT_POINT" "${mount_point}"
     write_env_setting "CLOUDPI_DB_MOUNT" "${mount_point}/${APPDATA_SUBDIR}"
@@ -281,6 +289,7 @@ main() {
     echo "  1. Visit CloudPi Admin -> Layer 1: LUKS Disk Encryption"
     echo "  2. Confirm status shows the mounted device"
     echo "  3. Test secure vault creation and upload"
+    echo "  4. The stack now tracks the encrypted partition by UUID, not /dev/sdX"
     echo ""
     echo "Daily host control script:"
     echo "  sudo bash deploy/cloudpi-luks-stack.sh status"

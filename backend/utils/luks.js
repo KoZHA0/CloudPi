@@ -11,7 +11,8 @@
  *   never interpolated into a shell string — preventing shell injection.
  *
  * EXPECTED ENVIRONMENT:
- *   LUKS_DEVICE        - Block device to unlock  (e.g. /dev/sda1)
+ *   LUKS_DEVICE        - Persistent device reference to unlock
+ *                        (recommended: /dev/disk/by-uuid/<luks-uuid>)
  *   LUKS_MAPPER_NAME   - dm-crypt mapper name    (default: cloudpi-data)
  *   LUKS_MOUNT_POINT   - Where to mount the fs   (default: /media/cloudpi-data)
  *
@@ -24,7 +25,7 @@
  *     as root.  See docs/luks-sudoers.md for the recommended snippet.
  *
  * HOW LUKS WORKS AT A HIGH LEVEL:
- *   1. The USB drive's partition (/dev/sda1) is a LUKS container — all data
+ *   1. The USB drive's partition is a LUKS container — all data
  *      on disk is AES-256-XTS encrypted.
  *   2. `cryptsetup luksOpen` decrypts the LUKS header using the passphrase
  *      and creates a transparent block device at /dev/mapper/<name>.

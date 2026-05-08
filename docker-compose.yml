@@ -34,7 +34,9 @@ services:
       # Host path where USB drives are auto-mounted (default: /media/pi)
       - CLOUDPI_EXTERNAL_DRIVES_PATH=/media/pi
       # ── LUKS Configuration ──────────────────────────────────────────────
-      # LUKS_DEVICE: the raw LUKS-encrypted partition (e.g. /dev/sda1)
+      # LUKS_DEVICE: persistent reference to the LUKS-encrypted partition.
+      # Recommended: /dev/disk/by-uuid/<luks-uuid>
+      # The bootstrap script writes this automatically after initial setup.
       # The backend calls `cryptsetup luksOpen` and `mount` on this device
       # via the host OS (via a privileged sudoers-wrapped helper or host scripts).
       # If you manage LUKS unlocking purely at host level before Docker starts,

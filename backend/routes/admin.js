@@ -37,6 +37,14 @@ const { JWT_SECRET, SALT_ROUNDS } = require('../utils/auth-config');
 const { sendEmail } = require('../utils/mailer');
 
 const router = express.Router();
+const LUKS_MOUNT_POINT = path.resolve(process.env.LUKS_MOUNT_POINT || '/media/cloudpi-data');
+
+function isReservedLuksStoragePath(candidatePath) {
+    if (!candidatePath) return false;
+    const normalizedCandidate = path.resolve(candidatePath);
+    return normalizedCandidate === LUKS_MOUNT_POINT
+        || normalizedCandidate.startsWith(`${LUKS_MOUNT_POINT}${path.sep}`);
+}
 
 // HMAC helpers for .cloudpi-id integrity (shared utility)
 const { computeDriveHmac, verifyDriveHmac } = require('../utils/drive-hmac');
@@ -749,6 +757,12 @@ router.post('/storage', requireAdmin, (req, res) => {
             return res.status(400).json({ error: 'Path and label are required' });
         }
 
+        if (isReservedLuksStoragePath(drivePath)) {
+            return res.status(400).json({
+                error: 'The CloudPi LUKS mount is reserved for Layer 1 application storage and cannot be registered as a user storage source.'
+            });
+        }
+
         // Check path exists
         if (!fs.existsSync(drivePath)) {
             return res.status(400).json({ error: `Path not found: ${drivePath}` });
@@ -1024,6 +1038,7 @@ router.get('/drives', requireAdmin, async (req, res) => {
             if (!entry.isDirectory()) continue;
 
             const drivePath = path.join(EXTERNAL_DRIVES_PATH, entry.name);
+            if (isReservedLuksStoragePath(drivePath)) continue;
 
             // Check if registered in our DB
             let isRegistered = false;

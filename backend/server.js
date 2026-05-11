@@ -14,6 +14,16 @@
 // Load environment variables from .env file (must be first!)
 require('dotenv').config();
 
+// Load master encryption key (must happen before routes are imported)
+const { loadMasterKey } = require('./utils/crypto-utils');
+try {
+    loadMasterKey();
+} catch (err) {
+    console.error('\n❌ FATAL:', err.message);
+    console.error('   Set CLOUDPI_ENCRYPTION_KEY in backend/.env (generate with: openssl rand -hex 32)');
+    process.exit(1);
+}
+
 const express = require('express');
 const cors = require('cors');
 
@@ -180,11 +190,8 @@ app.use('/api/shares', shareRoutes);
 const dashboardRoutes = require('./routes/dashboard');
 app.use('/api/dashboard', dashboardRoutes);
 
-// WebDAV + LUKS routes
-// - /webdav/*        — Cryptomator-compatible WebDAV endpoint (per-user chroot)
-// - /api/luks/status — LUKS drive status (polled by the frontend)
-// - /api/luks/unlock — Admin-only: unlock + mount the LUKS drive
-// - /api/luks/lock   — Admin-only: lock the LUKS drive
+// WebDAV routes
+// - /webdav/*  — Cryptomator-compatible WebDAV endpoint (per-user chroot)
 const webdavRoutes = require('./routes/webdav');
 app.use('/', webdavRoutes);
 
@@ -202,11 +209,7 @@ const server = app.listen(PORT, () => {
   console.log(`   URL:    http://localhost:${PORT}`);
   console.log(`   Test:   http://localhost:${PORT}/api/test`);
   console.log(`   WebDAV: http://localhost:${PORT}/webdav/`);
-  // Log the LUKS drive status asynchronously (non-blocking)
-  require('./utils/luks').getLuksStatus()
-    .then(s => console.log(`   LUKS:   ${s.status.toUpperCase()} (${s.device})`))
-    .catch(() => console.log('   LUKS:   status unavailable (running on non-Linux host?)'))
-    .finally(() => console.log(''));
+  console.log('');
 });
 
 // Keep the process alive and handle errors

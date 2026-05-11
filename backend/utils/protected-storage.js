@@ -1,35 +1,23 @@
-const fs = require('fs');
-const path = require('path');
+/**
+ * PROTECTED STORAGE — No-op Compatibility Module
+ * ================================================
+ * Previously gated internal storage behind LUKS mount status.
+ * Now that encryption has moved to the application layer (AES-256-GCM),
+ * internal storage is always available — no block-device gating needed.
+ *
+ * This module is kept as a no-op stub so existing callers don't break.
+ */
 
-const LUKS_MOUNT_POINT = process.env.LUKS_MOUNT_POINT || '/media/cloudpi-data';
-const LUKS_MOUNT_MARKER = process.env.LUKS_MOUNT_MARKER || '.cloudpi-luks-ready';
-const INTERNAL_STORAGE_REQUIRES_LUKS = process.env.CLOUDPI_INTERNAL_STORAGE_REQUIRES_LUKS === '1';
+'use strict';
 
-function isProtectedInternalStorageRequired() {
-    return INTERNAL_STORAGE_REQUIRES_LUKS;
-}
-
-function getProtectedMountMarkerPath() {
-    return path.join(LUKS_MOUNT_POINT, LUKS_MOUNT_MARKER);
-}
-
-function isProtectedMountAvailable() {
-    return fs.existsSync(getProtectedMountMarkerPath());
-}
-
+/**
+ * No-op — internal storage is always available under application-level encryption.
+ * Previously threw when the LUKS mount was not present.
+ */
 function ensureProtectedInternalStorageAvailable() {
-    if (!isProtectedInternalStorageRequired()) return;
-    if (isProtectedMountAvailable()) return;
-
-    const error = new Error(
-        'CloudPi encrypted internal storage is unavailable. Reconnect or unlock the LUKS drive before accessing internal files.'
-    );
-    error.code = 'LUKS_STORAGE_UNAVAILABLE';
-    throw error;
+    // No-op: LUKS gating removed. Internal storage is always accessible.
 }
 
 module.exports = {
-    isProtectedInternalStorageRequired,
-    isProtectedMountAvailable,
     ensureProtectedInternalStorageAvailable,
 };

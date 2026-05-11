@@ -372,7 +372,7 @@ export function FilesContent() {
 
     function getStorageDisconnectMessage(source: { source_id: string; label: string }) {
         if (source.source_id === "internal") {
-            return "CloudPi's encrypted internal storage is locked or unavailable. Internal files cannot be opened until the LUKS drive is unlocked again."
+            return "CloudPi's internal storage is temporarily unavailable."
         }
         return `Drive "${source.label}" is not currently attached. Files on this drive are temporarily unavailable.`
     }

@@ -56,10 +56,19 @@ router.get('/stats', requireAuth, (req, res) => {
     try {
         const userId = req.user.userId;
 
+        // User storage quota
+        const user = db.prepare('SELECT storage_quota FROM users WHERE id = ?').get(userId);
+
         // Total files and storage
         const totalStats = db.prepare(`
             SELECT COUNT(*) as totalFiles, COALESCE(SUM(size), 0) as totalStorage
             FROM files WHERE user_id = ? AND type != 'folder' AND trashed = 0
+        `).get(userId);
+
+        // Trash stats (files taking up space in the bin)
+        const trashStats = db.prepare(`
+            SELECT COUNT(*) as trashFiles, COALESCE(SUM(size), 0) as trashStorage
+            FROM files WHERE user_id = ? AND type != 'folder' AND trashed = 1
         `).get(userId);
 
         // Total folders
@@ -99,6 +108,9 @@ router.get('/stats', requireAuth, (req, res) => {
             totalFiles: totalStats.totalFiles,
             totalStorage: totalStats.totalStorage,
             totalFolders: folderStats.totalFolders,
+            storageQuota: user.storage_quota,
+            trashFiles: trashStats.trashFiles,
+            trashStorage: trashStats.trashStorage,
             byType,
             recentFiles,
             sharedByMe: sharedByMe.count,

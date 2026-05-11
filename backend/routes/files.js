@@ -6,6 +6,7 @@
  * ENDPOINTS:
  * GET    /api/files              - List files/folders in directory
  * GET    /api/files/trash        - List trashed items
+ * DELETE /api/files/trash/empty  - Permanently empty trash
  * GET    /api/files/recent       - Get recently modified files
  * GET    /api/files/search       - Global file/folder search
  * POST   /api/files/folder       - Create new folder
@@ -32,7 +33,7 @@ const rateLimit = require('express-rate-limit'); // kept for reference but uploa
 const fastq = require('fastq');
 const archiver = require('archiver');
 const { spawn } = require('child_process');
-const { computeFileHash, verifyFileHash } = require('../utils/crypto-utils');
+const { computeFileHash, verifyFileHash, encryptFile, decryptToStream, createDecryptStream, isEncryptionEnabled } = require('../utils/crypto-utils');
 const { JWT_SECRET } = require('../utils/auth-config');
 const { ensureProtectedInternalStorageAvailable } = require('../utils/protected-storage');
 
@@ -290,11 +291,16 @@ async function uploadWorker(task, callback) {
         const { userId, parentId, files, storageSourceId } = task;
         const uploadedFiles = [];
 
+        // Check once per batch whether encryption is enabled
+        const shouldEncrypt = isEncryptionEnabled(db);
+
         for (const file of files) {
             const fileType = getFileType(file.mimetype);
             const diskPath = file.path;
 
-            // Compute SHA-256 hash for integrity verification on download
+            // Compute SHA-256 hash on the PLAINTEXT before any encryption.
+            // This ensures identical files produce the same hash regardless of
+            // their unique IVs, and download integrity checks work correctly.
             let sha256Hash = null;
             try {
                 sha256Hash = await computeFileHash(diskPath);
@@ -302,21 +308,54 @@ async function uploadWorker(task, callback) {
                 console.error('Hash computation failed:', hashErr.message);
             }
 
-            // Files are stored as plaintext in app logic; Layer 1 LUKS protects the disk.
-            // Secure vaults use separate client-side encryption flows.
+            // Encryption path: AES-256-GCM streaming encryption
+            let encrypted = 0;
+            let encryptionIv = null;
+            let encryptionAuthTag = null;
+            let finalSize = file.size;
+
+            if (shouldEncrypt) {
+                const encPath = diskPath + '.enc';
+                try {
+                    const result = await encryptFile(diskPath, encPath);
+                    // Replace original plaintext with encrypted version atomically
+                    fs.unlinkSync(diskPath);
+                    fs.renameSync(encPath, diskPath);
+
+                    encrypted = 1;
+                    encryptionIv = result.iv.toString('hex');
+                    encryptionAuthTag = result.authTag.toString('hex');
+                    finalSize = result.encryptedSize;
+                } catch (encErr) {
+                    // Drive may have been disconnected mid-encrypt (ENOENT / EIO)
+                    console.error(`⚠️ Encryption failed for ${file.originalname}:`, encErr.message);
+                    // Clean up partial .enc file if it exists
+                    try { fs.unlinkSync(encPath); } catch (_) { /* ignore */ }
+                    // If the original file is also gone (drive pulled), throw to fail the upload
+                    if (!fs.existsSync(diskPath)) {
+                        throw new Error(`Storage unavailable during encryption of ${file.originalname} — drive may be disconnected`);
+                    }
+                    // If the original is still there, proceed unencrypted (graceful degradation)
+                    console.warn(`   → File saved unencrypted as fallback`);
+                }
+            }
+
             const result = db.prepare(`
-                INSERT INTO files (user_id, name, path, type, size, mime_type, parent_id, storage_source_id, sha256_hash)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO files (user_id, name, path, type, size, mime_type, parent_id, storage_source_id, sha256_hash, encrypted, e2ee_iv, encryption_auth_tag)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `).run(
                 userId,
                 file.originalname,
                 file.filename,
                 fileType,
-                file.size,
+                finalSize,
                 file.mimetype,
                 parentId,
                 storageSourceId || 'internal',
-                sha256Hash
+                sha256Hash,
+                encrypted,
+                encryptionIv,
+                encryptionAuthTag
             );
 
             const uploaded = db.prepare('SELECT * FROM files WHERE id = ?').get(result.lastInsertRowid);
@@ -894,6 +933,12 @@ router.get('/:id/thumbnail', async (req, res) => {
 
         if (!file) return res.status(404).json({ error: 'File not found' });
 
+        // Encrypted files cannot have thumbnails generated without decrypting first
+        // (too expensive on Pi and creates temporary plaintext on disk)
+        if (file.encrypted === 1) {
+            return res.status(400).json({ error: 'Thumbnails are unavailable for encrypted files' });
+        }
+
         // Check if the file's storage source is ACTUALLY mounted
         if (file.storage_source_id && file.storage_source_id !== 'internal') {
             const source = db.prepare('SELECT is_accessible, label, path FROM storage_sources WHERE id = ?')
@@ -1081,8 +1126,22 @@ router.get('/:id/preview', async (req, res) => {
         res.set('Content-Disposition', `inline; filename="${encodeURIComponent(file.name)}"`);
         res.set('Cache-Control', 'public, max-age=86400');
 
-        // Serve the file directly (no AES decryption — LUKS handles disk encryption)
-        res.sendFile(filePath);
+        // Decrypt and stream if file is encrypted, otherwise serve directly
+        if (file.encrypted === 1) {
+            try {
+                await decryptToStream(filePath, res);
+            } catch (decErr) {
+                if (decErr.message.includes('FILE_INTEGRITY_FAILED')) {
+                    db.prepare('UPDATE files SET integrity_failed = 1 WHERE id = ?').run(file.id);
+                    if (!res.headersSent) return res.status(500).json({ error: 'File integrity check failed — the file may be corrupted' });
+                } else {
+                    console.error('Decryption error during preview:', decErr.message);
+                    if (!res.headersSent) return res.status(503).json({ error: 'Failed to decrypt file — storage may be unavailable' });
+                }
+            }
+        } else {
+            res.sendFile(filePath);
+        }
     } catch (error) {
         if (error.name === 'JsonWebTokenError' || error.name === 'TokenExpiredError') {
             return res.status(401).json({ error: 'Invalid token' });
@@ -1151,6 +1210,24 @@ router.get('/:id/download', requireAuth, async (req, res) => {
                 }
             }
 
+            // Decrypt and stream if encrypted, otherwise serve raw file
+            if (file.encrypted === 1) {
+                res.set('Content-Disposition', `attachment; filename="${encodeURIComponent(file.name)}"`);
+                res.set('Content-Type', file.mime_type || 'application/octet-stream');
+                try {
+                    await decryptToStream(filePath, res);
+                } catch (decErr) {
+                    if (decErr.message.includes('FILE_INTEGRITY_FAILED')) {
+                        db.prepare('UPDATE files SET integrity_failed = 1 WHERE id = ?').run(file.id);
+                        if (!res.headersSent) return res.status(500).json({ error: 'File integrity check failed — the file may be corrupted or tampered with' });
+                    } else {
+                        console.error('Decryption error during download:', decErr.message);
+                        if (!res.headersSent) return res.status(503).json({ error: 'Failed to decrypt file — storage may be unavailable' });
+                    }
+                }
+                return;
+            }
+
             return res.download(filePath, file.name);
         }
 
@@ -1172,6 +1249,7 @@ router.get('/:id/download', requireAuth, async (req, res) => {
                         collected.push({
                             diskPath,
                             archivePath: childPath,
+                            encrypted: child.encrypted === 1,
                         });
                     }
                 }
@@ -1197,9 +1275,19 @@ router.get('/:id/download', requireAuth, async (req, res) => {
         });
         archive.pipe(res);
 
-        // Files are stored as plaintext on the LUKS-encrypted disk — add directly
-        for (const { diskPath, archivePath } of filesToZip) {
-            archive.file(diskPath, { name: archivePath });
+        // Add files to archive — decrypt encrypted files before adding
+        for (const { diskPath, archivePath, encrypted } of filesToZip) {
+            if (encrypted) {
+                // Decrypt and pipe into archive as a stream
+                try {
+                    const { stream: decStream } = createDecryptStream(diskPath);
+                    archive.append(decStream, { name: archivePath });
+                } catch (decErr) {
+                    console.error(`Skipping encrypted file in ZIP (decrypt failed): ${archivePath}`, decErr.message);
+                }
+            } else {
+                archive.file(diskPath, { name: archivePath });
+            }
         }
 
         archive.finalize();
@@ -1670,6 +1758,57 @@ router.get('/storage-stats', requireAuth, (req, res) => {
             return res.status(503).json({ error: error.message });
         }
         res.status(500).json({ error: 'Server error' });
+    }
+});
+
+/**
+ * DELETE /api/files/trash/empty
+ * Permanently deletes all trashed records for the current user.
+ */
+router.delete('/trash/empty', requireAuth, (req, res) => {
+    try {
+        const userId = req.user.userId;
+
+        const trashedItems = db.prepare(`
+            SELECT id, user_id, path, type, size, storage_source_id, vault_root_id, is_secure_vault
+            FROM files
+            WHERE user_id = ? AND trashed = 1
+            ORDER BY CASE WHEN type = 'folder' THEN 0 ELSE 1 END, id ASC
+        `).all(userId);
+
+        if (trashedItems.length === 0) {
+            return res.json({
+                message: 'Trash is already empty',
+                deletedItems: 0,
+                deletedFiles: 0,
+                freedBytes: 0,
+            });
+        }
+
+        let deletedFiles = 0;
+        let freedBytes = 0;
+
+        for (const item of trashedItems) {
+            if (item.path) {
+                deleteStoredItem(item);
+            }
+            if (item.type !== 'folder') {
+                deletedFiles += 1;
+                freedBytes += Number(item.size) || 0;
+            }
+        }
+
+        db.prepare('DELETE FROM files WHERE user_id = ? AND trashed = 1').run(userId);
+
+        res.json({
+            message: 'Trash emptied successfully',
+            deletedItems: trashedItems.length,
+            deletedFiles,
+            freedBytes,
+        });
+    } catch (error) {
+        console.error('Empty trash error:', error);
+        res.status(500).json({ error: 'Failed to empty trash' });
     }
 });
 

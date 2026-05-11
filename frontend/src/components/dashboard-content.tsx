@@ -18,6 +18,7 @@ import {
     Thermometer,
 } from "lucide-react"
 import { getDashboardStats, getSystemHealth, type DashboardStats, type SystemHealth } from "@/lib/api"
+import { StorageOverview } from "@/lib/storage-overview"
 
 function formatBytes(bytes: number): string {
     if (bytes === 0) return "0 B"
@@ -121,16 +122,20 @@ export function DashboardContent() {
     async function loadData() {
         setIsLoading(true)
         try {
-            const [statsData, healthData] = await Promise.all([
-                getDashboardStats(),
-                getSystemHealth(),
-            ])
-            setStats(statsData)
-            setHealth(healthData)
+            await Promise.all([loadStats(), loadHealth()])
         } catch {
             // silently fail
         } finally {
             setIsLoading(false)
+        }
+    }
+
+    async function loadStats() {
+        try {
+            const statsData = await getDashboardStats()
+            setStats(statsData)
+        } catch {
+            // silently fail
         }
     }
 
@@ -203,6 +208,14 @@ export function DashboardContent() {
                     </CardContent>
                 </Card>
             </div>
+
+            <StorageOverview
+                totalStorage={stats?.totalStorage ?? 0}
+                storageQuota={stats?.storageQuota ?? null}
+                trashStorage={stats?.trashStorage ?? 0}
+                trashFiles={stats?.trashFiles ?? 0}
+                onRefreshStats={loadStats}
+            />
 
             <div className="grid gap-6 lg:grid-cols-3">
                 {/* System Health */}

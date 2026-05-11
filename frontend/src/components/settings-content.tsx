@@ -10,8 +10,8 @@ import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog"
-import { Bell, Globe, Palette, HardDrive, Trash2, Server, Database, Loader2, Shield, Save, CheckCircle2, Plus, Usb, Mail, Send } from "lucide-react"
-import { getDashboardStats, getSystemHealth, getRateLimitSettings, updateSettings, testSmtpSettings, getStorageSources, addStorageSource, removeStorageSource, type DashboardStats, type RateLimitSettings, type SystemHealth, type StorageSource } from "@/lib/api"
+import { Bell, Globe, Palette, HardDrive, Trash2, Server, Database, Loader2, Shield, Save, CheckCircle2, Plus, Usb, Mail, Send, Lock } from "lucide-react"
+import { getDashboardStats, getSystemHealth, getRateLimitSettings, updateSettings, testSmtpSettings, getStorageSources, addStorageSource, removeStorageSource, getEncryptionStats, type DashboardStats, type RateLimitSettings, type SystemHealth, type StorageSource, type EncryptionStats } from "@/lib/api"
 import { useAuth } from "@/contexts/auth-context"
 import { useTheme } from "@/contexts/theme-context"
 
@@ -74,6 +74,10 @@ export function SettingsContent() {
     const [storageMessage, setStorageMessage] = useState('')
     const [isAddingStorage, setIsAddingStorage] = useState(false)
 
+    // Encryption state (admin only)
+    const [encryptionStats, setEncryptionStats] = useState<EncryptionStats | null>(null)
+    const [isTogglingEncryption, setIsTogglingEncryption] = useState(false)
+
     const [notifications, setNotifications] = useState({
         email: false,
         fileChanges: true,
@@ -117,6 +121,14 @@ export function SettingsContent() {
                     smtp_from_email: s.smtp_from_email?.value || '',
                 })
                 setStorageSources(storageData.sources)
+
+                // Load encryption stats
+                try {
+                    const encStats = await getEncryptionStats()
+                    setEncryptionStats(encStats)
+                } catch (e) {
+                    console.error('Failed to load encryption stats', e)
+                }
             }
         } catch (error) {
             console.error("Failed to load settings data", error)
@@ -477,6 +489,70 @@ export function SettingsContent() {
                             </DialogFooter>
                         </DialogContent>
                     </Dialog>
+
+                    {/* Encryption (Admin Only) */}
+                    {isAdmin && (
+                        <Card className="bg-card border-border">
+                            <CardHeader>
+                                <div className="flex items-center gap-2">
+                                    <Lock className="h-5 w-5 text-primary" />
+                                    <CardTitle className="text-card-foreground">File Encryption</CardTitle>
+                                </div>
+                                <CardDescription>AES-256-GCM encryption for files stored on disk</CardDescription>
+                            </CardHeader>
+                            <CardContent className="space-y-4">
+                                <div className="flex items-center justify-between p-4 rounded-lg bg-secondary">
+                                    <div className="space-y-1">
+                                        <p className="font-medium text-secondary-foreground">Encrypt new uploads</p>
+                                        <p className="text-sm text-muted-foreground">
+                                            {encryptionStats?.encryption_enabled
+                                                ? 'New files will be encrypted before writing to disk'
+                                                : 'New files will be stored as plaintext'}
+                                        </p>
+                                    </div>
+                                    <Switch
+                                        checked={encryptionStats?.encryption_enabled ?? false}
+                                        disabled={isTogglingEncryption}
+                                        onCheckedChange={async (checked) => {
+                                            setIsTogglingEncryption(true)
+                                            try {
+                                                await updateSettings({ encryption_enabled: checked ? '1' : '0' })
+                                                const updated = await getEncryptionStats()
+                                                setEncryptionStats(updated)
+                                            } catch (e) {
+                                                console.error('Failed to toggle encryption', e)
+                                            } finally {
+                                                setIsTogglingEncryption(false)
+                                            }
+                                        }}
+                                    />
+                                </div>
+
+                                {encryptionStats && (
+                                    <div className="grid gap-3 sm:grid-cols-3">
+                                        <div className="p-3 rounded-lg bg-secondary text-center">
+                                            <p className="text-2xl font-bold text-green-500">{encryptionStats.encrypted_files}</p>
+                                            <p className="text-xs text-muted-foreground">Encrypted</p>
+                                        </div>
+                                        <div className="p-3 rounded-lg bg-secondary text-center">
+                                            <p className="text-2xl font-bold text-muted-foreground">{encryptionStats.unencrypted_files}</p>
+                                            <p className="text-xs text-muted-foreground">Unencrypted</p>
+                                        </div>
+                                        <div className="p-3 rounded-lg bg-secondary text-center">
+                                            <p className={`text-2xl font-bold ${encryptionStats.integrity_failed_files > 0 ? 'text-red-500' : 'text-muted-foreground'}`}>
+                                                {encryptionStats.integrity_failed_files}
+                                            </p>
+                                            <p className="text-xs text-muted-foreground">Integrity Issues</p>
+                                        </div>
+                                    </div>
+                                )}
+
+                                <p className="text-xs text-muted-foreground">
+                                    Existing files are not affected by this toggle. Encrypted files remain encrypted and readable regardless of this setting.
+                                </p>
+                            </CardContent>
+                        </Card>
+                    )}
 
                     {/* Rate Limits (Admin Only) */}
                     {isAdmin && (

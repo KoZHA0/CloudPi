@@ -23,6 +23,7 @@ const crypto = require('crypto');
 const db = require('../database/db');
 const { JWT_SECRET } = require('../utils/auth-config');
 const { ensureProtectedInternalStorageAvailable } = require('../utils/protected-storage');
+const { decryptToStream, createDecryptStream } = require('../utils/crypto-utils');
 
 const router = express.Router();
 
@@ -359,6 +360,18 @@ router.get('/shared-folder/:shareId/download/:fileId', requireAuth, async (req, 
             if (!fs.existsSync(filePath)) {
                 return res.status(404).json({ error: 'File not found on disk' });
             }
+            // Decrypt and stream if encrypted, otherwise serve raw
+            if (file.encrypted === 1) {
+                res.set('Content-Disposition', `attachment; filename="${encodeURIComponent(file.name)}"`);
+                res.set('Content-Type', file.mime_type || 'application/octet-stream');
+                try {
+                    await decryptToStream(filePath, res);
+                } catch (decErr) {
+                    console.error('Shared file decryption error:', decErr.message);
+                    if (!res.headersSent) return res.status(503).json({ error: 'Failed to decrypt file' });
+                }
+                return;
+            }
             return res.download(filePath, file.name);
         }
 
@@ -411,8 +424,17 @@ router.get('/shared-folder/:shareId/download/:fileId', requireAuth, async (req, 
             if (!res.headersSent) res.status(500).json({ error: 'ZIP creation failed' });
         });
         archive.pipe(res);
-        for (const { diskPath, archivePath } of filesToZip) {
-            archive.file(diskPath, { name: archivePath });
+        for (const { diskPath, archivePath, encrypted } of filesToZip) {
+            if (encrypted) {
+                try {
+                    const { stream: decStream } = createDecryptStream(diskPath);
+                    archive.append(decStream, { name: archivePath });
+                } catch (decErr) {
+                    console.error(`Skipping encrypted shared file in ZIP: ${archivePath}`, decErr.message);
+                }
+            } else {
+                archive.file(diskPath, { name: archivePath });
+            }
         }
         archive.finalize();
     } catch (error) {
@@ -675,7 +697,17 @@ router.get('/public/:link/download', async (req, res) => {
 
         res.set('Content-Type', share.mime_type || 'application/octet-stream');
         res.set('Content-Disposition', `attachment; filename="${encodeURIComponent(share.file_name)}"`);
-        res.sendFile(filePath);
+        // Decrypt and stream if encrypted, otherwise serve raw
+        if (share.encrypted === 1) {
+            try {
+                await decryptToStream(filePath, res);
+            } catch (decErr) {
+                console.error('Public download decryption error:', decErr.message);
+                if (!res.headersSent) return res.status(503).json({ error: 'Failed to decrypt file' });
+            }
+        } else {
+            res.sendFile(filePath);
+        }
     } catch (error) {
         console.error('Public download error:', error);
         res.status(500).json({ error: 'Server error' });
@@ -721,7 +753,17 @@ router.get('/public/:link/preview', async (req, res) => {
         res.set('Content-Disposition', `inline; filename="${encodeURIComponent(share.file_name)}"`);
         res.set('Cache-Control', 'public, max-age=86400');
 
-        res.sendFile(filePath);
+        // Decrypt and stream if encrypted, otherwise serve raw
+        if (share.encrypted === 1) {
+            try {
+                await decryptToStream(filePath, res);
+            } catch (decErr) {
+                console.error('Public preview decryption error:', decErr.message);
+                if (!res.headersSent) return res.status(503).json({ error: 'Failed to decrypt file' });
+            }
+        } else {
+            res.sendFile(filePath);
+        }
     } catch (error) {
         console.error('Public preview error:', error);
         res.status(500).json({ error: 'Server error' });

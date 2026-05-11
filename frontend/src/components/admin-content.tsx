@@ -27,9 +27,6 @@ import {
     Unlock,
     ShieldCheck,
     ShieldOff,
-    ShieldAlert,
-    Eye,
-    EyeOff,
 } from "lucide-react"
 import {
     Dialog,
@@ -73,14 +70,10 @@ import {
     disableUser,
     toggleUserRole,
     unlockUser,
-    getLuksStatus,
-    unlockLuksDrive,
-    lockLuksDrive,
     type User,
     type StorageSource,
     type DetectedDrive,
     type RegisteredSource,
-    type LuksStatus,
 } from "@/lib/api"
 
 export function AdminContent() {
@@ -120,14 +113,6 @@ export function AdminContent() {
     const [editingQuotaUserId, setEditingQuotaUserId] = useState<number | null>(null)
     const [quotaInput, setQuotaInput] = useState("")
 
-    // Layer 1 LUKS state
-    const [luksStatus, setLuksStatus] = useState<LuksStatus | null>(null)
-    const [isLuksLoading, setIsLuksLoading] = useState(false)
-    const [luksDialogOpen, setLuksDialogOpen] = useState(false)
-    const [luksPassphrase, setLuksPassphrase] = useState('')
-    const [showLuksPassphrase, setShowLuksPassphrase] = useState(false)
-    const [isLuksSubmitting, setIsLuksSubmitting] = useState(false)
-    const [luksMessage, setLuksMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null)
 
     const loadUsers = async () => {
         try {
@@ -150,26 +135,7 @@ export function AdminContent() {
         loadUsers()
     }, [])
 
-    const loadLuksLayerStatus = async () => {
-        try {
-            setIsLuksLoading(true)
-            const status = await getLuksStatus()
-            setLuksStatus(status)
-        } catch (err) {
-            setLuksMessage({ type: 'error', text: err instanceof Error ? err.message : 'Failed to load LUKS status' })
-        } finally {
-            setIsLuksLoading(false)
-        }
-    }
 
-    useEffect(() => {
-        loadLuksLayerStatus()
-        const timer = window.setInterval(() => {
-            loadLuksLayerStatus()
-        }, 15000)
-
-        return () => window.clearInterval(timer)
-    }, [])
 
     const handleCreateUser = async (e: React.FormEvent) => {
         e.preventDefault()
@@ -287,7 +253,7 @@ export function AdminContent() {
             if (result.drives.length === 0 && !result.message) {
                 setDriveMessage({
                     type: 'success',
-                    text: 'Scan complete. No assignable external drives detected. The LUKS disk is CloudPi internal storage and is hidden from drive registration.'
+                    text: 'Scan complete. No assignable external drives detected.'
                 })
             }
         } catch (err) {
@@ -346,47 +312,6 @@ export function AdminContent() {
         return `${(bytes / (1024 * 1024)).toFixed(0)} MB`
     }
 
-    // ===== Layer 1 LUKS Handlers =====
-
-    const openLuksDialog = () => {
-        setLuksPassphrase('')
-        setShowLuksPassphrase(false)
-        setLuksMessage(null)
-        setLuksDialogOpen(true)
-    }
-
-    const handleLuksUnlock = async (e: React.FormEvent) => {
-        e.preventDefault()
-        if (!luksPassphrase.trim()) return
-
-        setIsLuksSubmitting(true)
-        setLuksMessage(null)
-
-        try {
-            const result = await unlockLuksDrive(luksPassphrase)
-            setLuksMessage({ type: 'success', text: result.message })
-            setLuksPassphrase('')
-            await loadLuksLayerStatus()
-            setTimeout(() => setLuksDialogOpen(false), 1200)
-        } catch (err) {
-            setLuksMessage({
-                type: 'error',
-                text: err instanceof Error ? err.message : 'Failed to unlock the LUKS drive'
-            })
-        } finally {
-            setIsLuksSubmitting(false)
-        }
-    }
-
-    const handleLuksLock = async () => {
-        try {
-            const result = await lockLuksDrive()
-            setLuksMessage({ type: 'success', text: result.message })
-            await loadLuksLayerStatus()
-        } catch (err) {
-            setLuksMessage({ type: 'error', text: err instanceof Error ? err.message : 'Failed to lock the LUKS drive' })
-        }
-    }
 
     const formatUsed = (bytes: number | undefined) => {
         if (!bytes) return '0 MB'
@@ -906,154 +831,6 @@ export function AdminContent() {
                 </Card>
             )}
 
-            {/* Layer 1 LUKS Manager */}
-            {currentUser?.is_admin && (
-                <Card className="bg-card border-border">
-                    <CardHeader>
-                        <div>
-                            <CardTitle className="flex items-center gap-2">
-                                <ShieldAlert className="h-5 w-5" />
-                                Layer 1: LUKS Disk Encryption
-                            </CardTitle>
-                            <CardDescription>
-                                Host-level full-disk encryption for the CloudPi storage device. This replaces the old app-level per-drive encryption model.
-                            </CardDescription>
-                        </div>
-                    </CardHeader>
-                    <CardContent className="space-y-3">
-                        {luksMessage && (
-                            <div className={`p-3 rounded-lg flex items-center gap-2 text-sm ${
-                                luksMessage.type === 'success'
-                                    ? 'bg-green-500/10 border border-green-500/50 text-green-400'
-                                    : 'bg-destructive/10 border border-destructive/50 text-destructive'
-                            }`}>
-                                {luksMessage.type === 'success' ? <Check className="h-4 w-4" /> : <X className="h-4 w-4" />}
-                                {luksMessage.text}
-                            </div>
-                        )}
-
-                        <div className="p-4 rounded-lg bg-secondary flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                            <div className="flex items-start gap-3">
-                                <div className={`p-2 rounded-lg ${
-                                    luksStatus?.status === 'mounted'
-                                        ? 'bg-green-500/10'
-                                        : luksStatus?.status === 'unlocked'
-                                            ? 'bg-amber-500/10'
-                                            : luksStatus?.status === 'locked'
-                                                ? 'bg-red-500/10'
-                                                : 'bg-muted'
-                                }`}>
-                                    {luksStatus?.status === 'mounted' ? (
-                                        <Unlock className="h-5 w-5 text-green-400" />
-                                    ) : luksStatus?.status === 'unlocked' ? (
-                                        <AlertTriangle className="h-5 w-5 text-amber-400" />
-                                    ) : luksStatus?.status === 'locked' ? (
-                                        <Lock className="h-5 w-5 text-red-400" />
-                                    ) : (
-                                        <HardDrive className="h-5 w-5 text-muted-foreground" />
-                                    )}
-                                </div>
-                                <div className="space-y-2">
-                                    <div className="flex items-center gap-2 flex-wrap">
-                                        <p className="font-medium text-sm">CloudPi LUKS Device</p>
-                                        {luksStatus?.status === 'mounted' && (
-                                            <Badge className="bg-green-500/20 text-green-400 text-xs">
-                                                <Unlock className="h-3 w-3 mr-1" />Mounted
-                                            </Badge>
-                                        )}
-                                        {luksStatus?.status === 'unlocked' && (
-                                            <Badge variant="outline" className="text-xs border-amber-500/50 text-amber-400">
-                                                <AlertTriangle className="h-3 w-3 mr-1" />Opened, not mounted
-                                            </Badge>
-                                        )}
-                                        {luksStatus?.status === 'locked' && (
-                                            <Badge variant="outline" className="text-xs border-red-500/50 text-red-400">
-                                                <Lock className="h-3 w-3 mr-1" />Locked
-                                            </Badge>
-                                        )}
-                                        {luksStatus?.status === 'no_device' && (
-                                            <Badge variant="outline" className="text-xs border-muted-foreground/50 text-muted-foreground">
-                                                No device
-                                            </Badge>
-                                        )}
-                                    </div>
-                                    <p className="text-xs text-muted-foreground">
-                                        {luksStatus?.status === 'mounted' && 'The encrypted storage device is unlocked and mounted. Files, metadata, and the database are protected at rest by Layer 1.'}
-                                        {luksStatus?.status === 'unlocked' && 'The LUKS container is open but the filesystem is not mounted yet.'}
-                                        {luksStatus?.status === 'locked' && 'The encrypted drive is present but locked. Admin must provide the LUKS passphrase to mount it.'}
-                                        {luksStatus?.status === 'no_device' && 'No configured LUKS block device is available. This is expected on Windows dev machines or when the Pi storage device is disconnected.'}
-                                        {!luksStatus && 'Loading LUKS status...'}
-                                    </p>
-                                    <div className="text-xs text-muted-foreground space-y-1">
-                                        <p><strong>Device:</strong> {luksStatus?.device || '—'}</p>
-                                        <p><strong>Mapper:</strong> {luksStatus?.mapperDevice || '—'}</p>
-                                        <p><strong>Mount Point:</strong> {luksStatus?.mountPoint || '—'}</p>
-                                    </div>
-                                </div>
-                            </div>
-                            <div className="flex items-center gap-2">
-                                {luksStatus?.status !== 'mounted' && luksStatus?.status !== 'no_device' && (
-                                    <Button size="sm" className="gap-1" onClick={openLuksDialog}>
-                                        <Unlock className="h-3 w-3" />
-                                        Unlock
-                                    </Button>
-                                )}
-                                {luksStatus?.status === 'mounted' && (
-                                    <AlertDialog>
-                                        <AlertDialogTrigger asChild>
-                                            <Button
-                                                size="sm"
-                                                variant="outline"
-                                                className="gap-1 border-red-500/30 text-red-400 hover:bg-red-500/10"
-                                            >
-                                                <Lock className="h-3 w-3" />
-                                                Lock
-                                            </Button>
-                                        </AlertDialogTrigger>
-                                        <AlertDialogContent>
-                                            <AlertDialogHeader>
-                                                <AlertDialogTitle>Lock LUKS Storage</AlertDialogTitle>
-                                                <AlertDialogDescription>
-                                                    This will unmount the CloudPi storage filesystem and close the LUKS container. Files and the database on the encrypted disk will be unavailable until an admin unlocks it again.
-                                                </AlertDialogDescription>
-                                            </AlertDialogHeader>
-                                            <AlertDialogFooter>
-                                                <AlertDialogCancel>Cancel</AlertDialogCancel>
-                                                <AlertDialogAction
-                                                    onClick={handleLuksLock}
-                                                    className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-                                                >
-                                                    Lock LUKS Device
-                                                </AlertDialogAction>
-                                            </AlertDialogFooter>
-                                        </AlertDialogContent>
-                                    </AlertDialog>
-                                )}
-                                <Button
-                                    size="sm"
-                                    variant="ghost"
-                                    className="h-8 w-8 p-0"
-                                    onClick={loadLuksLayerStatus}
-                                    title="Refresh LUKS status"
-                                    disabled={isLuksLoading}
-                                >
-                                    <RefreshCw className={`h-3 w-3 ${isLuksLoading ? 'animate-spin' : ''}`} />
-                                </Button>
-                            </div>
-                        </div>
-
-                        {/* Info box */}
-                        <div className="p-3 rounded-lg bg-primary/5 border border-primary/20 text-xs text-muted-foreground space-y-1">
-                            <p className="font-medium text-primary">How Layer 1 works now</p>
-                            <p>• The Raspberry Pi storage device is encrypted at the block-device level with <strong>LUKS</strong>.</p>
-                            <p>• This protects the database, file blobs, salts, logs, and all other server-side data at rest.</p>
-                            <p>• The retired app-level per-drive key workflow has been removed from the Admin interface.</p>
-                            <p>• On Windows development machines, this will usually show <strong>No device</strong> because LUKS only works on the Linux host.</p>
-                        </div>
-                    </CardContent>
-                </Card>
-            )}
-
             {/* Reset Password Dialog */}
             <Dialog open={resetDialogOpen} onOpenChange={setResetDialogOpen}>
                 <DialogContent className="sm:max-w-md">
@@ -1102,84 +879,6 @@ export function AdminContent() {
                                     </>
                                 ) : (
                                     "Reset Password"
-                                )}
-                            </Button>
-                        </div>
-                    </form>
-                </DialogContent>
-            </Dialog>
-
-            {/* LUKS Unlock Dialog */}
-            <Dialog open={luksDialogOpen} onOpenChange={setLuksDialogOpen}>
-                <DialogContent className="sm:max-w-md">
-                    <DialogHeader>
-                        <DialogTitle className="flex items-center gap-2">
-                            <Unlock className="h-5 w-5 text-primary" />
-                            Unlock LUKS Drive
-                        </DialogTitle>
-                        <DialogDescription>
-                            Enter the Raspberry Pi host passphrase to unlock and mount the Layer 1 LUKS storage device.
-                        </DialogDescription>
-                    </DialogHeader>
-                    <form onSubmit={handleLuksUnlock} className="space-y-4 mt-4">
-                        {luksMessage && (
-                            <div className={`p-3 rounded-lg flex items-center gap-2 text-sm ${
-                                luksMessage.type === 'success'
-                                    ? 'bg-green-500/10 border border-green-500/50 text-green-400'
-                                    : 'bg-destructive/10 border border-destructive/50 text-destructive'
-                            }`}>
-                                {luksMessage.type === 'success' ? <Check className="h-4 w-4" /> : <X className="h-4 w-4" />}
-                                {luksMessage.text}
-                            </div>
-                        )}
-                        <div className="space-y-2">
-                            <Label htmlFor="luks-passphrase">LUKS Passphrase</Label>
-                            <div className="relative">
-                                <Input
-                                    id="luks-passphrase"
-                                    type={showLuksPassphrase ? 'text' : 'password'}
-                                    placeholder="Enter the disk unlock passphrase"
-                                    value={luksPassphrase}
-                                    onChange={(e) => setLuksPassphrase(e.target.value)}
-                                    required
-                                    autoFocus
-                                />
-                                <Button
-                                    type="button"
-                                    variant="ghost"
-                                    size="icon"
-                                    className="absolute right-1 top-1/2 -translate-y-1/2 h-7 w-7"
-                                    onClick={() => setShowLuksPassphrase(!showLuksPassphrase)}
-                                >
-                                    {showLuksPassphrase ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                                </Button>
-                            </div>
-                        </div>
-                        <div className="p-3 rounded-lg bg-amber-500/10 border border-amber-500/30 text-xs text-amber-400">
-                            <p className="font-medium flex items-center gap-1 mb-1">
-                                <AlertTriangle className="h-3 w-3" /> Important
-                            </p>
-                            <p>This is the host-level disk passphrase. On Windows dev machines, unlocking will not work because LUKS requires the Linux Raspberry Pi environment.</p>
-                        </div>
-                        <div className="flex justify-end gap-2">
-                            <Button
-                                type="button"
-                                variant="outline"
-                                onClick={() => setLuksDialogOpen(false)}
-                            >
-                                Cancel
-                            </Button>
-                            <Button
-                                type="submit"
-                                disabled={isLuksSubmitting || !luksPassphrase.trim()}
-                            >
-                                {isLuksSubmitting ? (
-                                    <>
-                                        <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                                        Unlocking...
-                                    </>
-                                ) : (
-                                    'Unlock LUKS Device'
                                 )}
                             </Button>
                         </div>

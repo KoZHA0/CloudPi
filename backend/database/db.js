@@ -41,6 +41,8 @@ const FILES_TABLE_SCHEMA = `
     storage_source_id TEXT REFERENCES storage_sources(id),
     sha256_hash TEXT DEFAULT NULL,
     encrypted INTEGER DEFAULT 0,
+    encryption_auth_tag TEXT DEFAULT NULL,
+    integrity_failed INTEGER DEFAULT 0,
     storage_id TEXT DEFAULT NULL,
     encrypted_metadata TEXT DEFAULT NULL,
     e2ee_iv TEXT DEFAULT NULL,
@@ -83,13 +85,15 @@ function migrateLegacyFilesTable() {
         INSERT INTO files (
           id, user_id, name, path, type, size, mime_type, parent_id, starred,
           trashed, trashed_at, created_at, modified_at, storage_source_id,
-          sha256_hash, encrypted, storage_id, encrypted_metadata, e2ee_iv,
+          sha256_hash, encrypted, encryption_auth_tag, integrity_failed,
+          storage_id, encrypted_metadata, e2ee_iv,
           is_chunked, chunk_count, vault_root_id, is_secure_vault
         )
         SELECT
           id, user_id, name, path, type, size, mime_type, parent_id, starred,
           trashed, trashed_at, created_at, modified_at, storage_source_id,
-          sha256_hash, encrypted, storage_id, encrypted_metadata, e2ee_iv,
+          sha256_hash, encrypted, NULL, 0,
+          storage_id, encrypted_metadata, e2ee_iv,
           is_chunked, chunk_count, vault_root_id, is_secure_vault
         FROM files_legacy;
         DROP TABLE files_legacy;
@@ -369,6 +373,7 @@ const defaultSettings = [
   ["smtp_user", "", "SMTP authentication username"],
   ["smtp_pass", "", "SMTP authentication password (encrypted)"],
   ["smtp_from_email", "", "Sender email address"],
+  ["encryption_enabled", "0", "Enable AES-256-GCM encryption for new file uploads (0=disabled, 1=enabled)"],
 ];
 
 const insertSetting = db.prepare(
@@ -378,7 +383,7 @@ for (const [key, value, desc] of defaultSettings) {
   insertSetting.run(key, value, desc);
 }
 
-db.prepare("DELETE FROM settings WHERE key = ?").run("encryption_enabled");
+// encryption_enabled is now a permanent setting — no longer deleted
 
 // Seed internal storage source (the existing backend/storage/ directory)
 const internalStoragePath = path.join(__dirname, "..", "storage");
@@ -467,6 +472,20 @@ try {
 
 try {
   db.exec(`ALTER TABLE files ADD COLUMN is_secure_vault INTEGER DEFAULT 0`);
+} catch (e) {
+  // Column already exists, ignore
+}
+
+// Add encryption_auth_tag for AES-256-GCM authentication tag storage
+try {
+  db.exec(`ALTER TABLE files ADD COLUMN encryption_auth_tag TEXT DEFAULT NULL`);
+} catch (e) {
+  // Column already exists, ignore
+}
+
+// Add integrity_failed flag for files that fail auth tag verification
+try {
+  db.exec(`ALTER TABLE files ADD COLUMN integrity_failed INTEGER DEFAULT 0`);
 } catch (e) {
   // Column already exists, ignore
 }

@@ -38,14 +38,6 @@ const { sendEmail } = require('../utils/mailer');
 const { isInternalStorageAccessible, syncInternalStorageState } = require('../utils/storage-status');
 
 const router = express.Router();
-const LUKS_MOUNT_POINT = path.resolve(process.env.LUKS_MOUNT_POINT || '/media/cloudpi-data');
-
-function isReservedLuksStoragePath(candidatePath) {
-    if (!candidatePath) return false;
-    const normalizedCandidate = path.resolve(candidatePath);
-    return normalizedCandidate === LUKS_MOUNT_POINT
-        || normalizedCandidate.startsWith(`${LUKS_MOUNT_POINT}${path.sep}`);
-}
 
 function getMountSourceForPath(targetPath) {
     try {
@@ -126,10 +118,6 @@ function getBlockMountInfo(drivePath) {
 }
 
 function classifyExternalDrivePath(drivePath) {
-    if (isReservedLuksStoragePath(drivePath)) {
-        return { eligible: false, reason: 'reserved CloudPi LUKS internal storage mount' };
-    }
-
     const info = getBlockMountInfo(drivePath);
     if (info.reason) {
         return { eligible: false, ...info };
@@ -633,6 +621,7 @@ router.put('/settings', requireAdmin, (req, res) => {
             'rate_limit_upload_max', 'rate_limit_upload_window',
             'password_min_length',
             'account_lockout_attempts', 'account_lockout_duration',
+            'encryption_enabled',
         ];
         
         const allowedStringKeys = [
@@ -861,11 +850,7 @@ router.post('/storage', requireAdmin, (req, res) => {
             return res.status(400).json({ error: 'Path and label are required' });
         }
 
-        if (isReservedLuksStoragePath(drivePath)) {
-            return res.status(400).json({
-                error: 'The CloudPi LUKS mount is reserved for Layer 1 application storage and cannot be registered as a user storage source.'
-            });
-        }
+
 
         // Check path exists
         if (!fs.existsSync(drivePath)) {
@@ -1311,6 +1296,45 @@ router.post('/storage/:id/reactivate', requireAdmin, (req, res) => {
 
     } catch (error) {
         console.error('Reactivate storage error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+/**
+ * GET /api/admin/encryption-stats
+ * Returns encryption status and file counts for the admin panel.
+ */
+router.get('/encryption-stats', requireAdmin, (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const user = db.prepare('SELECT is_admin FROM users WHERE id = ?').get(userId);
+        if (!user || !user.is_admin) {
+            return res.status(403).json({ error: 'Admin access required' });
+        }
+
+        const encSetting = db.prepare("SELECT value FROM settings WHERE key = 'encryption_enabled'").get();
+        const encryptionEnabled = encSetting && encSetting.value === '1';
+
+        const encryptedCount = db.prepare(
+            "SELECT COUNT(*) as count FROM files WHERE encrypted = 1 AND type != 'folder' AND trashed = 0"
+        ).get().count;
+
+        const unencryptedCount = db.prepare(
+            "SELECT COUNT(*) as count FROM files WHERE encrypted = 0 AND type != 'folder' AND trashed = 0"
+        ).get().count;
+
+        const integrityFailedCount = db.prepare(
+            "SELECT COUNT(*) as count FROM files WHERE integrity_failed = 1 AND type != 'folder'"
+        ).get().count;
+
+        res.json({
+            encryption_enabled: encryptionEnabled,
+            encrypted_files: encryptedCount,
+            unencrypted_files: unencryptedCount,
+            integrity_failed_files: integrityFailedCount,
+        });
+    } catch (error) {
+        console.error('Encryption stats error:', error);
         res.status(500).json({ error: 'Server error' });
     }
 });

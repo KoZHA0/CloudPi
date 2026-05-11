@@ -33,46 +33,21 @@ services:
       - CLOUDPI_DB_PATH=/data/cloudpi.db
       # Host path where USB drives are auto-mounted (default: /media/pi)
       - CLOUDPI_EXTERNAL_DRIVES_PATH=/media/pi
-      # ── LUKS Configuration ──────────────────────────────────────────────
-      # LUKS_DEVICE: persistent reference to the LUKS-encrypted partition.
-      # Recommended: /dev/disk/by-uuid/<luks-uuid>
-      # The bootstrap script writes this automatically after initial setup.
-      # The backend calls `cryptsetup luksOpen` and `mount` on this device
-      # via the host OS (via a privileged sudoers-wrapped helper or host scripts).
-      # If you manage LUKS unlocking purely at host level before Docker starts,
-      # only LUKS_MOUNT_POINT is strictly needed here.
-      - LUKS_DEVICE=${LUKS_DEVICE:-UNSET_RUN_LUKS_SETUP}
-      - LUKS_MAPPER_NAME=${LUKS_MAPPER_NAME:-cloudpi-data}
-      - LUKS_MOUNT_POINT=${LUKS_MOUNT_POINT:-/media/cloudpi-data}
-      - CLOUDPI_INTERNAL_STORAGE_REQUIRES_LUKS=${CLOUDPI_INTERNAL_STORAGE_REQUIRES_LUKS:-1}
     volumes:
-      # Persist database (survives container rebuilds).
-      # Default: named Docker volume.
-      # LUKS mode: set CLOUDPI_DB_MOUNT=/media/cloudpi-data/appdata in project-root .env
+      # Persist database (survives container rebuilds)
       - ${CLOUDPI_DB_MOUNT:-cloudpi-db}:/data
-      # Persist user uploads / avatars.
-      # LUKS mode: set CLOUDPI_UPLOADS_MOUNT=/media/cloudpi-data/uploads
+      # Persist user uploads / avatars
       - ${CLOUDPI_UPLOADS_MOUNT:-cloudpi-uploads}:/app/backend/uploads
-      # Persist internal file storage.
-      # LUKS mode: set CLOUDPI_STORAGE_MOUNT=/media/cloudpi-data/storage
+      # Persist internal file storage
       - ${CLOUDPI_STORAGE_MOUNT:-cloudpi-storage}:/app/backend/storage
       # Access host CPU temperature (Raspberry Pi)
       - /sys/class/thermal:/sys/class/thermal:ro
       # USB drive access — host OS handles mounting via udisks2/usbmount
       # Read-write needed: backend stores user files on external drives
-      # SECURITY: privileged mode and /dev access removed — not needed
       # rslave propagation: host→container only (one-way). The container sees
       # drives mounted on the host after startup, but cannot propagate mounts
       # back to the host. Narrowed to /media/pi to limit visibility.
       - /media/pi:/media/pi:rslave
-      # ── LUKS / Cryptomator data volume ──────────────────────────────────
-      # Once the admin unlocks the LUKS drive via the Web UI, the host mounts
-      # the decrypted ext4/exfat partition here.  This bind mount lets the
-      # backend (and WebDAV server) serve files from the encrypted drive.
-      # rslave: same one-way propagation policy as /media/pi above.
-      # NOTE: The directory must exist on the host before Docker starts;
-      #       it is created automatically by luks.js on first unlock.
-      - /media/cloudpi-data:/media/cloudpi-data:rslave
     # Expose backend port to host's localhost ONLY (not public).
     # Required for the udev drive-notify webhook (host→container).
     ports:
@@ -123,7 +98,8 @@ services:
       - cloudpi-net
 
 # ── Persistent Volumes ──────────────────────────────────────
-# Docker manages these volumes when no LUKS bind mounts are configured.
+# Docker manages these named volumes. Override with bind mounts in .env
+# if you want data on a specific disk.
 # View: docker volume ls | grep cloudpi
 # Backup: docker run --rm -v cloudpi_cloudpi-uploads:/data -v $(pwd):/bak alpine tar czf /bak/uploads.tar.gz /data
 volumes:

@@ -561,6 +561,19 @@ export async function permanentDeleteFile(fileId: number): Promise<{ message: st
     });
 }
 
+export interface EmptyTrashResponse {
+    message: string;
+    deletedItems: number;
+    deletedFiles: number;
+    freedBytes: number;
+}
+
+export async function emptyTrash(): Promise<EmptyTrashResponse> {
+    return apiRequest<EmptyTrashResponse>('/files/trash/empty', {
+        method: 'DELETE',
+    });
+}
+
 // ============= SECURE VAULTS =============
 
 export interface VaultEnvelopePayload {
@@ -834,6 +847,9 @@ export interface DashboardStats {
     totalFiles: number;
     totalStorage: number;
     totalFolders: number;
+    storageQuota: number | null;
+    trashFiles: number;
+    trashStorage: number;
     byType: Record<string, { count: number; size: number }>;
     recentFiles: {
         id: number;
@@ -894,6 +910,17 @@ export async function testSmtpSettings(
         method: 'POST',
         body: JSON.stringify(settings),
     });
+}
+
+export interface EncryptionStats {
+    encryption_enabled: boolean;
+    encrypted_files: number;
+    unencrypted_files: number;
+    integrity_failed_files: number;
+}
+
+export async function getEncryptionStats(): Promise<EncryptionStats> {
+    return apiRequest<EncryptionStats>('/admin/encryption-stats');
 }
 
 // ============= STORAGE SOURCES =============

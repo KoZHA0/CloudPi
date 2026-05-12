@@ -290,6 +290,7 @@ export function FilesContent() {
     const [breadcrumbs, setBreadcrumbs] = useState<Breadcrumb[]>([])
     const [displayNames, setDisplayNames] = useState<Record<number, string>>({})
     const [currentFolderId, setCurrentFolderId] = useState<number | null>(() => parseIdParam(searchParams.get("folder")))
+    const [loadedFolderId, setLoadedFolderId] = useState<number | null | undefined>(undefined)
     const [highlightedFileId, setHighlightedFileId] = useState<number | null>(() => parseIdParam(searchParams.get("highlight")))
     const [currentFolder, setCurrentFolder] = useState<Breadcrumb | null>(null)
     const [currentVault, setCurrentVault] = useState<Breadcrumb | null>(null)
@@ -300,6 +301,10 @@ export function FilesContent() {
     const [isLoading, setIsLoading] = useState(true)
     const [error, setError] = useState<string | null>(null)
     const [storageWarning, setStorageWarning] = useState<string | null>(null)
+    const fileLoadRequestRef = useRef(0)
+    const columnsLoadRequestRef = useRef(0)
+    const currentFolderIdRef = useRef<number | null>(currentFolderId)
+    const loadedFolderIdRef = useRef<number | null | undefined>(loadedFolderId)
 
     // Sorting & filtering
     const [sortKey, setSortKey] = useState<FilesSortKey>(() => getInitialSortKey())
@@ -389,6 +394,14 @@ export function FilesContent() {
     const [versionActionBusy, setVersionActionBusy] = useState(false)
 
     useEffect(() => {
+        currentFolderIdRef.current = currentFolderId
+    }, [currentFolderId])
+
+    useEffect(() => {
+        loadedFolderIdRef.current = loadedFolderId
+    }, [loadedFolderId])
+
+    useEffect(() => {
         const nextFolderId = parseIdParam(searchParams.get("folder"))
         const nextHighlightId = parseIdParam(searchParams.get("highlight"))
         const folderChanged = nextFolderId !== currentFolderId
@@ -403,6 +416,15 @@ export function FilesContent() {
         }
 
         if (folderChanged) {
+            currentFolderIdRef.current = nextFolderId
+            loadedFolderIdRef.current = undefined
+            fileLoadRequestRef.current += 1
+            columnsLoadRequestRef.current += 1
+            setLoadedFolderId(undefined)
+            setColumns([])
+            setColumnsError(null)
+            setColumnsLoading(false)
+            setIsLoading(true)
             setSelectedFiles([])
             setLastSelectedFileId(null)
             setIsSelecting(false)
@@ -432,9 +454,9 @@ export function FilesContent() {
     }, [currentFolderId])
 
     useEffect(() => {
-        if (view !== "columns" || isLoading) return
+        if (view !== "columns" || isLoading || loadedFolderId !== currentFolderId) return
         loadColumnsForPath()
-    }, [view, isLoading, currentFolderId, files, breadcrumbs])
+    }, [view, isLoading, currentFolderId, loadedFolderId, files, breadcrumbs])
 
     useEffect(() => {
         const previewId = parseIdParam(searchParams.get("preview"))
@@ -457,19 +479,34 @@ export function FilesContent() {
     const isInsideVault = activeVaultId !== null
     const isActiveVaultUnlocked = isVaultUnlocked(activeVaultId)
 
+    function isLatestFileLoad(requestId: number, folderId: number | null) {
+        return requestId === fileLoadRequestRef.current && currentFolderIdRef.current === folderId
+    }
+
+    function isLatestColumnLoad(requestId: number, folderId: number | null) {
+        return requestId === columnsLoadRequestRef.current &&
+            currentFolderIdRef.current === folderId &&
+            loadedFolderIdRef.current === folderId
+    }
+
     function getDisplayName(item: { id: number; name: string }) {
         return displayNames[item.id] ?? item.name
     }
 
     async function loadFiles() {
+        const folderId = currentFolderIdRef.current
+        const requestId = ++fileLoadRequestRef.current
         setIsLoading(true)
         setError(null)
         try {
-            const data = await getFiles(currentFolderId) as any
+            const data = await getFiles(folderId) as any
+            if (!isLatestFileLoad(requestId, folderId)) return
             setFiles(data.files)
             setBreadcrumbs(data.breadcrumbs)
             setCurrentFolder(data.currentFolder || null)
             setCurrentVault(data.currentVault || null)
+            loadedFolderIdRef.current = folderId
+            setLoadedFolderId(folderId)
             // Show warning if user's assigned drive is disconnected
             if (data.storageWarning) {
                 setStorageWarning(data.storageWarning)
@@ -477,18 +514,26 @@ export function FilesContent() {
                 setStorageWarning(null)
             }
         } catch (err) {
+            if (!isLatestFileLoad(requestId, folderId)) return
+            loadedFolderIdRef.current = undefined
+            setLoadedFolderId(undefined)
             setError(err instanceof Error ? err.message : "Failed to load files")
         } finally {
-            setIsLoading(false)
+            if (isLatestFileLoad(requestId, folderId)) {
+                setIsLoading(false)
+            }
         }
     }
 
     async function loadColumnsForPath() {
+        const folderId = currentFolderIdRef.current
+        const requestId = ++columnsLoadRequestRef.current
         setColumnsLoading(true)
         setColumnsError(null)
         try {
             const nextColumns: FilesColumn[] = []
-            const rootData = currentFolderId === null ? { files } : await getFiles(null) as any
+            const rootData = folderId === null ? { files } : await getFiles(null) as any
+            if (!isLatestColumnLoad(requestId, folderId)) return
             nextColumns.push({
                 folderId: null,
                 title: "My Files",
@@ -496,7 +541,8 @@ export function FilesContent() {
             })
 
             for (const crumb of breadcrumbs) {
-                const crumbData = crumb.id === currentFolderId ? { files } : await getFiles(crumb.id) as any
+                const crumbData = crumb.id === folderId ? { files } : await getFiles(crumb.id) as any
+                if (!isLatestColumnLoad(requestId, folderId)) return
                 nextColumns.push({
                     folderId: crumb.id,
                     title: getDisplayName(crumb),
@@ -506,10 +552,13 @@ export function FilesContent() {
 
             setColumns(nextColumns)
         } catch (err) {
+            if (!isLatestColumnLoad(requestId, folderId)) return
             setColumnsError(err instanceof Error ? err.message : "Failed to load columns view")
             setColumns([])
         } finally {
-            setColumnsLoading(false)
+            if (isLatestColumnLoad(requestId, folderId)) {
+                setColumnsLoading(false)
+            }
         }
     }
 
@@ -768,6 +817,17 @@ export function FilesContent() {
     // Navigation
     function navigateToFolder(folderId: number | null) {
         clearOverlays()
+        if (folderId !== currentFolderIdRef.current) {
+            currentFolderIdRef.current = folderId
+            loadedFolderIdRef.current = undefined
+            fileLoadRequestRef.current += 1
+            columnsLoadRequestRef.current += 1
+            setLoadedFolderId(undefined)
+            setColumns([])
+            setColumnsError(null)
+            setColumnsLoading(false)
+            setIsLoading(true)
+        }
         const nextParams = new URLSearchParams(searchParams)
         if (folderId) {
             nextParams.set("folder", String(folderId))

@@ -58,6 +58,62 @@ function generateBackupCode() {
     return code;
 }
 
+function verifyBearerToken(req) {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        const error = new Error('No token provided');
+        error.statusCode = 401;
+        throw error;
+    }
+
+    const token = authHeader.split(' ')[1];
+    const decoded = jwt.verify(token, JWT_SECRET);
+
+    if (!decoded.userId || decoded.tokenVersion === undefined) {
+        const error = new Error('Invalid token');
+        error.statusCode = 401;
+        throw error;
+    }
+
+    const user = db.prepare(
+        'SELECT id, username, email, is_admin, is_disabled, token_version, two_factor_enabled, avatar_url, created_at, password, two_factor_secret FROM users WHERE id = ?'
+    ).get(decoded.userId);
+
+    if (!user) {
+        const error = new Error('User not found');
+        error.statusCode = 401;
+        throw error;
+    }
+
+    if (user.is_disabled) {
+        const error = new Error('Account is disabled');
+        error.statusCode = 403;
+        throw error;
+    }
+
+    if (decoded.tokenVersion !== (user.token_version || 1)) {
+        const error = new Error('Token expired or invalidated');
+        error.statusCode = 401;
+        throw error;
+    }
+
+    return { decoded, user };
+}
+
+function handleAuthError(res, error, label = 'Auth error') {
+    if (error.statusCode) {
+        return res.status(error.statusCode).json({ error: error.message });
+    }
+    if (error.name === 'TokenExpiredError') {
+        return res.status(401).json({ error: 'Token expired' });
+    }
+    if (error.name === 'JsonWebTokenError') {
+        return res.status(401).json({ error: 'Invalid token' });
+    }
+    console.error(label, error);
+    return res.status(500).json({ error: 'Server error' });
+}
+
 /**
  * GET /api/auth/setup-status
  * Checks if initial setup is required (no users in database)
@@ -296,6 +352,10 @@ router.post('/login/2fa', async (req, res) => {
             return res.status(401).json({ error: '2FA not configured properly' });
         }
 
+        if (user.is_disabled) {
+            return res.status(403).json({ error: 'Account is disabled' });
+        }
+
         // Verify the code
         const result = await verify({ token: code, secret: user.two_factor_secret });
         
@@ -439,47 +499,24 @@ router.post('/reset-password', async (req, res) => {
  */
 router.get('/me', (req, res) => {
     try {
-        const authHeader = req.headers.authorization;
+        const { user } = verifyBearerToken(req);
 
-        if (!authHeader || !authHeader.startsWith('Bearer ')) {
-            return res.status(401).json({ error: 'No token provided' });
-        }
-
-        const token = authHeader.split(' ')[1];
-        const decoded = jwt.verify(token, JWT_SECRET);
-
-        // Get fresh user data from database
-        const user = db.prepare(
-            'SELECT id, username, email, is_admin, is_disabled, token_version, two_factor_enabled, avatar_url, created_at FROM users WHERE id = ?'
-        ).get(decoded.userId);
-
-        if (!user) {
-            return res.status(401).json({ error: 'User not found' });
-        }
-
-        if (user.is_disabled) {
-            return res.status(403).json({ error: 'Account is disabled' });
-        }
-
-        // Validate token_version
-        const tokenVersion = decoded.tokenVersion || 0;
-        const dbTokenVersion = user.token_version || 1;
-        
-        if (tokenVersion !== dbTokenVersion) {
-            return res.status(401).json({ error: 'Token expired or invalidated' });
-        }
-
-        res.json({ user });
+        res.json({
+            user: {
+                id: user.id,
+                username: user.username,
+                email: user.email,
+                is_admin: user.is_admin,
+                is_disabled: user.is_disabled,
+                token_version: user.token_version,
+                two_factor_enabled: user.two_factor_enabled,
+                avatar_url: user.avatar_url,
+                created_at: user.created_at,
+            }
+        });
 
     } catch (error) {
-        if (error.name === 'JsonWebTokenError') {
-            return res.status(401).json({ error: 'Invalid token' });
-        }
-        if (error.name === 'TokenExpiredError') {
-            return res.status(401).json({ error: 'Token expired' });
-        }
-        console.error('Auth check error:', error);
-        res.status(500).json({ error: 'Server error' });
+        return handleAuthError(res, error, 'Auth check error:');
     }
 });
 
@@ -489,27 +526,12 @@ router.get('/me', (req, res) => {
  */
 router.put('/profile', async (req, res) => {
     try {
-        const authHeader = req.headers.authorization;
-
-        if (!authHeader || !authHeader.startsWith('Bearer ')) {
-            return res.status(401).json({ error: 'No token provided' });
-        }
-
-        const token = authHeader.split(' ')[1];
-        const decoded = jwt.verify(token, JWT_SECRET);
+        const { decoded, user } = verifyBearerToken(req);
 
         const { username, email, currentPassword } = req.body;
 
         if (!username) {
             return res.status(400).json({ error: 'Username is required' });
-        }
-
-        const user = db.prepare(
-            'SELECT id, email, password FROM users WHERE id = ?'
-        ).get(decoded.userId);
-
-        if (!user) {
-            return res.status(401).json({ error: 'User not found' });
         }
 
         // Check if new username already exists for another user
@@ -563,11 +585,7 @@ router.put('/profile', async (req, res) => {
         });
 
     } catch (error) {
-        if (error.name === 'JsonWebTokenError') {
-            return res.status(401).json({ error: 'Invalid token' });
-        }
-        console.error('Profile update error:', error);
-        res.status(500).json({ error: 'Server error during profile update' });
+        return handleAuthError(res, error, 'Profile update error:');
     }
 });
 
@@ -581,15 +599,7 @@ router.put('/profile', async (req, res) => {
  */
 router.get('/2fa/setup', async (req, res) => {
     try {
-        const authHeader = req.headers.authorization;
-        if (!authHeader || !authHeader.startsWith('Bearer ')) {
-            return res.status(401).json({ error: 'No token provided' });
-        }
-
-        const token = authHeader.split(' ')[1];
-        const decoded = jwt.verify(token, JWT_SECRET);
-
-        const user = db.prepare('SELECT email, username, two_factor_enabled FROM users WHERE id = ?').get(decoded.userId);
+        const { decoded, user } = verifyBearerToken(req);
         
         if (!user.email) {
             return res.status(400).json({ error: 'You must set an email address in your profile before enabling 2FA.' });
@@ -623,14 +633,7 @@ router.get('/2fa/setup', async (req, res) => {
         });
 
     } catch (error) {
-        if (error.name === 'JsonWebTokenError') {
-            return res.status(401).json({ error: 'Invalid token' });
-        }
-        if (error.name === 'TokenExpiredError') {
-            return res.status(401).json({ error: 'Token expired' });
-        }
-        console.error('2FA Setup Error:', error);
-        res.status(500).json({ error: 'Server error' });
+        return handleAuthError(res, error, '2FA Setup Error:');
     }
 });
 
@@ -640,21 +643,13 @@ router.get('/2fa/setup', async (req, res) => {
  */
 router.post('/2fa/verify', async (req, res) => {
     try {
-        const authHeader = req.headers.authorization;
-        if (!authHeader || !authHeader.startsWith('Bearer ')) {
-            return res.status(401).json({ error: 'No token provided' });
-        }
-
-        const token = authHeader.split(' ')[1];
-        const decoded = jwt.verify(token, JWT_SECRET);
+        const { decoded, user } = verifyBearerToken(req);
 
         const { code } = req.body;
         if (!code) {
             return res.status(400).json({ error: 'Code is required' });
         }
 
-        const user = db.prepare('SELECT two_factor_secret, two_factor_enabled FROM users WHERE id = ?').get(decoded.userId);
-        
         if (user.two_factor_enabled) {
             return res.status(400).json({ error: '2FA is already enabled.' });
         }
@@ -684,14 +679,7 @@ router.post('/2fa/verify', async (req, res) => {
         });
 
     } catch (error) {
-        if (error.name === 'JsonWebTokenError') {
-            return res.status(401).json({ error: 'Invalid token' });
-        }
-        if (error.name === 'TokenExpiredError') {
-            return res.status(401).json({ error: 'Token expired' });
-        }
-        console.error('2FA Verify Error:', error);
-        res.status(500).json({ error: 'Server error' });
+        return handleAuthError(res, error, '2FA Verify Error:');
     }
 });
 
@@ -701,26 +689,12 @@ router.post('/2fa/verify', async (req, res) => {
  */
 router.post('/2fa/disable', async (req, res) => {
     try {
-        const authHeader = req.headers.authorization;
-        if (!authHeader || !authHeader.startsWith('Bearer ')) {
-            return res.status(401).json({ error: 'No token provided' });
-        }
-
-        const token = authHeader.split(' ')[1];
-        const decoded = jwt.verify(token, JWT_SECRET);
+        const { decoded, user } = verifyBearerToken(req);
 
         const { currentPassword } = req.body;
 
         if (!currentPassword) {
             return res.status(400).json({ error: 'Current password is required to disable 2FA' });
-        }
-
-        const user = db.prepare(
-            'SELECT password, two_factor_enabled FROM users WHERE id = ?'
-        ).get(decoded.userId);
-
-        if (!user) {
-            return res.status(401).json({ error: 'User not found' });
         }
 
         if (!user.two_factor_enabled) {
@@ -746,14 +720,7 @@ router.post('/2fa/disable', async (req, res) => {
         });
 
     } catch (error) {
-        if (error.name === 'JsonWebTokenError') {
-            return res.status(401).json({ error: 'Invalid token' });
-        }
-        if (error.name === 'TokenExpiredError') {
-            return res.status(401).json({ error: 'Token expired' });
-        }
-        console.error('2FA Disable Error:', error);
-        res.status(500).json({ error: 'Server error' });
+        return handleAuthError(res, error, '2FA Disable Error:');
     }
 });
 
@@ -763,14 +730,7 @@ router.post('/2fa/disable', async (req, res) => {
  */
 router.put('/password', async (req, res) => {
     try {
-        const authHeader = req.headers.authorization;
-
-        if (!authHeader || !authHeader.startsWith('Bearer ')) {
-            return res.status(401).json({ error: 'No token provided' });
-        }
-
-        const token = authHeader.split(' ')[1];
-        const decoded = jwt.verify(token, JWT_SECRET);
+        const { decoded, user } = verifyBearerToken(req);
 
         const { currentPassword, newPassword } = req.body;
 
@@ -783,14 +743,6 @@ router.put('/password', async (req, res) => {
 
         if (newPassword.length < getSetting('password_min_length', 8)) {
             return res.status(400).json({ error: `New password must be at least ${getSetting('password_min_length', 8)} characters` });
-        }
-
-        const user = db.prepare(
-            'SELECT * FROM users WHERE id = ?'
-        ).get(decoded.userId);
-
-        if (!user) {
-            return res.status(401).json({ error: 'User not found' });
         }
 
         const passwordMatch = await bcrypt.compare(currentPassword, user.password);
@@ -808,11 +760,7 @@ router.put('/password', async (req, res) => {
         res.json({ message: 'Password changed successfully' });
 
     } catch (error) {
-        if (error.name === 'JsonWebTokenError') {
-            return res.status(401).json({ error: 'Invalid token' });
-        }
-        console.error('Password change error:', error);
-        res.status(500).json({ error: 'Server error during password change' });
+        return handleAuthError(res, error, 'Password change error:');
     }
 });
 
@@ -941,30 +889,11 @@ router.post('/check-recovery', (req, res) => {
  */
 function requireAuth(req, res, next) {
     try {
-        const authHeader = req.headers.authorization;
-        if (!authHeader || !authHeader.startsWith('Bearer ')) {
-            return res.status(401).json({ error: 'No token provided' });
-        }
-        const token = authHeader.split(' ')[1];
-        const decoded = jwt.verify(token, JWT_SECRET);
-
-        const user = db.prepare('SELECT token_version, is_disabled FROM users WHERE id = ?').get(decoded.userId);
-        if (!user) return res.status(401).json({ error: 'User not found' });
-        if (user.is_disabled) return res.status(403).json({ error: 'Account is disabled' });
-
-        const tokenVersion = decoded.tokenVersion || 0;
-        if (tokenVersion !== (user.token_version || 1)) {
-            return res.status(401).json({ error: 'Token expired or invalidated' });
-        }
-
+        const { decoded } = verifyBearerToken(req);
         req.user = decoded;
         next();
     } catch (error) {
-        if (error.name === 'JsonWebTokenError' || error.name === 'TokenExpiredError') {
-            return res.status(401).json({ error: 'Invalid token' });
-        }
-        console.error('Auth error:', error);
-        res.status(500).json({ error: 'Server error' });
+        return handleAuthError(res, error, 'Auth error:');
     }
 }
 

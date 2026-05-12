@@ -9,9 +9,8 @@ import { Switch } from "@/components/ui/switch"
 import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog"
-import { Bell, Globe, Palette, HardDrive, Trash2, Server, Database, Loader2, Shield, Save, CheckCircle2, Plus, Usb, Mail, Send, Lock } from "lucide-react"
-import { getDashboardStats, getSystemHealth, getRateLimitSettings, updateSettings, testSmtpSettings, getStorageSources, addStorageSource, removeStorageSource, getEncryptionStats, type DashboardStats, type RateLimitSettings, type SystemHealth, type StorageSource, type EncryptionStats } from "@/lib/api"
+import { Bell, Palette, HardDrive, Trash2, Server, Loader2, Shield, Save, CheckCircle2, Mail, Send, Lock } from "lucide-react"
+import { getDashboardStats, getSystemHealth, getRateLimitSettings, updateSettings, testSmtpSettings, getEncryptionStats, getNotificationPreferences, updateNotificationPreferences, type DashboardStats, type RateLimitSettings, type SystemHealth, type EncryptionStats, type NotificationPreferences } from "@/lib/api"
 import { useAuth } from "@/contexts/auth-context"
 import { useTheme } from "@/contexts/theme-context"
 
@@ -54,6 +53,7 @@ export function SettingsContent() {
         rate_limit_upload_max: '10',
         rate_limit_upload_window: '15',
     })
+    const [trashRetentionDays, setTrashRetentionDays] = useState('30')
     const [smtpSettings, setSmtpSettings] = useState({
         smtp_host: '',
         smtp_port: '587',
@@ -61,28 +61,25 @@ export function SettingsContent() {
         smtp_pass: '',
         smtp_from_email: '',
     })
-    const [isSaving, setIsSaving] = useState(false)
-    const [saveMessage, setSaveMessage] = useState('')
+    const [isSavingRateLimits, setIsSavingRateLimits] = useState(false)
+    const [rateLimitMessage, setRateLimitMessage] = useState('')
+    const [isSavingTrashRetention, setIsSavingTrashRetention] = useState(false)
+    const [trashRetentionMessage, setTrashRetentionMessage] = useState('')
+    const [isSavingSmtp, setIsSavingSmtp] = useState(false)
+    const [smtpSaveMessage, setSmtpSaveMessage] = useState('')
     const [isTestingSmtp, setIsTestingSmtp] = useState(false)
     const [smtpTestMessage, setSmtpTestMessage] = useState('')
-
-    // Storage sources (admin only)
-    const [storageSources, setStorageSources] = useState<StorageSource[]>([])
-    const [showAddStorage, setShowAddStorage] = useState(false)
-    const [newStoragePath, setNewStoragePath] = useState('')
-    const [newStorageLabel, setNewStorageLabel] = useState('')
-    const [storageMessage, setStorageMessage] = useState('')
-    const [isAddingStorage, setIsAddingStorage] = useState(false)
 
     // Encryption state (admin only)
     const [encryptionStats, setEncryptionStats] = useState<EncryptionStats | null>(null)
     const [isTogglingEncryption, setIsTogglingEncryption] = useState(false)
 
-    const [notifications, setNotifications] = useState({
-        email: false,
-        fileChanges: true,
-        storageWarning: true,
+    const [notificationPreferences, setNotificationPreferences] = useState<NotificationPreferences>({
+        share_notifications: true,
+        storage_warnings: true,
     })
+    const [isSavingNotifications, setIsSavingNotifications] = useState(false)
+    const [notificationMessage, setNotificationMessage] = useState('')
 
     useEffect(() => {
         loadData()
@@ -90,19 +87,20 @@ export function SettingsContent() {
 
     async function loadData() {
         try {
-            const [statsData, healthData] = await Promise.all([
+            const [statsData, healthData, notificationPrefsData] = await Promise.all([
                 getDashboardStats(),
                 getSystemHealth(),
+                getNotificationPreferences(),
             ])
 
             setStats(statsData)
             setHealth(healthData)
+            setNotificationPreferences(notificationPrefsData.preferences)
 
             // Set rate limit settings if admin
             if (isAdmin) {
-                const [settingsData, storageData] = await Promise.all([
+                const [settingsData] = await Promise.all([
                     getRateLimitSettings(),
-                    getStorageSources(),
                 ])
                 const s: RateLimitSettings = settingsData.settings
                 setRateLimits({
@@ -113,6 +111,7 @@ export function SettingsContent() {
                     rate_limit_upload_max: s.rate_limit_upload_max?.value || '10',
                     rate_limit_upload_window: s.rate_limit_upload_window?.value || '15',
                 })
+                setTrashRetentionDays(s.trash_retention_days?.value || '30')
                 setSmtpSettings({
                     smtp_host: s.smtp_host?.value || '',
                     smtp_port: s.smtp_port?.value || '587',
@@ -120,8 +119,6 @@ export function SettingsContent() {
                     smtp_pass: s.smtp_pass?.value ? '********' : '',
                     smtp_from_email: s.smtp_from_email?.value || '',
                 })
-                setStorageSources(storageData.sources)
-
                 // Load encryption stats
                 try {
                     const encStats = await getEncryptionStats()
@@ -138,36 +135,59 @@ export function SettingsContent() {
     }
 
     async function handleSaveRateLimits() {
-        setIsSaving(true)
-        setSaveMessage('')
+        setIsSavingRateLimits(true)
+        setRateLimitMessage('')
         try {
             await updateSettings(rateLimits)
-            setSaveMessage('Settings saved successfully!')
-            setTimeout(() => setSaveMessage(''), 3000)
+            setRateLimitMessage('Settings saved successfully!')
+            setTimeout(() => setRateLimitMessage(''), 3000)
         } catch (error: unknown) {
-            setSaveMessage(getErrorMessage(error, 'Failed to save settings'))
+            setRateLimitMessage(getErrorMessage(error, 'Failed to save settings'))
         } finally {
-            setIsSaving(false)
+            setIsSavingRateLimits(false)
+        }
+    }
+
+    async function handleSaveTrashRetention() {
+        const days = Number(trashRetentionDays)
+        if (!Number.isInteger(days) || days < 1 || days > 3650) {
+            setTrashRetentionMessage('Trash retention must be between 1 and 3650 days')
+            return
+        }
+
+        setIsSavingTrashRetention(true)
+        setTrashRetentionMessage('')
+        try {
+            await updateSettings({ trash_retention_days: String(days) })
+            setTrashRetentionDays(String(days))
+            setTrashRetentionMessage('Trash retention saved successfully!')
+            setTimeout(() => setTrashRetentionMessage(''), 3000)
+        } catch (error: unknown) {
+            setTrashRetentionMessage(getErrorMessage(error, 'Failed to save trash retention'))
+        } finally {
+            setIsSavingTrashRetention(false)
         }
     }
 
     async function handleSaveSmtpSettings() {
-        setIsSaving(true)
-        setSaveMessage('')
+        setIsSavingSmtp(true)
+        setSmtpSaveMessage('')
+        setSmtpTestMessage('')
         try {
             await updateSettings(smtpSettings)
-            setSaveMessage('Email settings saved successfully!')
-            setTimeout(() => setSaveMessage(''), 3000)
+            setSmtpSaveMessage('Email settings saved successfully!')
+            setTimeout(() => setSmtpSaveMessage(''), 3000)
         } catch (error: unknown) {
-            setSaveMessage(getErrorMessage(error, 'Failed to save email settings'))
+            setSmtpSaveMessage(getErrorMessage(error, 'Failed to save email settings'))
         } finally {
-            setIsSaving(false)
+            setIsSavingSmtp(false)
         }
     }
 
     async function handleTestSmtp() {
         setIsTestingSmtp(true)
         setSmtpTestMessage('')
+        setSmtpSaveMessage('')
         try {
             const result = await testSmtpSettings(smtpSettings)
             setSmtpTestMessage(result.message)
@@ -178,35 +198,18 @@ export function SettingsContent() {
         }
     }
 
-    async function handleAddStorage() {
-        if (!newStoragePath.trim() || !newStorageLabel.trim()) return
-        setIsAddingStorage(true)
-        setStorageMessage('')
+    async function handleSaveNotificationPreferences() {
+        setIsSavingNotifications(true)
+        setNotificationMessage('')
         try {
-            const result = await addStorageSource(newStoragePath.trim(), newStorageLabel.trim())
-            setStorageMessage(result.message)
-            setShowAddStorage(false)
-            setNewStoragePath('')
-            setNewStorageLabel('')
-            // Refresh storage sources
-            const data = await getStorageSources()
-            setStorageSources(data.sources)
+            const result = await updateNotificationPreferences(notificationPreferences)
+            setNotificationPreferences(result.preferences)
+            setNotificationMessage('Notification preferences saved successfully!')
+            setTimeout(() => setNotificationMessage(''), 3000)
         } catch (error: unknown) {
-            setStorageMessage(getErrorMessage(error, 'Failed to add storage'))
+            setNotificationMessage(getErrorMessage(error, 'Failed to save notification preferences'))
         } finally {
-            setIsAddingStorage(false)
-        }
-    }
-
-    async function handleRemoveStorage(id: string) {
-        try {
-            await removeStorageSource(id)
-            const data = await getStorageSources()
-            setStorageSources(data.sources)
-            setStorageMessage('Storage source removed')
-            setTimeout(() => setStorageMessage(''), 3000)
-        } catch (error: unknown) {
-            setStorageMessage(getErrorMessage(error, 'Failed to remove storage'))
+            setIsSavingNotifications(false)
         }
     }
 
@@ -224,14 +227,14 @@ export function SettingsContent() {
     const storagePercent = Math.min(100, Math.round((usedStorage / totalDiskSpace) * 100))
 
     return (
-        <div className="space-y-6 max-w-4xl">
+        <div className="min-w-0 max-w-4xl space-y-6">
             <div>
                 <h1 className="text-2xl font-bold text-foreground">Settings</h1>
                 <p className="text-muted-foreground">Manage your personal cloud settings</p>
             </div>
 
             <Tabs defaultValue="server" className="space-y-6">
-                <TabsList className="bg-secondary">
+                <TabsList className="flex h-auto w-full justify-start overflow-x-auto bg-secondary p-1 sm:w-auto">
                     <TabsTrigger value="general">General</TabsTrigger>
                     <TabsTrigger value="server">Server</TabsTrigger>
                     <TabsTrigger value="notifications">Notifications</TabsTrigger>
@@ -248,13 +251,13 @@ export function SettingsContent() {
                             <CardDescription>Customize how your cloud looks</CardDescription>
                         </CardHeader>
                         <CardContent className="space-y-4">
-                            <div className="flex items-center justify-between">
+                            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                                 <div>
                                     <Label className="text-base">Theme</Label>
                                     <p className="text-sm text-muted-foreground">Select your preferred theme</p>
                                 </div>
                                 <Select value={theme} onValueChange={(value) => setTheme(value as "light" | "dark" | "system")}>
-                                    <SelectTrigger className="w-32">
+                                    <SelectTrigger className="w-full sm:w-32">
                                         <SelectValue />
                                     </SelectTrigger>
                                     <SelectContent>
@@ -263,32 +266,6 @@ export function SettingsContent() {
                                         <SelectItem value="system">System</SelectItem>
                                     </SelectContent>
                                 </Select>
-                            </div>
-                        </CardContent>
-                    </Card>
-
-                    {/* Language & Region */}
-                    <Card className="bg-card border-border">
-                        <CardHeader>
-                            <div className="flex items-center gap-2">
-                                <Globe className="h-5 w-5 text-primary" />
-                                <CardTitle className="text-card-foreground">Language & Region</CardTitle>
-                            </div>
-                            <CardDescription>Set your language and regional preferences</CardDescription>
-                        </CardHeader>
-                        <CardContent className="space-y-4">
-                            <div className="grid gap-4 sm:grid-cols-2">
-                                <div className="space-y-2">
-                                    <Label>Language</Label>
-                                    <Select defaultValue="en">
-                                        <SelectTrigger>
-                                            <SelectValue />
-                                        </SelectTrigger>
-                                        <SelectContent>
-                                            <SelectItem value="en">English</SelectItem>
-                                        </SelectContent>
-                                    </Select>
-                                </div>
                             </div>
                         </CardContent>
                     </Card>
@@ -316,12 +293,6 @@ export function SettingsContent() {
                                         style={{ width: `${storagePercent}%` }}
                                     />
                                 </div>
-                            </div>
-                            <div className="flex gap-2">
-                                <Button variant="outline" className="gap-2 bg-transparent">
-                                    <Trash2 className="h-4 w-4" />
-                                    Clear Cache
-                                </Button>
                             </div>
                         </CardContent>
                     </Card>
@@ -360,135 +331,59 @@ export function SettingsContent() {
                         </CardContent>
                     </Card>
 
-                    <Card className="bg-card border-border">
-                        <CardHeader>
-                            <div className="flex items-center gap-2">
-                                <Database className="h-5 w-5 text-primary" />
-                                <CardTitle className="text-card-foreground">Data Management</CardTitle>
-                            </div>
-                            <CardDescription>Backup and maintenance options</CardDescription>
-                        </CardHeader>
-                        <CardContent className="space-y-4">
-                            <div className="flex items-center justify-between p-4 rounded-lg bg-secondary">
-                                <div>
-                                    <p className="font-medium text-secondary-foreground">Last Backup</p>
-                                    <p className="text-sm text-muted-foreground">No backups yet</p>
-                                </div>
-                                <Button variant="outline">Backup Now</Button>
-                            </div>
-                        </CardContent>
-                    </Card>
-
-                    {/* Storage Sources (Admin Only) */}
+                    {/* Trash Retention (Admin Only) */}
                     {isAdmin && (
                         <Card className="bg-card border-border">
                             <CardHeader>
-                                <div className="flex items-center justify-between">
-                                    <div className="flex items-center gap-2">
-                                        <HardDrive className="h-5 w-5 text-primary" />
-                                        <CardTitle className="text-card-foreground">Storage Sources</CardTitle>
+                                <div className="flex items-center gap-2">
+                                    <Trash2 className="h-5 w-5 text-primary" />
+                                    <CardTitle className="text-card-foreground">Trash Retention</CardTitle>
+                                </div>
+                                <CardDescription>Choose how long deleted items stay recoverable</CardDescription>
+                            </CardHeader>
+                            <CardContent className="space-y-4">
+                                <div className="grid gap-3 rounded-lg bg-secondary p-4 sm:grid-cols-[minmax(0,1fr)_9rem_auto] sm:items-end">
+                                    <div className="space-y-1">
+                                        <p className="font-medium text-secondary-foreground">Auto-delete from Trash</p>
+                                        <p className="text-sm text-muted-foreground">
+                                            Expired trash is cleaned automatically when Trash is opened.
+                                        </p>
                                     </div>
-                                    <Button size="sm" className="gap-2" onClick={() => setShowAddStorage(true)}>
-                                        <Plus className="h-4 w-4" />
-                                        Add Storage
+                                    <div className="space-y-1">
+                                        <Label className="text-xs text-muted-foreground">Days</Label>
+                                        <Input
+                                            type="number"
+                                            min="1"
+                                            max="3650"
+                                            value={trashRetentionDays}
+                                            onChange={(event) => setTrashRetentionDays(event.target.value)}
+                                            className="bg-background"
+                                        />
+                                    </div>
+                                    <Button
+                                        onClick={handleSaveTrashRetention}
+                                        disabled={isSavingTrashRetention}
+                                        className="w-full gap-2 sm:w-auto"
+                                    >
+                                        {isSavingTrashRetention ? (
+                                            <Loader2 className="h-4 w-4 animate-spin" />
+                                        ) : (
+                                            <Save className="h-4 w-4" />
+                                        )}
+                                        Save
                                     </Button>
                                 </div>
-                                <CardDescription>Manage internal and external storage drives</CardDescription>
-                            </CardHeader>
-                            <CardContent className="space-y-3">
-                                {storageSources.map(source => {
-                                    const usedPercent = source.total_bytes > 0 
-                                        ? Math.round((source.used_bytes / source.total_bytes) * 100) 
-                                        : 0
-                                    return (
-                                        <div key={source.id} className="p-4 rounded-lg bg-secondary space-y-3">
-                                            <div className="flex items-center justify-between">
-                                                <div className="flex items-center gap-2">
-                                                    {source.type === 'internal' ? (
-                                                        <Server className="h-4 w-4 text-muted-foreground" />
-                                                    ) : (
-                                                        <Usb className="h-4 w-4 text-muted-foreground" />
-                                                    )}
-                                                    <span className="font-medium text-secondary-foreground">{source.label}</span>
-                                                    {source.is_accessible ? (
-                                                        <span className="text-xs px-2 py-0.5 rounded-full bg-green-500/20 text-green-400">Online</span>
-                                                    ) : (
-                                                        <span className="text-xs px-2 py-0.5 rounded-full bg-red-500/20 text-red-400">Offline</span>
-                                                    )}
-                                                </div>
-                                                {source.type !== 'internal' && (
-                                                    <Button 
-                                                        variant="ghost" 
-                                                        size="icon" 
-                                                        className="h-8 w-8 text-destructive hover:text-destructive"
-                                                        onClick={() => handleRemoveStorage(source.id)}
-                                                    >
-                                                        <Trash2 className="h-4 w-4" />
-                                                    </Button>
-                                                )}
-                                            </div>
-                                            <p className="text-xs text-muted-foreground font-mono">{source.path}</p>
-                                            <div className="flex items-center justify-between text-xs text-muted-foreground">
-                                                <span>{source.file_count} file(s) · {formatBytes(source.used_bytes)} used</span>
-                                                {source.total_bytes > 0 && (
-                                                    <span>{formatBytes(source.total_bytes - source.used_bytes)} free</span>
-                                                )}
-                                            </div>
-                                            {source.total_bytes > 0 && (
-                                                <div className="w-full bg-background rounded-full h-1.5">
-                                                    <div
-                                                        className={`h-1.5 rounded-full transition-all ${usedPercent > 90 ? 'bg-red-500' : usedPercent > 70 ? 'bg-yellow-500' : 'bg-primary'}`}
-                                                        style={{ width: `${usedPercent}%` }}
-                                                    />
-                                                </div>
-                                            )}
-                                        </div>
-                                    )
-                                })}
-                                {storageMessage && (
-                                    <p className={`text-sm ${storageMessage.includes('Cannot') || storageMessage.includes('Failed') ? 'text-red-500' : 'text-green-500'}`}>
-                                        {storageMessage}
+                                {trashRetentionMessage && (
+                                    <p className={`flex items-center gap-1 text-sm ${
+                                        trashRetentionMessage.includes('success') ? 'text-green-500' : 'text-red-500'
+                                    }`}>
+                                        {trashRetentionMessage.includes('success') && <CheckCircle2 className="h-4 w-4" />}
+                                        {trashRetentionMessage}
                                     </p>
                                 )}
                             </CardContent>
                         </Card>
                     )}
-
-                    {/* Add Storage Dialog */}
-                    <Dialog open={showAddStorage} onOpenChange={setShowAddStorage}>
-                        <DialogContent>
-                            <DialogHeader>
-                                <DialogTitle>Add External Storage</DialogTitle>
-                            </DialogHeader>
-                            <div className="space-y-4 py-4">
-                                <div className="space-y-2">
-                                    <Label>Drive Path</Label>
-                                    <Input
-                                        placeholder="e.g. /mnt/usb1 or E:\\"
-                                        value={newStoragePath}
-                                        onChange={(e) => setNewStoragePath(e.target.value)}
-                                    />
-                                    <p className="text-xs text-muted-foreground">The mount point or drive letter where the external drive is accessible</p>
-                                </div>
-                                <div className="space-y-2">
-                                    <Label>Label</Label>
-                                    <Input
-                                        placeholder="e.g. My USB Drive"
-                                        value={newStorageLabel}
-                                        onChange={(e) => setNewStorageLabel(e.target.value)}
-                                    />
-                                    <p className="text-xs text-muted-foreground">A friendly name to identify this drive</p>
-                                </div>
-                            </div>
-                            <DialogFooter>
-                                <Button variant="outline" onClick={() => setShowAddStorage(false)}>Cancel</Button>
-                                <Button onClick={handleAddStorage} disabled={isAddingStorage || !newStoragePath.trim() || !newStorageLabel.trim()} className="gap-2">
-                                    {isAddingStorage ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-                                    {isAddingStorage ? 'Adding...' : 'Add Storage'}
-                                </Button>
-                            </DialogFooter>
-                        </DialogContent>
-                    </Dialog>
 
                     {/* Encryption (Admin Only) */}
                     {isAdmin && (
@@ -656,21 +551,21 @@ export function SettingsContent() {
                                 </div>
 
                                 {/* Save Button */}
-                                <div className="flex items-center gap-3">
-                                    <Button onClick={handleSaveRateLimits} disabled={isSaving} className="gap-2">
-                                        {isSaving ? (
+                                <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+                                    <Button onClick={handleSaveRateLimits} disabled={isSavingRateLimits} className="w-full gap-2 sm:w-auto">
+                                        {isSavingRateLimits ? (
                                             <Loader2 className="h-4 w-4 animate-spin" />
                                         ) : (
                                             <Save className="h-4 w-4" />
                                         )}
-                                        {isSaving ? 'Saving...' : 'Save Changes'}
+                                        {isSavingRateLimits ? 'Saving...' : 'Save Changes'}
                                     </Button>
-                                    {saveMessage && (
+                                    {rateLimitMessage && (
                                         <span className={`text-sm flex items-center gap-1 ${
-                                            saveMessage.includes('success') ? 'text-green-500' : 'text-red-500'
+                                            rateLimitMessage.includes('success') ? 'text-green-500' : 'text-red-500'
                                         }`}>
-                                            {saveMessage.includes('success') && <CheckCircle2 className="h-4 w-4" />}
-                                            {saveMessage}
+                                            {rateLimitMessage.includes('success') && <CheckCircle2 className="h-4 w-4" />}
+                                            {rateLimitMessage}
                                         </span>
                                     )}
                                 </div>
@@ -742,24 +637,24 @@ export function SettingsContent() {
                                     </div>
                                 </div>
 
-                                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                                    <div className="flex items-center gap-3">
-                                        <Button onClick={handleSaveSmtpSettings} disabled={isSaving} className="gap-2">
-                                            {isSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                                <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
+                                    <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+                                        <Button onClick={handleSaveSmtpSettings} disabled={isSavingSmtp} className="w-full gap-2 sm:w-auto">
+                                            {isSavingSmtp ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
                                             Save Settings
                                         </Button>
-                                        <Button variant="outline" onClick={handleTestSmtp} disabled={isTestingSmtp || !smtpSettings.smtp_host} className="gap-2 border-primary/20 text-primary hover:bg-primary/10">
+                                        <Button variant="outline" onClick={handleTestSmtp} disabled={isTestingSmtp || !smtpSettings.smtp_host} className="w-full gap-2 border-primary/20 text-primary hover:bg-primary/10 sm:w-auto">
                                             {isTestingSmtp ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
                                             Send Test Email
                                         </Button>
                                     </div>
                                     
-                                    {(saveMessage || smtpTestMessage) && (
+                                    {(smtpSaveMessage || smtpTestMessage) && (
                                         <span className={`text-sm flex items-center gap-1 ${
-                                            (saveMessage || smtpTestMessage).includes('success') ? 'text-green-500' : 'text-red-500'
+                                            (smtpSaveMessage || smtpTestMessage).includes('success') ? 'text-green-500' : 'text-red-500'
                                         }`}>
-                                            {(saveMessage || smtpTestMessage).includes('success') && <CheckCircle2 className="h-4 w-4 shrink-0" />}
-                                            {saveMessage || smtpTestMessage}
+                                            {(smtpSaveMessage || smtpTestMessage).includes('success') && <CheckCircle2 className="h-4 w-4 shrink-0" />}
+                                            {smtpSaveMessage || smtpTestMessage}
                                         </span>
                                     )}
                                 </div>
@@ -775,40 +670,55 @@ export function SettingsContent() {
                                 <Bell className="h-5 w-5 text-primary" />
                                 <CardTitle className="text-card-foreground">Notification Preferences</CardTitle>
                             </div>
-                            <CardDescription>Choose how you want to be notified</CardDescription>
+                            <CardDescription>Choose which in-app notifications CloudPi should create</CardDescription>
                         </CardHeader>
                         <CardContent className="space-y-4">
-                            <div className="flex items-center justify-between">
-                                <div>
-                                    <Label className="text-base">Email Notifications</Label>
-                                    <p className="text-sm text-muted-foreground">Receive notifications via email</p>
+                            <div className="flex flex-col gap-3 rounded-lg bg-secondary p-4 sm:flex-row sm:items-center sm:justify-between">
+                                <div className="space-y-1">
+                                    <Label className="text-base text-secondary-foreground">Share notifications</Label>
+                                    <p className="text-sm text-muted-foreground">
+                                        Notify me when someone shares something with me or removes my access.
+                                    </p>
                                 </div>
                                 <Switch
-                                    checked={notifications.email}
-                                    onCheckedChange={(checked) => setNotifications({ ...notifications, email: checked })}
+                                    checked={notificationPreferences.share_notifications}
+                                    onCheckedChange={(checked) => setNotificationPreferences({
+                                        ...notificationPreferences,
+                                        share_notifications: checked,
+                                    })}
+                                    className="shrink-0"
                                 />
                             </div>
                             <Separator />
-                            <div className="flex items-center justify-between">
-                                <div>
-                                    <Label className="text-base">File Change Alerts</Label>
-                                    <p className="text-sm text-muted-foreground">Get notified when files are modified</p>
+                            <div className="flex flex-col gap-3 rounded-lg bg-secondary p-4 sm:flex-row sm:items-center sm:justify-between">
+                                <div className="space-y-1">
+                                    <Label className="text-base text-secondary-foreground">Storage warnings</Label>
+                                    <p className="text-sm text-muted-foreground">
+                                        Notify me when my storage quota is close to full or reached.
+                                    </p>
                                 </div>
                                 <Switch
-                                    checked={notifications.fileChanges}
-                                    onCheckedChange={(checked) => setNotifications({ ...notifications, fileChanges: checked })}
+                                    checked={notificationPreferences.storage_warnings}
+                                    onCheckedChange={(checked) => setNotificationPreferences({
+                                        ...notificationPreferences,
+                                        storage_warnings: checked,
+                                    })}
+                                    className="shrink-0"
                                 />
                             </div>
-                            <Separator />
-                            <div className="flex items-center justify-between">
-                                <div>
-                                    <Label className="text-base">Storage Warning</Label>
-                                    <p className="text-sm text-muted-foreground">Alert when storage is almost full</p>
-                                </div>
-                                <Switch
-                                    checked={notifications.storageWarning}
-                                    onCheckedChange={(checked) => setNotifications({ ...notifications, storageWarning: checked })}
-                                />
+                            <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+                                <Button onClick={handleSaveNotificationPreferences} disabled={isSavingNotifications} className="w-full gap-2 sm:w-auto">
+                                    {isSavingNotifications ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                                    Save Preferences
+                                </Button>
+                                {notificationMessage && (
+                                    <span className={`flex items-center gap-1 text-sm ${
+                                        notificationMessage.includes('success') ? 'text-green-500' : 'text-red-500'
+                                    }`}>
+                                        {notificationMessage.includes('success') && <CheckCircle2 className="h-4 w-4" />}
+                                        {notificationMessage}
+                                    </span>
+                                )}
                             </div>
                         </CardContent>
                     </Card>

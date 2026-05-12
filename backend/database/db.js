@@ -11,6 +11,11 @@
 
 const Database = require("better-sqlite3");
 const path = require("path");
+const {
+  ensureFileVersioningSchema,
+  migrateDuplicateActiveSiblings,
+  createFileVersionUniqueIndexes,
+} = require("../utils/file-versioning");
 
 // Database path: configurable via env var (for Docker), falls back to backend root
 const dbPath = process.env.CLOUDPI_DB_PATH || path.join(__dirname, "..", "cloudpi.db");
@@ -38,6 +43,8 @@ const FILES_TABLE_SCHEMA = `
     trashed_at DATETIME,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     modified_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    accessed_at DATETIME DEFAULT NULL,
+    version_number INTEGER NOT NULL DEFAULT 1,
     storage_source_id TEXT REFERENCES storage_sources(id),
     sha256_hash TEXT DEFAULT NULL,
     encrypted INTEGER DEFAULT 0,
@@ -69,6 +76,139 @@ function syncAutoincrementSequence(tableName) {
   }
 }
 
+function tableSqlReferences(tableName, referencedTableName) {
+  const row = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(tableName);
+  return !!row?.sql && row.sql.includes(referencedTableName);
+}
+
+function repairStaleFilesLegacyForeignKeys() {
+  const staleTables = ["shares", "folder_locks", "vault_upload_sessions"]
+    .filter((tableName) => tableSqlReferences(tableName, "files_legacy"));
+
+  if (staleTables.length === 0) {
+    return;
+  }
+
+  console.log(`🛠️ Repairing stale files_legacy foreign keys in ${staleTables.join(", ")}...`);
+
+  db.pragma("foreign_keys = OFF");
+  try {
+    db.transaction(() => {
+      if (staleTables.includes("folder_locks")) {
+        db.exec(`
+          ALTER TABLE folder_locks RENAME TO folder_locks_fk_repair_old;
+          CREATE TABLE folder_locks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            folder_id INTEGER NOT NULL UNIQUE,
+            user_id INTEGER NOT NULL,
+            salt TEXT NOT NULL,
+            encrypted_dek TEXT NOT NULL,
+            dek_iv TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (folder_id) REFERENCES files(id) ON DELETE CASCADE,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+          );
+          INSERT INTO folder_locks (id, folder_id, user_id, salt, encrypted_dek, dek_iv, created_at)
+          SELECT id, folder_id, user_id, salt, encrypted_dek, dek_iv, created_at
+          FROM folder_locks_fk_repair_old;
+          DROP TABLE folder_locks_fk_repair_old;
+        `);
+        syncAutoincrementSequence("folder_locks");
+      }
+
+      if (staleTables.includes("vault_upload_sessions")) {
+        db.exec(`
+          ALTER TABLE vault_upload_sessions RENAME TO vault_upload_sessions_fk_repair_old;
+          CREATE TABLE vault_upload_sessions (
+            id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            vault_root_id INTEGER NOT NULL,
+            parent_id INTEGER NOT NULL,
+            storage_source_id TEXT NOT NULL,
+            storage_id TEXT NOT NULL,
+            mime_type TEXT,
+            size INTEGER NOT NULL,
+            chunk_count INTEGER NOT NULL,
+            encrypted_metadata TEXT NOT NULL,
+            e2ee_iv TEXT NOT NULL,
+            temp_path TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (vault_root_id) REFERENCES files(id) ON DELETE CASCADE,
+            FOREIGN KEY (parent_id) REFERENCES files(id) ON DELETE CASCADE,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+          );
+          INSERT INTO vault_upload_sessions (
+            id, user_id, vault_root_id, parent_id, storage_source_id, storage_id,
+            mime_type, size, chunk_count, encrypted_metadata, e2ee_iv, temp_path, created_at
+          )
+          SELECT
+            id, user_id, vault_root_id, parent_id, storage_source_id, storage_id,
+            mime_type, size, chunk_count, encrypted_metadata, e2ee_iv, temp_path, created_at
+          FROM vault_upload_sessions_fk_repair_old;
+          DROP TABLE vault_upload_sessions_fk_repair_old;
+        `);
+      }
+
+      if (staleTables.includes("shares")) {
+        const hasSharedWith = hasColumn("shares", "shared_with");
+        db.exec(`
+          ALTER TABLE shares RENAME TO shares_fk_repair_old;
+          CREATE TABLE shares (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id INTEGER NOT NULL,
+            shared_by INTEGER NOT NULL,
+            shared_with_email TEXT,
+            permission TEXT DEFAULT 'view',
+            share_link TEXT UNIQUE,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            share_type TEXT DEFAULT 'user',
+            expires_at DATETIME DEFAULT NULL,
+            password_hash TEXT DEFAULT NULL,
+            allow_download INTEGER DEFAULT 1,
+            access_count INTEGER DEFAULT 0,
+            last_accessed_at DATETIME DEFAULT NULL,
+            shared_with INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
+            FOREIGN KEY (shared_by) REFERENCES users(id) ON DELETE CASCADE
+          );
+        `);
+        if (hasSharedWith) {
+          db.exec(`
+            INSERT INTO shares (
+              id, file_id, shared_by, shared_with_email, permission, share_link, created_at,
+              share_type, expires_at, password_hash, allow_download, access_count, last_accessed_at,
+              shared_with
+            )
+            SELECT
+              id, file_id, shared_by, shared_with_email, permission, share_link, created_at,
+              CASE WHEN shared_with IS NULL THEN 'link' ELSE 'user' END,
+              NULL, NULL, 1, 0, NULL, shared_with
+            FROM shares_fk_repair_old;
+          `);
+        } else {
+          db.exec(`
+            INSERT INTO shares (
+              id, file_id, shared_by, shared_with_email, permission, share_link, created_at,
+              share_type, expires_at, password_hash, allow_download, access_count, last_accessed_at,
+              shared_with
+            )
+            SELECT
+              id, file_id, shared_by, shared_with_email, permission, share_link, created_at,
+              'link', NULL, NULL, 1, 0, NULL, NULL
+            FROM shares_fk_repair_old;
+          `);
+        }
+        db.exec("DROP TABLE shares_fk_repair_old;");
+        syncAutoincrementSequence("shares");
+      }
+    })();
+  } finally {
+    db.pragma("foreign_keys = ON");
+  }
+
+  console.log("✅ Stale file foreign key repair complete.");
+}
+
 function migrateLegacyFilesTable() {
   if (!hasColumn("files", "key_wrapped")) {
     return;
@@ -84,14 +224,14 @@ function migrateLegacyFilesTable() {
         ${FILES_TABLE_SCHEMA.replace("IF NOT EXISTS ", "")};
         INSERT INTO files (
           id, user_id, name, path, type, size, mime_type, parent_id, starred,
-          trashed, trashed_at, created_at, modified_at, storage_source_id,
+          trashed, trashed_at, created_at, modified_at, version_number, storage_source_id,
           sha256_hash, encrypted, encryption_auth_tag, integrity_failed,
           storage_id, encrypted_metadata, e2ee_iv,
           is_chunked, chunk_count, vault_root_id, is_secure_vault
         )
         SELECT
           id, user_id, name, path, type, size, mime_type, parent_id, starred,
-          trashed, trashed_at, created_at, modified_at, storage_source_id,
+          trashed, trashed_at, created_at, modified_at, 1, storage_source_id,
           sha256_hash, encrypted, NULL, 0,
           storage_id, encrypted_metadata, e2ee_iv,
           is_chunked, chunk_count, vault_root_id, is_secure_vault
@@ -104,6 +244,8 @@ function migrateLegacyFilesTable() {
   } finally {
     db.pragma("foreign_keys = ON");
   }
+
+  repairStaleFilesLegacyForeignKeys();
 
   const foreignKeyIssues = db.prepare("PRAGMA foreign_key_check").all();
   if (foreignKeyIssues.length > 0) {
@@ -286,11 +428,110 @@ db.exec(`
     shared_with_email TEXT,
     permission TEXT DEFAULT 'view',
     share_link TEXT UNIQUE,
+    share_type TEXT DEFAULT 'user',
+    expires_at DATETIME DEFAULT NULL,
+    password_hash TEXT DEFAULT NULL,
+    allow_download INTEGER DEFAULT 1,
+    access_count INTEGER DEFAULT 0,
+    last_accessed_at DATETIME DEFAULT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
     FOREIGN KEY (shared_by) REFERENCES users(id) ON DELETE CASCADE
   )
 `);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS share_access_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    share_id INTEGER NOT NULL,
+    accessed_by INTEGER DEFAULT NULL,
+    ip_address TEXT,
+    user_agent TEXT,
+    action TEXT DEFAULT 'view',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (share_id) REFERENCES shares(id) ON DELETE CASCADE,
+    FOREIGN KEY (accessed_by) REFERENCES users(id) ON DELETE SET NULL
+  )
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS share_shortcuts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    share_id INTEGER NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, share_id),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (share_id) REFERENCES shares(id) ON DELETE CASCADE
+  )
+`);
+
+/**
+ * NOTIFICATIONS TABLE
+ * -------------------
+ * In-app notifications for user-facing events such as private shares.
+ */
+db.exec(`
+  CREATE TABLE IF NOT EXISTS notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    link TEXT,
+    metadata_json TEXT,
+    read_at DATETIME DEFAULT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  )
+`);
+
+db.exec(`CREATE INDEX IF NOT EXISTS idx_notifications_user_created ON notifications(user_id, created_at DESC)`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_notifications_user_read ON notifications(user_id, read_at)`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS notification_states (
+    user_id INTEGER NOT NULL,
+    state_key TEXT NOT NULL,
+    value TEXT,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id, state_key),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  )
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS notification_preferences (
+    user_id INTEGER PRIMARY KEY,
+    share_notifications INTEGER DEFAULT 1,
+    storage_warnings INTEGER DEFAULT 1,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  )
+`);
+
+/**
+ * ACTIVITY EVENTS TABLE
+ * ---------------------
+ * Lightweight user-visible activity history for dashboard feeds.
+ */
+db.exec(`
+  CREATE TABLE IF NOT EXISTS activity_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    actor_id INTEGER DEFAULT NULL,
+    type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT,
+    link TEXT,
+    metadata_json TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (actor_id) REFERENCES users(id) ON DELETE SET NULL
+  )
+`);
+
+db.exec(`CREATE INDEX IF NOT EXISTS idx_activity_events_user_created ON activity_events(user_id, created_at DESC)`);
 
 /**
  * SETTINGS TABLE
@@ -344,6 +585,13 @@ try {
   // Column already exists, ignore
 }
 
+// Track the last time a file was opened in the browser preview.
+try {
+  db.exec(`ALTER TABLE files ADD COLUMN accessed_at DATETIME DEFAULT NULL`);
+} catch (e) {
+  // Column already exists, ignore
+}
+
 // Add default_storage_id to users table — admin can assign each user a default storage
 try {
   db.exec(
@@ -374,6 +622,7 @@ const defaultSettings = [
   ["smtp_pass", "", "SMTP authentication password (encrypted)"],
   ["smtp_from_email", "", "Sender email address"],
   ["encryption_enabled", "0", "Enable AES-256-GCM encryption for new file uploads (0=disabled, 1=enabled)"],
+  ["trash_retention_days", "30", "Days to keep items in Trash before permanent deletion"],
 ];
 
 const insertSetting = db.prepare(
@@ -412,6 +661,47 @@ try {
 } catch (e) {
   // Column already exists, ignore
 }
+
+try {
+  db.exec(`ALTER TABLE shares ADD COLUMN share_type TEXT DEFAULT 'user'`);
+  db.exec(`UPDATE shares SET share_type = CASE WHEN shared_with IS NULL THEN 'link' ELSE 'user' END WHERE share_type IS NULL`);
+} catch (e) {
+  // Column already exists, ignore
+}
+
+try {
+  db.exec(`ALTER TABLE shares ADD COLUMN expires_at DATETIME DEFAULT NULL`);
+} catch (e) {
+  // Column already exists, ignore
+}
+
+try {
+  db.exec(`ALTER TABLE shares ADD COLUMN password_hash TEXT DEFAULT NULL`);
+} catch (e) {
+  // Column already exists, ignore
+}
+
+try {
+  db.exec(`ALTER TABLE shares ADD COLUMN allow_download INTEGER DEFAULT 1`);
+} catch (e) {
+  // Column already exists, ignore
+}
+
+try {
+  db.exec(`ALTER TABLE shares ADD COLUMN access_count INTEGER DEFAULT 0`);
+} catch (e) {
+  // Column already exists, ignore
+}
+
+try {
+  db.exec(`ALTER TABLE shares ADD COLUMN last_accessed_at DATETIME DEFAULT NULL`);
+} catch (e) {
+  // Column already exists, ignore
+}
+
+db.exec(`UPDATE shares SET share_type = CASE WHEN shared_with IS NULL THEN 'link' ELSE 'user' END WHERE share_type IS NULL`);
+db.exec(`UPDATE shares SET allow_download = 1 WHERE allow_download IS NULL`);
+db.exec(`UPDATE shares SET access_count = 0 WHERE access_count IS NULL`);
 
 // Add storage_quota column if it doesn't exist (NULL = unlimited, value in bytes)
 try {
@@ -491,6 +781,24 @@ try {
 }
 
 migrateLegacyFilesTable();
+repairStaleFilesLegacyForeignKeys();
+ensureFileVersioningSchema(db);
+const versioningMigration = migrateDuplicateActiveSiblings(db);
+if (
+  versioningMigration.renamed ||
+  versioningMigration.fileRowsMerged ||
+  versioningMigration.folderRowsMerged ||
+  versioningMigration.sharesMoved
+) {
+  console.log(
+    `✅ File versioning migration resolved duplicates: ` +
+    `${versioningMigration.fileRowsMerged} file row(s) merged, ` +
+    `${versioningMigration.folderRowsMerged} folder row(s) merged, ` +
+    `${versioningMigration.renamed} item(s) renamed, ` +
+    `${versioningMigration.sharesMoved} share reference(s) moved.`
+  );
+}
+createFileVersionUniqueIndexes(db);
 
 // Export the database connection so other files can use it
 module.exports = db;

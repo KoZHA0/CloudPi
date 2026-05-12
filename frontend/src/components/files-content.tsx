@@ -1,9 +1,11 @@
 "use client"
 
 import { useState, useEffect, useRef } from "react"
+import { useSearchParams } from "react-router-dom"
 import { Card, CardContent, CardHeader } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { Badge } from "@/components/ui/badge"
 import {
     ContextMenu,
     ContextMenuContent,
@@ -35,8 +37,23 @@ import {
     AlertDialogHeader,
     AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
+import {
+    Sheet,
+    SheetContent,
+    SheetDescription,
+    SheetHeader,
+    SheetTitle,
+} from "@/components/ui/sheet"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Label } from "@/components/ui/label"
+import { Switch } from "@/components/ui/switch"
+import {
+    Select,
+    SelectContent,
+    SelectItem,
+    SelectTrigger,
+    SelectValue,
+} from "@/components/ui/select"
 import {
     Folder,
     FileText,
@@ -47,6 +64,7 @@ import {
     MoreVertical,
     Grid3X3,
     List,
+    Columns3,
     SortAsc,
     SortDesc,
     Upload,
@@ -56,6 +74,7 @@ import {
     Trash2,
     Star,
     Search,
+    ChevronLeft,
     ChevronRight,
     Home,
     Loader2,
@@ -80,6 +99,12 @@ import {
     ShieldAlert,
     KeyRound,
     RefreshCw,
+    History,
+    RotateCcw,
+    RotateCw,
+    ZoomIn,
+    ZoomOut,
+    Keyboard,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import {
@@ -91,6 +116,10 @@ import {
     fetchVaultChunk,
     getVaultMetadata,
     changeVaultPin,
+    initFileUpload,
+    uploadFileChunk,
+    completeFileUpload,
+    abortFileUpload,
     initVaultUpload,
     uploadVaultChunk,
     completeVaultUpload,
@@ -103,15 +132,28 @@ import {
     deleteFile,
     getPreviewUrl,
     getThumbnailUrl,
+    downloadFilesZip,
     createShareLink,
     getShareUsers,
+    getSharedFolderFiles,
+    downloadSharedFile,
+    downloadIncomingShare,
+    getIncomingSharePreviewUrl,
+    removeShareShortcut,
+    getFileVersions,
+    restoreFileVersion as restoreArchivedFileVersion,
+    deleteFileVersion as deleteArchivedFileVersion,
     type FileItem,
     type Breadcrumb,
     type ShareUser,
+    type SharePermission,
+    type FileVersion,
+    type FileVersionsResponse,
 } from "@/lib/api"
 import { useUpload } from "@/contexts/upload-context"
 import { useDriveStatus } from "@/contexts/drive-status-context"
 import { useVaults } from "@/contexts/vault-context"
+import { OPEN_FILE_UPLOAD_PICKER_EVENT, REFRESH_FILES_EVENT } from "@/lib/upload-events"
 import {
     CHUNK_SIZE_BYTES,
     createFileIv,
@@ -133,8 +175,73 @@ const getFileIcon = (type: FileItem["type"]) => {
         video: Video,
         audio: Music,
         archive: Archive,
+        other: FileText,
     }
     return icons[type] || FileText
+}
+
+type FilesViewMode = "grid" | "list" | "columns"
+type FilesSortKey = "name" | "modified" | "size" | "type"
+type CloudPiUploadFile = File & { cloudpiRelativePath?: string; webkitRelativePath?: string }
+interface FilesColumn {
+    folderId: number | null
+    title: string
+    files: FileItem[]
+}
+
+const FILES_VIEW_KEY = "cloudpi.files.view"
+const FILES_SORT_KEY = "cloudpi.files.sortKey"
+const FILES_SORT_DIRECTION_KEY = "cloudpi.files.sortDirection"
+const FILE_DRAG_TYPE = "application/x-cloudpi-file-ids"
+const KNOWN_FILE_FILTER_TYPES = ["document", "image", "video", "audio", "archive"] as const
+const FILE_FILTER_TYPES = [...KNOWN_FILE_FILTER_TYPES, "other", "starred"] as const
+const CODE_PREVIEW_EXTENSIONS = new Set([
+    "js", "jsx", "ts", "tsx", "mjs", "cjs", "css", "scss", "html", "htm",
+    "py", "rb", "php", "java", "c", "cpp", "h", "hpp", "cs", "go", "rs",
+    "sh", "bash", "ps1", "sql", "xml", "toml", "ini", "env",
+])
+const TEXT_PREVIEW_EXTENSIONS = new Set([
+    ...CODE_PREVIEW_EXTENSIONS,
+    "txt", "text", "log", "md", "markdown", "json", "yaml", "yml", "csv",
+])
+const CODE_KEYWORDS = new Set([
+    "async", "await", "break", "case", "catch", "class", "const", "continue", "def",
+    "default", "do", "else", "export", "extends", "false", "finally", "for", "from",
+    "function", "if", "import", "in", "interface", "let", "new", "null", "return",
+    "switch", "throw", "true", "try", "type", "var", "while",
+])
+
+function getInitialFilesView(): FilesViewMode {
+    if (typeof window === "undefined") return "list"
+    const value = window.localStorage.getItem(FILES_VIEW_KEY)
+    return value === "grid" || value === "columns" ? value : "list"
+}
+
+function getInitialSortKey(): FilesSortKey {
+    if (typeof window === "undefined") return "name"
+    const value = window.localStorage.getItem(FILES_SORT_KEY)
+    return value === "modified" || value === "size" || value === "type" ? value : "name"
+}
+
+function getInitialSortDirection(): "asc" | "desc" {
+    if (typeof window === "undefined") return "asc"
+    return window.localStorage.getItem(FILES_SORT_DIRECTION_KEY) === "desc" ? "desc" : "asc"
+}
+
+function parseIdParam(value: string | null) {
+    if (!value) return null
+    const id = Number(value)
+    return Number.isInteger(id) && id > 0 ? id : null
+}
+
+function getFileExtension(fileName: string) {
+    const match = fileName.toLowerCase().match(/\.([^.]+)$/)
+    return match?.[1] || ""
+}
+
+function getInitialFilterType(searchParams: URLSearchParams) {
+    const type = searchParams.get("type")
+    return FILE_FILTER_TYPES.includes(type as typeof FILE_FILTER_TYPES[number]) ? type : null
 }
 
 const getFileColor = (type: FileItem["type"]) => {
@@ -145,6 +252,7 @@ const getFileColor = (type: FileItem["type"]) => {
         video: "text-purple-400",
         audio: "text-yellow-400",
         archive: "text-orange-400",
+        other: "text-gray-400",
     }
     return colors[type] || "text-gray-400"
 }
@@ -173,14 +281,20 @@ export function FilesContent() {
     const { addUpload } = useUpload()
     const { isFileAccessible, disconnectedDrives, notification } = useDriveStatus()
     const { isVaultUnlocked, getVaultKey, unlockVault, lockVault, touchVault } = useVaults()
-    const [view, setView] = useState<"grid" | "list">("grid")
+    const [searchParams, setSearchParams] = useSearchParams()
+    const [view, setView] = useState<FilesViewMode>(() => getInitialFilesView())
     const [files, setFiles] = useState<FileItem[]>([])
+    const [columns, setColumns] = useState<FilesColumn[]>([])
+    const [columnsLoading, setColumnsLoading] = useState(false)
+    const [columnsError, setColumnsError] = useState<string | null>(null)
     const [breadcrumbs, setBreadcrumbs] = useState<Breadcrumb[]>([])
     const [displayNames, setDisplayNames] = useState<Record<number, string>>({})
-    const [currentFolderId, setCurrentFolderId] = useState<number | null>(null)
+    const [currentFolderId, setCurrentFolderId] = useState<number | null>(() => parseIdParam(searchParams.get("folder")))
+    const [highlightedFileId, setHighlightedFileId] = useState<number | null>(() => parseIdParam(searchParams.get("highlight")))
     const [currentFolder, setCurrentFolder] = useState<Breadcrumb | null>(null)
     const [currentVault, setCurrentVault] = useState<Breadcrumb | null>(null)
     const [selectedFiles, setSelectedFiles] = useState<number[]>([])
+    const [lastSelectedFileId, setLastSelectedFileId] = useState<number | null>(null)
     const [isSelecting, setIsSelecting] = useState(false)
     const [searchQuery, setSearchQuery] = useState("")
     const [isLoading, setIsLoading] = useState(true)
@@ -188,9 +302,9 @@ export function FilesContent() {
     const [storageWarning, setStorageWarning] = useState<string | null>(null)
 
     // Sorting & filtering
-    const [sortKey, setSortKey] = useState<"name" | "modified" | "size" | "type">("name")
-    const [sortDirection, setSortDirection] = useState<"asc" | "desc">("asc")
-    const [filterType, setFilterType] = useState<string | null>(null)
+    const [sortKey, setSortKey] = useState<FilesSortKey>(() => getInitialSortKey())
+    const [sortDirection, setSortDirection] = useState<"asc" | "desc">(() => getInitialSortDirection())
+    const [filterType, setFilterTypeState] = useState<string | null>(() => getInitialFilterType(searchParams))
 
     // File details sidebar
     const [detailFile, setDetailFile] = useState<FileItem | null>(null)
@@ -204,6 +318,7 @@ export function FilesContent() {
     const [showRenameDialog, setShowRenameDialog] = useState(false)
     const [showDeleteDialog, setShowDeleteDialog] = useState(false)
     const [showLocationDialog, setShowLocationDialog] = useState(false)
+    const [showKeyboardHelp, setShowKeyboardHelp] = useState(false)
     const [newFolderName, setNewFolderName] = useState("")
     const [newSecureVaultName, setNewSecureVaultName] = useState("")
     const [secureVaultPin, setSecureVaultPin] = useState("")
@@ -216,6 +331,7 @@ export function FilesContent() {
     const [selectedItem, setSelectedItem] = useState<FileItem | null>(null)
     const [locationMode, setLocationMode] = useState<"move" | "copy">("move")
     const [locationTarget, setLocationTarget] = useState<FileItem | null>(null)
+    const [locationTargets, setLocationTargets] = useState<FileItem[]>([])
     const [destinationFolderId, setDestinationFolderId] = useState<number | null>(null)
     const [destinationFolders, setDestinationFolders] = useState<FileItem[]>([])
     const [destinationBreadcrumbs, setDestinationBreadcrumbs] = useState<Breadcrumb[]>([])
@@ -226,28 +342,116 @@ export function FilesContent() {
     const [previewFile, setPreviewFile] = useState<FileItem | null>(null)
     const [previewTextContent, setPreviewTextContent] = useState<string | null>(null)
     const [pdfBlobUrl, setPdfBlobUrl] = useState<string | null>(null)
+    const [imageZoom, setImageZoom] = useState(1)
+    const [imageRotation, setImageRotation] = useState(0)
+    const [imagePan, setImagePan] = useState({ x: 0, y: 0 })
+    const [isImagePanning, setIsImagePanning] = useState(false)
+    const imagePanStartRef = useRef({ pointerX: 0, pointerY: 0, panX: 0, panY: 0 })
+    const [previewTextWrap, setPreviewTextWrap] = useState(true)
+    const [previewTextCopied, setPreviewTextCopied] = useState(false)
+
+    // Shared shortcuts added to My Files
+    const [browsingShortcut, setBrowsingShortcut] = useState<FileItem | null>(null)
+    const [shortcutFiles, setShortcutFiles] = useState<FileItem[]>([])
+    const [shortcutBreadcrumbs, setShortcutBreadcrumbs] = useState<Breadcrumb[]>([])
+    const [shortcutRootFolderId, setShortcutRootFolderId] = useState<number | null>(null)
+    const [shortcutLoading, setShortcutLoading] = useState(false)
 
     // Upload
     const fileInputRef = useRef<HTMLInputElement>(null)
+    const folderInputRef = useRef<HTMLInputElement>(null)
 
     // Drag and drop
     const [isDragging, setIsDragging] = useState(false)
+    const [internalDragIds, setInternalDragIds] = useState<number[]>([])
+    const [dropTargetFolderId, setDropTargetFolderId] = useState<number | null>(null)
     const dragCounter = useRef(0)
 
     // Share dialog
     const [showShareDialog, setShowShareDialog] = useState(false)
     const [shareFile, setShareFile] = useState<FileItem | null>(null)
+    const [shareFiles, setShareFiles] = useState<FileItem[]>([])
     const [shareUsers, setShareUsers] = useState<ShareUser[]>([])
     const [shareLoading, setShareLoading] = useState(false)
     const [selectedShareUsers, setSelectedShareUsers] = useState<number[]>([])
+    const [shareUserQuery, setShareUserQuery] = useState("")
+    const [sharePermission, setSharePermission] = useState<SharePermission>("view")
+    const [shareExpiry, setShareExpiry] = useState("")
+    const [allowShareDownload, setAllowShareDownload] = useState(true)
     const [shareStatus, setShareStatus] = useState<{ type: 'success' | 'warning' | 'error'; message: string } | null>(null)
     const [isSharing, setIsSharing] = useState(false)
     const [vaultBusy, setVaultBusy] = useState(false)
+    const [versionFile, setVersionFile] = useState<FileItem | null>(null)
+    const [versionHistory, setVersionHistory] = useState<FileVersionsResponse | null>(null)
+    const [versionLoading, setVersionLoading] = useState(false)
+    const [versionError, setVersionError] = useState<string | null>(null)
+    const [versionAction, setVersionAction] = useState<{ type: "restore" | "delete"; version: FileVersion } | null>(null)
+    const [versionActionBusy, setVersionActionBusy] = useState(false)
+
+    useEffect(() => {
+        const nextFolderId = parseIdParam(searchParams.get("folder"))
+        const nextHighlightId = parseIdParam(searchParams.get("highlight"))
+        const folderChanged = nextFolderId !== currentFolderId
+        const highlightChanged = nextHighlightId !== highlightedFileId
+        setHighlightedFileId(nextHighlightId)
+
+        if (folderChanged || highlightChanged) {
+            closePreview()
+            setDetailFile(null)
+            closeVersionHistory()
+            closeShortcutBrowser()
+        }
+
+        if (folderChanged) {
+            setSelectedFiles([])
+            setLastSelectedFileId(null)
+            setIsSelecting(false)
+            setCurrentFolderId(nextFolderId)
+        }
+    }, [searchParams])
+
+    useEffect(() => {
+        const nextFilterType = getInitialFilterType(searchParams)
+        setFilterTypeState((current) => current === nextFilterType ? current : nextFilterType)
+    }, [searchParams])
+
+    useEffect(() => {
+        if (typeof window === "undefined") return
+        window.localStorage.setItem(FILES_VIEW_KEY, view)
+    }, [view])
+
+    useEffect(() => {
+        if (typeof window === "undefined") return
+        window.localStorage.setItem(FILES_SORT_KEY, sortKey)
+        window.localStorage.setItem(FILES_SORT_DIRECTION_KEY, sortDirection)
+    }, [sortKey, sortDirection])
 
     // Load files
     useEffect(() => {
         loadFiles()
     }, [currentFolderId])
+
+    useEffect(() => {
+        if (view !== "columns" || isLoading) return
+        loadColumnsForPath()
+    }, [view, isLoading, currentFolderId, files, breadcrumbs])
+
+    useEffect(() => {
+        const previewId = parseIdParam(searchParams.get("preview"))
+        if (!previewId || isLoading) return
+
+        const target = files.find((file) => file.id === previewId)
+        if (!target) return
+
+        const nextParams = new URLSearchParams(searchParams)
+        nextParams.delete("preview")
+
+        if (target.type !== "folder" && isFileAccessible(target) && !isSecureItem(target)) {
+            openPreview(target)
+        }
+
+        setSearchParams(nextParams, { replace: true })
+    }, [searchParams, isLoading, files])
 
     const activeVaultId = currentVault?.id ?? null
     const isInsideVault = activeVaultId !== null
@@ -279,6 +483,36 @@ export function FilesContent() {
         }
     }
 
+    async function loadColumnsForPath() {
+        setColumnsLoading(true)
+        setColumnsError(null)
+        try {
+            const nextColumns: FilesColumn[] = []
+            const rootData = currentFolderId === null ? { files } : await getFiles(null) as any
+            nextColumns.push({
+                folderId: null,
+                title: "My Files",
+                files: rootData.files || [],
+            })
+
+            for (const crumb of breadcrumbs) {
+                const crumbData = crumb.id === currentFolderId ? { files } : await getFiles(crumb.id) as any
+                nextColumns.push({
+                    folderId: crumb.id,
+                    title: getDisplayName(crumb),
+                    files: crumbData.files || [],
+                })
+            }
+
+            setColumns(nextColumns)
+        } catch (err) {
+            setColumnsError(err instanceof Error ? err.message : "Failed to load columns view")
+            setColumns([])
+        } finally {
+            setColumnsLoading(false)
+        }
+    }
+
     useEffect(() => {
         let cancelled = false
 
@@ -286,8 +520,10 @@ export function FilesContent() {
             const nextNames: Record<number, string> = {}
             const activeKey = getVaultKey(activeVaultId)
 
+            const columnItems = columns.flatMap((column) => column.files)
             const allItems = [
                 ...files,
+                ...columnItems,
                 ...breadcrumbs,
                 ...(currentFolder ? [currentFolder] : []),
                 ...(currentVault ? [currentVault] : []),
@@ -315,37 +551,49 @@ export function FilesContent() {
         return () => {
             cancelled = true
         }
-    }, [files, breadcrumbs, currentFolder, currentVault, activeVaultId, getVaultKey])
+    }, [files, columns, breadcrumbs, currentFolder, currentVault, activeVaultId, getVaultKey])
 
-    const filteredFiles = files
-        .filter((file) => getDisplayName(file).toLowerCase().includes(searchQuery.toLowerCase()))
-        .filter((file) => {
-            if (!filterType) return true
-            if (filterType === "starred") return file.starred === 1
-            return file.type === filterType
-        })
-        .sort((a, b) => {
-            // Folders always come first
-            if (a.type === "folder" && b.type !== "folder") return -1
-            if (a.type !== "folder" && b.type === "folder") return 1
+    function fileMatchesActiveFilters(file: FileItem) {
+        if (!getDisplayName(file).toLowerCase().includes(searchQuery.toLowerCase())) return false
+        if (!filterType) return true
+        if (filterType === "starred") return file.starred === 1
+        if (filterType === "other") return !KNOWN_FILE_FILTER_TYPES.includes(file.type as typeof KNOWN_FILE_FILTER_TYPES[number])
+        return file.type === filterType
+    }
 
-            let cmp = 0
-            switch (sortKey) {
-                case "name":
-                    cmp = getDisplayName(a).localeCompare(getDisplayName(b))
-                    break
-                case "modified":
-                    cmp = new Date(a.modified_at).getTime() - new Date(b.modified_at).getTime()
-                    break
-                case "size":
-                    cmp = a.size - b.size
-                    break
-                case "type":
-                    cmp = a.type.localeCompare(b.type)
-                    break
-            }
-            return sortDirection === "asc" ? cmp : -cmp
-        })
+    function compareFilesForDisplay(a: FileItem, b: FileItem) {
+        // Folders always come first.
+        if (a.type === "folder" && b.type !== "folder") return -1
+        if (a.type !== "folder" && b.type === "folder") return 1
+
+        let cmp = 0
+        switch (sortKey) {
+            case "name":
+                cmp = getDisplayName(a).localeCompare(getDisplayName(b))
+                break
+            case "modified":
+                cmp = new Date(a.modified_at).getTime() - new Date(b.modified_at).getTime()
+                break
+            case "size":
+                cmp = a.size - b.size
+                break
+            case "type":
+                cmp = a.type.localeCompare(b.type)
+                break
+        }
+        return sortDirection === "asc" ? cmp : -cmp
+    }
+
+    function getSortedVisibleFiles(items: FileItem[]) {
+        return [...items].filter(fileMatchesActiveFilters).sort(compareFilesForDisplay)
+    }
+
+    const filteredFiles = getSortedVisibleFiles(files)
+
+    const filteredShareUsers = shareUsers.filter((user) => {
+        const needle = shareUserQuery.toLowerCase()
+        return user.username.toLowerCase().includes(needle) || (user.email || "").toLowerCase().includes(needle)
+    })
 
     function handleSort(key: typeof sortKey) {
         if (sortKey === key) {
@@ -361,9 +609,119 @@ export function FilesContent() {
         return Boolean(file.is_secure_vault) || Number.isInteger(file.vault_root_id)
     }
 
+    function isShareShortcut(file: FileItem | null | undefined) {
+        return Boolean(file?.is_share_shortcut && file.share_id)
+    }
+
+    function getShareShortcutPreviewUrl(file: FileItem) {
+        return file.share_id ? getIncomingSharePreviewUrl(file.share_id) : ""
+    }
+
+    function canDragFile(file: FileItem) {
+        return !isShareShortcut(file) && !isSecureItem(file) && isFileAccessible(file)
+    }
+
+    function isInternalFileDrag(event: React.DragEvent | DragEvent) {
+        return Array.from(event.dataTransfer?.types || []).includes(FILE_DRAG_TYPE)
+    }
+
+    function getDragIdsForFile(file: FileItem) {
+        if (!canDragFile(file)) return []
+        if (selectedFiles.includes(file.id)) {
+            return getSelectedRegularItems()
+                .filter((selected) => canDragFile(selected))
+                .map((selected) => selected.id)
+        }
+        return [file.id]
+    }
+
+    function canDropOnFolder(folder: FileItem) {
+        return folder.type === "folder" &&
+            canDragFile(folder) &&
+            !internalDragIds.includes(folder.id)
+    }
+
+    function getVersionNumber(file: FileItem | null | undefined) {
+        return Math.max(1, Number(file?.version_number) || 1)
+    }
+
+    function canShowVersions(file: FileItem | null | undefined) {
+        return Boolean(file && file.type !== "folder" && !isSecureItem(file) && !isShareShortcut(file))
+    }
+
+    function getPreviewUrlForFile(file: FileItem) {
+        return isShareShortcut(file) ? getShareShortcutPreviewUrl(file) : getPreviewUrl(file.id)
+    }
+
+    function isPdfPreviewFile(file: FileItem | null | undefined) {
+        if (!file) return false
+        const name = getDisplayName(file).toLowerCase()
+        return Boolean(file.mime_type?.toLowerCase().includes("pdf") || name.endsWith(".pdf"))
+    }
+
+    function isTextPreviewFile(file: FileItem | null | undefined) {
+        if (!file || file.type !== "document" || isPdfPreviewFile(file)) return false
+        const mime = (file.mime_type || "").toLowerCase()
+        const ext = getFileExtension(getDisplayName(file))
+        return mime.startsWith("text/") ||
+            mime.includes("json") ||
+            mime.includes("javascript") ||
+            mime.includes("xml") ||
+            mime.includes("csv") ||
+            TEXT_PREVIEW_EXTENSIONS.has(ext)
+    }
+
+    function isCodePreviewFile(file: FileItem | null | undefined) {
+        if (!file) return false
+        const ext = getFileExtension(getDisplayName(file))
+        const mime = (file.mime_type || "").toLowerCase()
+        return CODE_PREVIEW_EXTENSIONS.has(ext) ||
+            mime.includes("javascript") ||
+            mime.includes("json") ||
+            mime.includes("xml")
+    }
+
+    function getPreviewLanguageLabel(file: FileItem) {
+        const ext = getFileExtension(getDisplayName(file))
+        if (ext === "md" || ext === "markdown") return "Markdown"
+        if (ext === "env") return "Environment"
+        if (ext === "txt" || ext === "text") return "Plain text"
+        if (ext === "log") return "Log"
+        if (ext) return ext.toUpperCase()
+        return file.mime_type || "Text"
+    }
+
+    function isUnsupportedPreviewFile(file: FileItem | null | undefined) {
+        if (!file) return false
+        return file.type !== "image" &&
+            file.type !== "video" &&
+            file.type !== "audio" &&
+            !isPdfPreviewFile(file) &&
+            !isTextPreviewFile(file)
+    }
+
+    function closeVersionHistory() {
+        setVersionFile(null)
+        setVersionHistory(null)
+        setVersionError(null)
+        setVersionAction(null)
+        setVersionActionBusy(false)
+        setVersionLoading(false)
+    }
+
+    function closeShortcutBrowser() {
+        setBrowsingShortcut(null)
+        setShortcutFiles([])
+        setShortcutBreadcrumbs([])
+        setShortcutRootFolderId(null)
+        setShortcutLoading(false)
+    }
+
     function clearOverlays() {
         closePreview()
         setDetailFile(null)
+        closeVersionHistory()
+        closeShortcutBrowser()
     }
 
     function getStorageDisconnectTitle(source: { source_id: string; label: string }) {
@@ -396,25 +754,129 @@ export function FilesContent() {
         return `CloudPi's encrypted internal storage is unavailable, and ${externalSources.length} external drive${externalSources.length === 1 ? "" : "s"} ${externalSources.map(d => `"${d.label}"`).join(", ")} ${externalSources.length === 1 ? "is" : "are"} also offline.`
     }
 
+    function updateFilterType(nextType: string | null) {
+        const nextParams = new URLSearchParams(searchParams)
+        if (nextType) {
+            nextParams.set("type", nextType)
+        } else {
+            nextParams.delete("type")
+        }
+        setFilterTypeState(nextType)
+        setSearchParams(nextParams, { replace: false })
+    }
+
     // Navigation
     function navigateToFolder(folderId: number | null) {
         clearOverlays()
+        const nextParams = new URLSearchParams(searchParams)
+        if (folderId) {
+            nextParams.set("folder", String(folderId))
+        } else {
+            nextParams.delete("folder")
+        }
+        nextParams.delete("highlight")
+        setSearchParams(nextParams, { replace: false })
+        setHighlightedFileId(null)
         setCurrentFolderId(folderId)
         setSelectedFiles([])
+        setLastSelectedFileId(null)
         setIsSelecting(false)
     }
 
+    async function openShortcutFolder(file: FileItem) {
+        if (!file.share_id) return
+        setBrowsingShortcut(file)
+        setShortcutLoading(true)
+        setError(null)
+        try {
+            const data = await getSharedFolderFiles(file.share_id)
+            setShortcutFiles(data.files)
+            setShortcutBreadcrumbs(data.breadcrumbs)
+            setShortcutRootFolderId(data.rootFolderId)
+        } catch (err) {
+            setError(err instanceof Error ? err.message : "Failed to open shared folder")
+        } finally {
+            setShortcutLoading(false)
+        }
+    }
+
+    async function navigateShortcutFolder(folderId?: number) {
+        if (!browsingShortcut?.share_id) return
+        setShortcutLoading(true)
+        setError(null)
+        try {
+            const data = await getSharedFolderFiles(browsingShortcut.share_id, folderId)
+            setShortcutFiles(data.files)
+            setShortcutBreadcrumbs(data.breadcrumbs)
+            setShortcutRootFolderId(data.rootFolderId)
+        } catch (err) {
+            setError(err instanceof Error ? err.message : "Failed to load shared folder")
+        } finally {
+            setShortcutLoading(false)
+        }
+    }
+
     function handleFileClick(file: FileItem) {
+        if (isShareShortcut(file)) {
+            if (file.type === "folder") {
+                openShortcutFolder(file)
+            } else {
+                openPreview(file)
+            }
+            return
+        }
         if (file.type === "folder") {
             navigateToFolder(file.id)
         }
     }
 
+    function getColumnTitle(column: FilesColumn) {
+        if (column.folderId === null) return "My Files"
+        const crumb = breadcrumbs.find((item) => item.id === column.folderId)
+        if (crumb) return getDisplayName(crumb)
+        return column.title
+    }
+
+    function handleColumnItemClick(file: FileItem, column: FilesColumn, event: React.MouseEvent) {
+        const isActiveColumn = column.folderId === currentFolderId
+        if (isSelecting) {
+            event.stopPropagation()
+            if (isActiveColumn && !isShareShortcut(file)) {
+                toggleFileSelection(file.id, event)
+            }
+            return
+        }
+        if (!isFileAccessible(file)) return
+        if (file.type === "folder") {
+            handleFileClick(file)
+            return
+        }
+        if (!isSecureItem(file)) {
+            openPreview(file)
+        }
+    }
+
     // Selection
-    function toggleFileSelection(id: number) {
+    function toggleFileSelection(id: number, event?: Pick<React.MouseEvent, "shiftKey" | "ctrlKey" | "metaKey">) {
+        if (id < 0) return
+        const selectableIds = filteredFiles.filter((file) => !isShareShortcut(file)).map((file) => file.id)
+
+        if (event?.shiftKey && lastSelectedFileId !== null) {
+            const start = selectableIds.indexOf(lastSelectedFileId)
+            const end = selectableIds.indexOf(id)
+            if (start !== -1 && end !== -1) {
+                const [from, to] = start < end ? [start, end] : [end, start]
+                const range = selectableIds.slice(from, to + 1)
+                setSelectedFiles((prev) => Array.from(new Set([...prev, ...range])))
+                setLastSelectedFileId(id)
+                return
+            }
+        }
+
         setSelectedFiles((prev) =>
             prev.includes(id) ? prev.filter((f) => f !== id) : [...prev, id]
         )
+        setLastSelectedFileId(id)
     }
 
     // Create folder
@@ -549,7 +1011,53 @@ export function FilesContent() {
         }
     }
 
-    async function uploadFilesToVault(filesToUpload: File[], folderId: number | null, onProgress: (uploadedBytes: number, totalBytes: number) => void) {
+    async function uploadRegularFilesChunked(filesToUpload: File[], folderId: number | null, onProgress: (uploadedBytes: number, totalBytes: number) => void, signal?: AbortSignal) {
+        const totalBytes = filesToUpload.reduce((sum, file) => sum + file.size, 0)
+        let completedBytes = 0
+        const throwIfAborted = () => {
+            if (signal?.aborted) {
+                throw new DOMException("Upload cancelled", "AbortError")
+            }
+        }
+
+        for (const file of filesToUpload) {
+            throwIfAborted()
+            const uploadFile = file as CloudPiUploadFile
+            const relativePath = uploadFile.cloudpiRelativePath || uploadFile.webkitRelativePath || file.name
+            const chunkCount = file.size === 0 ? 0 : Math.ceil(file.size / CHUNK_SIZE_BYTES)
+            const init = await initFileUpload({
+                parent_id: folderId,
+                name: file.name,
+                size: file.size,
+                mime_type: file.type || "application/octet-stream",
+                relative_path: relativePath,
+                chunk_count: chunkCount,
+            })
+
+            let fileUploadedBytes = 0
+            try {
+                for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
+                    throwIfAborted()
+                    const start = chunkIndex * CHUNK_SIZE_BYTES
+                    const end = Math.min(file.size, start + CHUNK_SIZE_BYTES)
+                    const chunkBuffer = await file.slice(start, end).arrayBuffer()
+                    throwIfAborted()
+                    await uploadFileChunk(init.upload.id, chunkIndex, new Uint8Array(chunkBuffer), signal)
+                    fileUploadedBytes += end - start
+                    onProgress(completedBytes + fileUploadedBytes, totalBytes)
+                }
+
+                await completeFileUpload(init.upload.id)
+                completedBytes += file.size
+                onProgress(completedBytes, totalBytes)
+            } catch (error) {
+                await abortFileUpload(init.upload.id).catch(() => undefined)
+                throw error
+            }
+        }
+    }
+
+    async function uploadFilesToVault(filesToUpload: File[], folderId: number | null, onProgress: (uploadedBytes: number, totalBytes: number) => void, signal?: AbortSignal) {
         if (!activeVaultId || !folderId) {
             throw new Error("Vault destination is unavailable")
         }
@@ -561,8 +1069,14 @@ export function FilesContent() {
 
         const totalBytes = filesToUpload.reduce((sum, file) => sum + file.size, 0)
         let uploadedBytes = 0
+        const throwIfAborted = () => {
+            if (signal?.aborted) {
+                throw new DOMException("Upload cancelled", "AbortError")
+            }
+        }
 
         for (const file of filesToUpload) {
+            throwIfAborted()
             const storageId = createStorageId()
             const encryptedMetadata = await encryptMetadata(dek, file.name)
             const baseIv = createFileIv()
@@ -579,11 +1093,13 @@ export function FilesContent() {
 
             try {
                 for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
+                    throwIfAborted()
                     const start = chunkIndex * CHUNK_SIZE_BYTES
                     const end = Math.min(file.size, start + CHUNK_SIZE_BYTES)
                     const chunkBuffer = await file.slice(start, end).arrayBuffer()
+                    throwIfAborted()
                     const encryptedChunk = await encryptChunk(dek, chunkBuffer, baseIv, chunkIndex)
-                    await uploadVaultChunk(init.upload.id, chunkIndex, encryptedChunk)
+                    await uploadVaultChunk(init.upload.id, chunkIndex, encryptedChunk, signal)
                     uploadedBytes += end - start
                     onProgress(uploadedBytes, totalBytes)
                     touchVault(activeVaultId)
@@ -652,17 +1168,172 @@ export function FilesContent() {
     }
 
     // Upload
-    async function handleUpload(e: React.ChangeEvent<HTMLInputElement>) {
-        const fileList = e.target.files
-        if (!fileList || fileList.length === 0) return
+    function withRelativePath(file: File, relativePath: string): File {
+        const uploadFile = file as CloudPiUploadFile
+        uploadFile.cloudpiRelativePath = relativePath.replace(/\\/g, "/")
+        return uploadFile
+    }
 
-        const filesArray = Array.from(fileList)
+    function readDirectoryEntries(reader: any): Promise<any[]> {
+        return new Promise((resolve, reject) => {
+            const entries: any[] = []
+
+            function readBatch() {
+                reader.readEntries(
+                    (batch: any[]) => {
+                        if (batch.length === 0) {
+                            resolve(entries)
+                            return
+                        }
+                        entries.push(...batch)
+                        readBatch()
+                    },
+                    reject,
+                )
+            }
+
+            readBatch()
+        })
+    }
+
+    function readEntryFile(entry: any): Promise<File> {
+        return new Promise((resolve, reject) => entry.file(resolve, reject))
+    }
+
+    async function collectEntryFiles(entry: any, parentPath: string, output: File[]) {
+        if (entry.isFile) {
+            const file = await readEntryFile(entry)
+            output.push(withRelativePath(file, `${parentPath}${file.name}`))
+            return
+        }
+
+        if (entry.isDirectory) {
+            const directoryPath = `${parentPath}${entry.name}/`
+            const reader = entry.createReader()
+            const entries = await readDirectoryEntries(reader)
+            for (const child of entries) {
+                await collectEntryFiles(child, directoryPath, output)
+            }
+        }
+    }
+
+    async function filesFromDataTransfer(dataTransfer: DataTransfer): Promise<File[]> {
+        const items = Array.from(dataTransfer.items || [])
+        const entries = items
+            .map((item) => {
+                const maybeEntry = item as DataTransferItem & { webkitGetAsEntry?: () => any }
+                return maybeEntry.webkitGetAsEntry?.()
+            })
+            .filter(Boolean)
+
+        if (entries.length === 0) {
+            return Array.from(dataTransfer.files || [])
+        }
+
+        const files: File[] = []
+        for (const entry of entries) {
+            await collectEntryFiles(entry, "", files)
+        }
+        return files
+    }
+
+    function enqueueUpload(filesArray: File[]) {
+        if (filesArray.length === 0) return
         addUpload(
             filesArray,
             currentFolderId,
             () => loadFiles(),
-            isInsideVault ? uploadFilesToVault : undefined,
+            isInsideVault ? uploadFilesToVault : uploadRegularFilesChunked,
         )
+    }
+
+    function openUploadPicker() {
+        if (isInsideVault && !isActiveVaultUnlocked) {
+            setError("Unlock this vault before uploading files")
+            setShowUnlockVaultDialog(true)
+            return
+        }
+
+        fileInputRef.current?.click()
+    }
+
+    function handleFileDragStart(event: React.DragEvent, file: FileItem) {
+        const dragIds = getDragIdsForFile(file)
+        if (dragIds.length === 0) {
+            event.preventDefault()
+            return
+        }
+
+        event.dataTransfer.effectAllowed = "move"
+        event.dataTransfer.setData(FILE_DRAG_TYPE, JSON.stringify(dragIds))
+        event.dataTransfer.setData("text/plain", `${dragIds.length} CloudPi item${dragIds.length === 1 ? "" : "s"}`)
+        setInternalDragIds(dragIds)
+        setIsDragging(false)
+        dragCounter.current = 0
+    }
+
+    function handleFileDragEnd() {
+        setInternalDragIds([])
+        setDropTargetFolderId(null)
+    }
+
+    function parseDraggedFileIds(event: React.DragEvent) {
+        try {
+            const raw = event.dataTransfer.getData(FILE_DRAG_TYPE)
+            const parsed = JSON.parse(raw)
+            if (!Array.isArray(parsed)) return []
+            return parsed.map(Number).filter((id) => Number.isInteger(id) && id > 0)
+        } catch {
+            return []
+        }
+    }
+
+    function handleFolderDragOver(event: React.DragEvent, folder: FileItem) {
+        if (!isInternalFileDrag(event) || !canDropOnFolder(folder)) return
+        event.preventDefault()
+        event.stopPropagation()
+        event.dataTransfer.dropEffect = "move"
+        setDropTargetFolderId(folder.id)
+    }
+
+    function handleFolderDragLeave(event: React.DragEvent, folder: FileItem) {
+        if (!isInternalFileDrag(event)) return
+        const nextTarget = event.relatedTarget as Node | null
+        if (nextTarget && event.currentTarget.contains(nextTarget)) return
+        if (dropTargetFolderId === folder.id) {
+            setDropTargetFolderId(null)
+        }
+    }
+
+    async function handleFolderDrop(event: React.DragEvent, folder: FileItem) {
+        if (!isInternalFileDrag(event) || !canDropOnFolder(folder)) return
+        event.preventDefault()
+        event.stopPropagation()
+
+        const ids = parseDraggedFileIds(event).filter((id) => id !== folder.id)
+        setDropTargetFolderId(null)
+        setInternalDragIds([])
+        if (ids.length === 0) return
+
+        try {
+            for (const id of ids) {
+                await moveFile(id, folder.id)
+            }
+            setSelectedFiles([])
+            setLastSelectedFileId(null)
+            setIsSelecting(false)
+            await loadFiles()
+        } catch (err) {
+            setError(err instanceof Error ? err.message : "Move failed")
+            await loadFiles()
+        }
+    }
+
+    async function handleUpload(e: React.ChangeEvent<HTMLInputElement>) {
+        const fileList = e.target.files
+        if (!fileList || fileList.length === 0) return
+
+        enqueueUpload(Array.from(fileList))
 
         // Reset input
         if (fileInputRef.current) {
@@ -670,10 +1341,26 @@ export function FilesContent() {
         }
     }
 
+    async function handleFolderUpload(e: React.ChangeEvent<HTMLInputElement>) {
+        const fileList = e.target.files
+        if (!fileList || fileList.length === 0) return
+
+        if (isInsideVault) {
+            setError("Folder upload into encrypted vaults is not supported yet")
+        } else {
+            enqueueUpload(Array.from(fileList))
+        }
+
+        if (folderInputRef.current) {
+            folderInputRef.current.value = ""
+        }
+    }
+
     // Drag and drop handlers
     function handleDragEnter(e: React.DragEvent) {
         e.preventDefault()
         e.stopPropagation()
+        if (isInternalFileDrag(e)) return
         if (isInsideVault && !isActiveVaultUnlocked) return
         dragCounter.current++
         if (e.dataTransfer.items && e.dataTransfer.items.length > 0) {
@@ -684,6 +1371,7 @@ export function FilesContent() {
     function handleDragLeave(e: React.DragEvent) {
         e.preventDefault()
         e.stopPropagation()
+        if (isInternalFileDrag(e)) return
         dragCounter.current--
         if (dragCounter.current === 0) {
             setIsDragging(false)
@@ -693,6 +1381,9 @@ export function FilesContent() {
     function handleDragOver(e: React.DragEvent) {
         e.preventDefault()
         e.stopPropagation()
+        if (isInternalFileDrag(e)) {
+            e.dataTransfer.dropEffect = "none"
+        }
     }
 
     async function handleDrop(e: React.DragEvent) {
@@ -701,26 +1392,35 @@ export function FilesContent() {
         setIsDragging(false)
         dragCounter.current = 0
 
+        if (isInternalFileDrag(e)) {
+            setInternalDragIds([])
+            setDropTargetFolderId(null)
+            return
+        }
+
         if (isInsideVault && !isActiveVaultUnlocked) {
             setError("Unlock this vault before uploading files")
             return
         }
 
-        const droppedFiles = e.dataTransfer.files
-        if (!droppedFiles || droppedFiles.length === 0) return
-
-        const filesArray = Array.from(droppedFiles)
-        addUpload(
-            filesArray,
-            currentFolderId,
-            () => loadFiles(),
-            isInsideVault ? uploadFilesToVault : undefined,
-        )
+        const filesArray = await filesFromDataTransfer(e.dataTransfer)
+        if (filesArray.some((file) => (file as CloudPiUploadFile).cloudpiRelativePath) && isInsideVault) {
+            setError("Folder upload into encrypted vaults is not supported yet")
+            return
+        }
+        enqueueUpload(filesArray)
     }
 
     // Download (supports both files and folders — folders download as ZIP)
     async function handleDownload(file: FileItem) {
         try {
+            if (isShareShortcut(file)) {
+                if (!file.share_id) throw new Error("Shared shortcut is missing its share reference")
+                if (file.share_allow_download === 0) throw new Error("Downloads are disabled for this share")
+                const fileName = file.type === 'folder' ? `${getDisplayName(file)}.zip` : getDisplayName(file)
+                await downloadIncomingShare(file.share_id, fileName)
+                return
+            }
             if (isSecureItem(file)) {
                 if (file.type === "folder") {
                     throw new Error("Vault folders cannot be downloaded as server-side ZIP archives yet")
@@ -736,16 +1436,70 @@ export function FilesContent() {
         }
     }
 
+    async function handleDuplicate(file: FileItem) {
+        if (isShareShortcut(file)) {
+            setError("Shared shortcuts cannot be duplicated")
+            return
+        }
+        if (isSecureItem(file)) {
+            setError("Encrypted vault items cannot be duplicated yet")
+            return
+        }
+        try {
+            await copyFile(file.id, file.parent_id ?? null)
+            await loadFiles()
+        } catch (err) {
+            setError(err instanceof Error ? err.message : "Duplicate failed")
+        }
+    }
+
     // Share
     async function handleShare(file: FileItem) {
+        if (isShareShortcut(file)) {
+            setError("Shared shortcuts are managed from the Shares page")
+            return
+        }
         if (isSecureItem(file)) {
             setError("Encrypted vault items cannot be shared yet")
             return
         }
         setShareFile(file)
+        setShareFiles([file])
         setShowShareDialog(true)
         setShareLoading(true)
         setSelectedShareUsers([])
+        setShareUserQuery("")
+        setSharePermission("view")
+        setShareExpiry("")
+        setAllowShareDownload(true)
+        setShareStatus(null)
+        try {
+            const data = await getShareUsers()
+            setShareUsers(data.users)
+        } catch (err) {
+            setError(err instanceof Error ? err.message : "Failed to load users")
+        } finally {
+            setShareLoading(false)
+        }
+    }
+
+    async function handleBulkShare() {
+        const targets = getSelectedRegularItems()
+        if (targets.length === 0) return
+        if (targets.some((file) => isSecureItem(file))) {
+            setError("Encrypted vault items cannot be shared yet")
+            return
+        }
+
+        setShareFile(targets[0])
+        setShareFiles(targets)
+        setShowShareDialog(true)
+        setShareLoading(true)
+        setSelectedShareUsers([])
+        setShareUserQuery("")
+        setSharePermission("view")
+        setShareExpiry("")
+        setAllowShareDownload(true)
         setShareStatus(null)
         try {
             const data = await getShareUsers()
@@ -767,46 +1521,66 @@ export function FilesContent() {
     }
 
     async function handleShareWithSelected() {
-        if (!shareFile || selectedShareUsers.length === 0) return
+        const targets = shareFiles.length > 0 ? shareFiles : (shareFile ? [shareFile] : [])
+        if (targets.length === 0 || selectedShareUsers.length === 0) return
         setIsSharing(true)
         setShareStatus(null)
 
         const results: string[] = []
-        const alreadyShared: string[] = []
+        const updated: string[] = []
         let hadError = false
 
-        for (const userId of selectedShareUsers) {
-            try {
-                const result = await createShareLink(shareFile.id, userId)
-                if (result.message.includes('Already')) {
+        const shareOptions = {
+            expiresAt: shareExpiry || null,
+            allowDownload: allowShareDownload,
+        }
+
+        for (const file of targets) {
+            for (const userId of selectedShareUsers) {
+                try {
+                    const result = await createShareLink(file.id, userId, sharePermission, shareOptions)
                     const user = shareUsers.find(u => u.id === userId)
-                    alreadyShared.push(user?.username || 'user')
-                } else {
-                    const user = shareUsers.find(u => u.id === userId)
-                    results.push(user?.username || 'user')
+                    const label = targets.length > 1
+                        ? `${getDisplayName(file)} -> ${user?.username || 'user'}`
+                        : (user?.username || 'user')
+                    if (result.message.includes('updated')) {
+                        updated.push(label)
+                    } else {
+                        results.push(label)
+                    }
+                } catch {
+                    hadError = true
                 }
-            } catch {
-                hadError = true
             }
         }
 
         setIsSharing(false)
         setSelectedShareUsers([])
+        setSelectedFiles([])
+        setLastSelectedFileId(null)
+        setIsSelecting(false)
+        await loadFiles()
 
-        if (results.length > 0 && alreadyShared.length > 0) {
+        if (results.length > 0 && updated.length > 0) {
             setShareStatus({
                 type: 'warning',
-                message: `Shared with ${results.join(', ')}. Already shared with ${alreadyShared.join(', ')}.`
+                message: targets.length > 1
+                    ? `Shared ${results.length} access rule(s). Updated ${updated.length}.`
+                    : `Shared with ${results.join(', ')}. Updated ${updated.join(', ')}.`
             })
         } else if (results.length > 0) {
             setShareStatus({
                 type: 'success',
-                message: `Successfully shared with ${results.join(', ')}!`
+                message: targets.length > 1
+                    ? `Successfully shared ${targets.length} item(s).`
+                    : `Successfully shared with ${results.join(', ')}!`
             })
-        } else if (alreadyShared.length > 0) {
+        } else if (updated.length > 0) {
             setShareStatus({
                 type: 'warning',
-                message: `Already shared with ${alreadyShared.join(', ')}.`
+                message: targets.length > 1
+                    ? `Updated ${updated.length} access rule(s).`
+                    : `Updated share settings for ${updated.join(', ')}.`
             })
         } else if (hadError) {
             setShareStatus({
@@ -816,8 +1590,66 @@ export function FilesContent() {
         }
     }
 
+    async function loadVersionHistory(fileId: number) {
+        setVersionLoading(true)
+        setVersionError(null)
+        try {
+            const history = await getFileVersions(fileId)
+            setVersionHistory(history)
+        } catch (err) {
+            setVersionError(err instanceof Error ? err.message : "Failed to load version history")
+        } finally {
+            setVersionLoading(false)
+        }
+    }
+
+    function openVersionHistory(file: FileItem) {
+        if (!canShowVersions(file)) {
+            setError("Version history is only available for regular files")
+            return
+        }
+
+        setDetailFile(null)
+        setVersionFile(file)
+        setVersionHistory(null)
+        setVersionAction(null)
+        loadVersionHistory(file.id)
+    }
+
+    async function handleVersionAction() {
+        if (!versionFile || !versionAction) return
+
+        setVersionActionBusy(true)
+        setVersionError(null)
+
+        try {
+            if (versionAction.type === "restore") {
+                const result = await restoreArchivedFileVersion(versionFile.id, versionAction.version.id)
+                const updatedFile = { ...versionFile, ...result.file }
+                setVersionFile(updatedFile)
+                setFiles(prev => prev.map(file => file.id === updatedFile.id ? { ...file, ...updatedFile } : file))
+                if (detailFile?.id === updatedFile.id) setDetailFile(updatedFile)
+                await loadVersionHistory(updatedFile.id)
+            } else {
+                await deleteArchivedFileVersion(versionFile.id, versionAction.version.id)
+                await loadVersionHistory(versionFile.id)
+            }
+
+            setVersionAction(null)
+            await loadFiles()
+        } catch (err) {
+            setVersionError(err instanceof Error ? err.message : "Version action failed")
+        } finally {
+            setVersionActionBusy(false)
+        }
+    }
+
     // Rename
     function openRenameDialog(file: FileItem) {
+        if (isShareShortcut(file)) {
+            setError("Shared shortcuts cannot be renamed here")
+            return
+        }
         setSelectedItem(file)
         setRenameValue(getDisplayName(file))
         setShowRenameDialog(true)
@@ -861,11 +1693,33 @@ export function FilesContent() {
     }
 
     async function openLocationDialog(file: FileItem, mode: "move" | "copy") {
+        if (isShareShortcut(file)) {
+            setError("Shared shortcuts stay in My Files until you remove the shortcut")
+            return
+        }
         if (isSecureItem(file)) {
             setError(`${mode === "move" ? "Moving" : "Copying"} encrypted vault items is not supported yet`)
             return
         }
         setLocationTarget(file)
+        setLocationTargets([file])
+        setLocationMode(mode)
+        setShowLocationDialog(true)
+        const initialParent = currentFolderId
+        setDestinationFolderId(initialParent)
+        await loadDestinationView(initialParent)
+    }
+
+    async function openBulkLocationDialog(mode: "move" | "copy") {
+        const targets = getSelectedRegularItems()
+        if (targets.length === 0) return
+        if (targets.some((file) => isSecureItem(file))) {
+            setError(`${mode === "move" ? "Moving" : "Copying"} encrypted vault items is not supported yet`)
+            return
+        }
+
+        setLocationTarget(null)
+        setLocationTargets(targets)
         setLocationMode(mode)
         setShowLocationDialog(true)
         const initialParent = currentFolderId
@@ -879,17 +1733,24 @@ export function FilesContent() {
     }
 
     async function applyLocationAction() {
-        if (!locationTarget || isApplyingLocation) return
+        const targets = locationTargets.length > 0 ? locationTargets : (locationTarget ? [locationTarget] : [])
+        if (targets.length === 0 || isApplyingLocation) return
 
         setIsApplyingLocation(true)
         try {
-            if (locationMode === "move") {
-                await moveFile(locationTarget.id, destinationFolderId)
-            } else {
-                await copyFile(locationTarget.id, destinationFolderId)
+            for (const target of targets) {
+                if (locationMode === "move") {
+                    await moveFile(target.id, destinationFolderId)
+                } else {
+                    await copyFile(target.id, destinationFolderId)
+                }
             }
             setShowLocationDialog(false)
             setLocationTarget(null)
+            setLocationTargets([])
+            setSelectedFiles([])
+            setLastSelectedFileId(null)
+            setIsSelecting(false)
             await loadFiles()
         } catch (err) {
             setError(err instanceof Error ? err.message : `${locationMode === "move" ? "Move" : "Copy"} failed`)
@@ -900,6 +1761,10 @@ export function FilesContent() {
 
     // Star
     async function handleToggleStar(file: FileItem) {
+        if (isShareShortcut(file)) {
+            setError("Shared shortcuts cannot be starred")
+            return
+        }
         try {
             await toggleStar(file.id)
             loadFiles()
@@ -910,6 +1775,10 @@ export function FilesContent() {
 
     // Delete
     function openDeleteDialog(file: FileItem) {
+        if (isShareShortcut(file)) {
+            handleRemoveShortcut(file)
+            return
+        }
         setSelectedItem(file)
         setShowDeleteDialog(true)
     }
@@ -925,6 +1794,18 @@ export function FilesContent() {
         }
     }
 
+    async function handleRemoveShortcut(file: FileItem) {
+        if (!file.share_id) return
+        try {
+            await removeShareShortcut(file.share_id)
+            if (detailFile?.id === file.id) setDetailFile(null)
+            if (browsingShortcut?.id === file.id) closeShortcutBrowser()
+            await loadFiles()
+        } catch (err) {
+            setError(err instanceof Error ? err.message : "Failed to remove shortcut")
+        }
+    }
+
     // Bulk delete
     async function handleBulkDelete() {
         try {
@@ -932,15 +1813,217 @@ export function FilesContent() {
                 await deleteFile(id)
             }
             setSelectedFiles([])
+            setLastSelectedFileId(null)
             loadFiles()
         } catch (err) {
             setError(err instanceof Error ? err.message : "Delete failed")
         }
     }
 
+    async function handleBulkStar() {
+        try {
+            const selected = files.filter((file) => selectedFiles.includes(file.id) && !isShareShortcut(file))
+            for (const file of selected) {
+                if (file.starred !== 1) {
+                    await toggleStar(file.id)
+                }
+            }
+            await loadFiles()
+        } catch (err) {
+            setError(err instanceof Error ? err.message : "Failed to update starred items")
+        }
+    }
+
+    async function handleBulkDownload() {
+        const selected = getSelectedRegularItems()
+        if (selected.length === 0) return
+        if (selected.some((file) => isSecureItem(file))) {
+            setError("Encrypted vault items cannot be included in server-side ZIP downloads yet")
+            return
+        }
+
+        try {
+            const currentName = currentFolder ? getDisplayName(currentFolder) : "cloudpi-selection"
+            const fileName = selected.length === 1
+                ? `${getDisplayName(selected[0])}.zip`
+                : `${currentName || "cloudpi-selection"}.zip`
+            await downloadFilesZip(selected.map((file) => file.id), fileName)
+        } catch (err) {
+            setError(err instanceof Error ? err.message : "Bulk download failed")
+        }
+    }
+
+    function getSelectedRegularItems() {
+        return filteredFiles.filter((file) => selectedFiles.includes(file.id) && !isShareShortcut(file))
+    }
+
+    function openSelectedItem() {
+        if (selectedFiles.length !== 1) return
+        const selected = filteredFiles.find((file) => file.id === selectedFiles[0])
+        if (!selected || !isFileAccessible(selected)) return
+        if (selected.type === "folder") {
+            handleFileClick(selected)
+        } else {
+            openPreview(selected)
+        }
+    }
+
+    function renameSelectedItem() {
+        if (selectedFiles.length !== 1) return
+        const selected = filteredFiles.find((file) => file.id === selectedFiles[0])
+        if (selected && !isShareShortcut(selected)) {
+            openRenameDialog(selected)
+        }
+    }
+
+    function goUpFolder() {
+        const parent = breadcrumbs.length > 1 ? breadcrumbs[breadcrumbs.length - 2] : null
+        navigateToFolder(parent?.id ?? null)
+    }
+
+    function selectAllVisible() {
+        const ids = filteredFiles.filter((file) => !isShareShortcut(file)).map((file) => file.id)
+        setIsSelecting(true)
+        setSelectedFiles(ids)
+        setLastSelectedFileId(ids.length > 0 ? ids[ids.length - 1] : null)
+    }
+
+    function getPreviewSibling(direction: -1 | 1) {
+        if (!previewFile) return null
+        const previewable = filteredFiles.filter((file) =>
+            file.type !== "folder" &&
+            isFileAccessible(file) &&
+            (isShareShortcut(file) || !isSecureItem(file))
+        )
+        const index = previewable.findIndex((file) => file.id === previewFile.id)
+        if (index === -1) return null
+        return previewable[index + direction] || null
+    }
+
+    function navigatePreviewSibling(direction: -1 | 1) {
+        const next = getPreviewSibling(direction)
+        if (next) openPreview(next)
+    }
+
+    function resetImagePreviewState() {
+        setImageZoom(1)
+        setImageRotation(0)
+        setImagePan({ x: 0, y: 0 })
+        setIsImagePanning(false)
+    }
+
+    function updateImageZoom(nextZoom: number) {
+        setImageZoom(Math.min(4, Math.max(0.5, Number(nextZoom.toFixed(2)))))
+    }
+
+    function zoomImage(delta: number) {
+        updateImageZoom(imageZoom + delta)
+    }
+
+    function handleImagePointerDown(event: React.PointerEvent<HTMLDivElement>) {
+        if (imageZoom <= 1) return
+        event.preventDefault()
+        event.currentTarget.setPointerCapture(event.pointerId)
+        imagePanStartRef.current = {
+            pointerX: event.clientX,
+            pointerY: event.clientY,
+            panX: imagePan.x,
+            panY: imagePan.y,
+        }
+        setIsImagePanning(true)
+    }
+
+    function handleImagePointerMove(event: React.PointerEvent<HTMLDivElement>) {
+        if (!isImagePanning) return
+        const start = imagePanStartRef.current
+        setImagePan({
+            x: start.panX + event.clientX - start.pointerX,
+            y: start.panY + event.clientY - start.pointerY,
+        })
+    }
+
+    function handleImagePointerUp(event: React.PointerEvent<HTMLDivElement>) {
+        if (!isImagePanning) return
+        event.currentTarget.releasePointerCapture(event.pointerId)
+        setIsImagePanning(false)
+    }
+
+    function handleImageWheel(event: React.WheelEvent<HTMLDivElement>) {
+        event.preventDefault()
+        updateImageZoom(imageZoom + (event.deltaY < 0 ? 0.15 : -0.15))
+    }
+
+    async function copyPreviewText() {
+        if (!previewTextContent) return
+        try {
+            await navigator.clipboard.writeText(previewTextContent)
+            setPreviewTextCopied(true)
+            window.setTimeout(() => setPreviewTextCopied(false), 1200)
+        } catch {
+            setError("Could not copy preview text")
+        }
+    }
+
+    function renderHighlightedLine(line: string, file: FileItem, lineIndex: number) {
+        if (!isCodePreviewFile(file)) return line || "\u00A0"
+
+        const ext = getFileExtension(getDisplayName(file))
+        if (ext === "md" || ext === "markdown") {
+            if (/^#{1,6}\s/.test(line)) return <span className="font-semibold text-sky-300">{line}</span>
+            if (/^```/.test(line)) return <span className="text-emerald-300">{line}</span>
+            if (/^\s*[-*+]\s/.test(line)) return <span className="text-violet-300">{line}</span>
+        }
+
+        if (ext === "env" || ext === "ini") {
+            const envMatch = line.match(/^([^=#\s][^=]*)(=)(.*)$/)
+            if (envMatch) {
+                return (
+                    <>
+                        <span className="text-sky-300">{envMatch[1]}</span>
+                        <span className="text-white/60">{envMatch[2]}</span>
+                        <span className="text-amber-200">{envMatch[3]}</span>
+                    </>
+                )
+            }
+        }
+
+        const parts: React.ReactNode[] = []
+        const tokenPattern = /(\/\/.*|#.*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|\b\d+(?:\.\d+)?\b|\b[A-Za-z_$][\w$]*\b|[{}()[\].,;:])/g
+        let lastIndex = 0
+
+        for (const match of line.matchAll(tokenPattern)) {
+            const token = match[0]
+            const index = match.index ?? 0
+            if (index > lastIndex) {
+                parts.push(line.slice(lastIndex, index))
+            }
+
+            let className = "text-card-foreground"
+            if (token.startsWith("//") || token.startsWith("#")) className = "text-white/40"
+            else if (/^["'`]/.test(token)) className = "text-emerald-300"
+            else if (/^\d/.test(token)) className = "text-amber-300"
+            else if (CODE_KEYWORDS.has(token)) className = "text-violet-300"
+            else if (/^[{}()[\].,;:]$/.test(token)) className = "text-white/50"
+
+            parts.push(
+                <span key={`${lineIndex}-${index}`} className={className}>
+                    {token}
+                </span>
+            )
+            lastIndex = index + token.length
+        }
+
+        if (lastIndex < line.length) {
+            parts.push(line.slice(lastIndex))
+        }
+
+        return parts.length > 0 ? parts : "\u00A0"
+    }
+
     // Preview
     function openPreview(file: FileItem) {
-        if (isSecureItem(file)) {
+        const shortcut = isShareShortcut(file)
+        if (!shortcut && isSecureItem(file)) {
             clearOverlays()
             setError("Encrypted vault files cannot be previewed in the browser yet. Download them to decrypt locally.")
             return
@@ -948,10 +2031,16 @@ export function FilesContent() {
         setPreviewFile(file)
         setPreviewTextContent(null)
         setPdfBlobUrl(null)
+        setPreviewTextCopied(false)
+        resetImagePreviewState()
+        const previewUrl = getPreviewUrlForFile(file)
         // For PDFs, fetch as blob to bypass IDM interception
         // raw=1 tells backend to serve as octet-stream so IDM ignores it
-        if (file.mime_type?.includes('pdf')) {
-            fetch(getPreviewUrl(file.id) + '&raw=1')
+        if (isPdfPreviewFile(file)) {
+            if (shortcut) {
+                setPdfBlobUrl(previewUrl)
+            } else {
+                fetch(previewUrl + '&raw=1')
                 .then(r => {
                     if (!r.ok) throw new Error('Failed to load PDF')
                     return r.blob()
@@ -963,10 +2052,11 @@ export function FilesContent() {
                     setPdfBlobUrl(url)
                 })
                 .catch(() => setPdfBlobUrl('error'))
+            }
         }
         // For non-PDF documents (text, code, etc.), fetch as text
-        if (file.type === 'document' && !file.mime_type?.includes('pdf')) {
-            fetch(getPreviewUrl(file.id))
+        if (isTextPreviewFile(file)) {
+            fetch(previewUrl)
                 .then(r => r.text())
                 .then(text => setPreviewTextContent(text))
                 .catch(() => setPreviewTextContent('Failed to load file content'))
@@ -974,16 +2064,365 @@ export function FilesContent() {
     }
 
     function closePreview() {
-        if (pdfBlobUrl && pdfBlobUrl !== 'error') URL.revokeObjectURL(pdfBlobUrl)
+        if (pdfBlobUrl?.startsWith('blob:')) URL.revokeObjectURL(pdfBlobUrl)
         setPreviewFile(null)
         setPreviewTextContent(null)
         setPdfBlobUrl(null)
+        setPreviewTextCopied(false)
+        resetImagePreviewState()
     }
+
+    async function handleDownloadShortcutFolderFile(file: FileItem) {
+        if (!browsingShortcut?.share_id) return
+        try {
+            if (browsingShortcut.share_allow_download === 0) {
+                throw new Error("Downloads are disabled for this share")
+            }
+            const fileName = file.type === "folder" ? `${file.name}.zip` : file.name
+            await downloadSharedFile(browsingShortcut.share_id, file.id, fileName)
+        } catch (err) {
+            setError(err instanceof Error ? err.message : "Download failed")
+        }
+    }
+
+    function renderFileContextMenuItems(file: FileItem) {
+        const isShortcut = isShareShortcut(file)
+        const accessible = isFileAccessible(file)
+        const previewAllowed = !isSecureItem(file) && file.type !== "folder"
+
+        return (
+            <>
+                {isShortcut ? (
+                    <>
+                        <ContextMenuItem onClick={() => handleFileClick(file)}>
+                            {file.type === "folder" ? (
+                                <FolderOpen className="h-4 w-4 mr-2" />
+                            ) : (
+                                <Eye className="h-4 w-4 mr-2" />
+                            )}
+                            {file.type === "folder" ? "Open shared folder" : "Preview"}
+                        </ContextMenuItem>
+                        <ContextMenuItem
+                            onClick={() => handleDownload(file)}
+                            disabled={file.share_allow_download === 0}
+                        >
+                            <Download className="h-4 w-4 mr-2" />
+                            {file.type === "folder" ? "Download ZIP" : "Download"}
+                        </ContextMenuItem>
+                        <ContextMenuItem onClick={() => setDetailFile(file)}>
+                            <Info className="h-4 w-4 mr-2" />
+                            Details
+                        </ContextMenuItem>
+                        <ContextMenuSeparator />
+                        <ContextMenuItem className="text-destructive" onClick={() => handleRemoveShortcut(file)}>
+                            <Trash2 className="h-4 w-4 mr-2" />
+                            Remove shortcut
+                        </ContextMenuItem>
+                    </>
+                ) : file.type === "folder" ? (
+                    <>
+                        <ContextMenuItem onClick={() => handleFileClick(file)}>
+                            <FolderOpen className="h-4 w-4 mr-2" />
+                            Open
+                        </ContextMenuItem>
+                        <ContextMenuItem
+                            onClick={() => accessible && handleDownload(file)}
+                            disabled={!accessible}
+                            title={!accessible ? "Drive disconnected" : undefined}
+                        >
+                            <Download className="h-4 w-4 mr-2" />
+                            Download as ZIP
+                        </ContextMenuItem>
+                    </>
+                ) : (
+                    <>
+                        <ContextMenuItem
+                            onClick={() => accessible && openPreview(file)}
+                            disabled={!accessible || !previewAllowed}
+                            title={!accessible ? "Drive disconnected" : undefined}
+                        >
+                            <Eye className="h-4 w-4 mr-2" />
+                            {previewAllowed ? "Preview" : "Preview unavailable"}
+                        </ContextMenuItem>
+                        <ContextMenuItem
+                            onClick={() => accessible && handleDownload(file)}
+                            disabled={!accessible}
+                            title={!accessible ? "Drive disconnected" : undefined}
+                        >
+                            <Download className="h-4 w-4 mr-2" />
+                            Download
+                        </ContextMenuItem>
+                        <ContextMenuItem onClick={() => openVersionHistory(file)}>
+                            <History className="h-4 w-4 mr-2" />
+                            Version history
+                        </ContextMenuItem>
+                    </>
+                )}
+                {!isShortcut && (
+                    <>
+                        <ContextMenuSeparator />
+                        <ContextMenuItem onClick={() => openRenameDialog(file)}>
+                            <Pencil className="h-4 w-4 mr-2" />
+                            Rename
+                        </ContextMenuItem>
+                        <ContextMenuItem onClick={() => openLocationDialog(file, "move")}>
+                            <Scissors className="h-4 w-4 mr-2" />
+                            Move
+                        </ContextMenuItem>
+                        <ContextMenuItem onClick={() => openLocationDialog(file, "copy")}>
+                            <Copy className="h-4 w-4 mr-2" />
+                            Copy
+                        </ContextMenuItem>
+                        <ContextMenuItem onClick={() => handleDuplicate(file)}>
+                            <Copy className="h-4 w-4 mr-2" />
+                            Duplicate
+                        </ContextMenuItem>
+                        <ContextMenuItem onClick={() => handleToggleStar(file)}>
+                            <Star className="h-4 w-4 mr-2" />
+                            {file.starred ? "Unstar" : "Star"}
+                        </ContextMenuItem>
+                        <ContextMenuItem onClick={() => handleShare(file)}>
+                            <Link2 className="h-4 w-4 mr-2" />
+                            Share
+                        </ContextMenuItem>
+                        <ContextMenuItem onClick={() => setDetailFile(file)}>
+                            <Info className="h-4 w-4 mr-2" />
+                            Details
+                        </ContextMenuItem>
+                        <ContextMenuSeparator />
+                        <ContextMenuItem className="text-destructive" onClick={() => openDeleteDialog(file)}>
+                            <Trash2 className="h-4 w-4 mr-2" />
+                            Delete
+                        </ContextMenuItem>
+                    </>
+                )}
+            </>
+        )
+    }
+
+    useEffect(() => {
+        if (!highlightedFileId || isLoading) return
+        const file = files.find((item) => item.id === highlightedFileId)
+        if (!file) return
+
+        const timer = window.setTimeout(() => {
+            const element = document.querySelector(`[data-file-id="${highlightedFileId}"]`)
+            element?.scrollIntoView({ block: "center", behavior: "smooth" })
+        }, 75)
+
+        return () => window.clearTimeout(timer)
+    }, [highlightedFileId, files, isLoading])
+
+    useEffect(() => {
+        if (isLoading) return
+
+        const handleOpenUploadPicker = () => openUploadPicker()
+        const handleRefreshFiles = () => loadFiles()
+
+        window.addEventListener(OPEN_FILE_UPLOAD_PICKER_EVENT, handleOpenUploadPicker)
+        window.addEventListener(REFRESH_FILES_EVENT, handleRefreshFiles)
+
+        return () => {
+            window.removeEventListener(OPEN_FILE_UPLOAD_PICKER_EVENT, handleOpenUploadPicker)
+            window.removeEventListener(REFRESH_FILES_EVENT, handleRefreshFiles)
+        }
+    }, [isLoading, isInsideVault, isActiveVaultUnlocked, currentFolderId])
+
+    useEffect(() => {
+        function isTypingTarget(target: EventTarget | null) {
+            if (!(target instanceof HTMLElement)) return false
+            const tagName = target.tagName.toLowerCase()
+            return tagName === "input" || tagName === "textarea" || tagName === "select" || target.isContentEditable
+        }
+
+        function handleKeyDown(event: KeyboardEvent) {
+            if (previewFile) {
+                if (event.key === "Escape") {
+                    event.preventDefault()
+                    closePreview()
+                } else if (event.key === "ArrowLeft") {
+                    event.preventDefault()
+                    navigatePreviewSibling(-1)
+                } else if (event.key === "ArrowRight") {
+                    event.preventDefault()
+                    navigatePreviewSibling(1)
+                }
+                return
+            }
+
+            if (isTypingTarget(event.target)) return
+
+            const dialogOpen = showNewFolderDialog || showSecureVaultDialog || showUnlockVaultDialog ||
+                showChangePinDialog || showRenameDialog || showDeleteDialog || showLocationDialog ||
+                showShareDialog || showKeyboardHelp || Boolean(versionFile) || Boolean(versionAction)
+
+            if (dialogOpen) return
+
+            const key = event.key.toLowerCase()
+
+            if (key === "?") {
+                event.preventDefault()
+                setShowKeyboardHelp(true)
+                return
+            }
+
+            if ((event.ctrlKey || event.metaKey) && key === "a") {
+                event.preventDefault()
+                selectAllVisible()
+                return
+            }
+
+            if ((event.ctrlKey || event.metaKey) && key === "u") {
+                event.preventDefault()
+                openUploadPicker()
+                return
+            }
+
+            if (event.key === "Escape") {
+                event.preventDefault()
+                clearOverlays()
+                setSelectedFiles([])
+                setLastSelectedFileId(null)
+                setIsSelecting(false)
+                return
+            }
+
+            if (event.key === "Enter") {
+                event.preventDefault()
+                openSelectedItem()
+                return
+            }
+
+            if (event.key === "F2") {
+                event.preventDefault()
+                renameSelectedItem()
+                return
+            }
+
+            if (event.key === "Delete") {
+                event.preventDefault()
+                const selected = getSelectedRegularItems()
+                if (selected.length === 1) {
+                    openDeleteDialog(selected[0])
+                } else if (selected.length > 1) {
+                    handleBulkDelete()
+                }
+                return
+            }
+
+            if (event.key === "Backspace" || (event.altKey && event.key === "ArrowLeft")) {
+                event.preventDefault()
+                goUpFolder()
+            }
+        }
+
+        window.addEventListener("keydown", handleKeyDown)
+        return () => window.removeEventListener("keydown", handleKeyDown)
+    })
+
+    const previewPreviousFile = previewFile ? getPreviewSibling(-1) : null
+    const previewNextFile = previewFile ? getPreviewSibling(1) : null
+    const previewTextLines = previewTextContent?.split(/\r?\n/) || []
 
     if (isLoading) {
         return (
             <div className="flex items-center justify-center h-64">
                 <Loader2 className="h-8 w-8 animate-spin text-primary" />
+            </div>
+        )
+    }
+
+    if (browsingShortcut) {
+        return (
+            <div className="space-y-6">
+                <div className="flex items-center gap-3">
+                    <Button variant="ghost" size="icon" onClick={closeShortcutBrowser}>
+                        <ArrowLeft className="h-5 w-5" />
+                    </Button>
+                    <div className="min-w-0">
+                        <h1 className="flex items-center gap-2 truncate text-2xl font-bold text-foreground">
+                            <Folder className="h-6 w-6 shrink-0 text-blue-400" />
+                            {getDisplayName(browsingShortcut)}
+                        </h1>
+                        <p className="text-sm text-muted-foreground">
+                            Shared by {browsingShortcut.shared_by_name || "another user"}
+                        </p>
+                    </div>
+                </div>
+
+                {shortcutBreadcrumbs.length > 0 && (
+                    <div className="flex items-center gap-1 overflow-x-auto pb-2 text-sm">
+                        {shortcutBreadcrumbs.map((crumb, index) => (
+                            <div key={crumb.id} className="flex shrink-0 items-center gap-1">
+                                {index > 0 && <ChevronRight className="h-4 w-4 text-muted-foreground" />}
+                                <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    className="max-w-[180px] truncate"
+                                    onClick={() => navigateShortcutFolder(crumb.id === shortcutRootFolderId ? undefined : crumb.id)}
+                                >
+                                    {index === 0 && <FolderOpen className="mr-1 h-4 w-4" />}
+                                    {crumb.name}
+                                </Button>
+                            </div>
+                        ))}
+                    </div>
+                )}
+
+                {error && (
+                    <div className="rounded-lg bg-destructive/10 px-4 py-3 text-sm text-destructive">
+                        {error}
+                    </div>
+                )}
+
+                {shortcutLoading ? (
+                    <div className="flex h-32 items-center justify-center">
+                        <Loader2 className="h-6 w-6 animate-spin text-primary" />
+                    </div>
+                ) : shortcutFiles.length === 0 ? (
+                    <Card className="py-12">
+                        <CardContent className="flex flex-col items-center justify-center text-center">
+                            <FolderOpen className="mb-4 h-12 w-12 text-muted-foreground" />
+                            <h3 className="text-lg font-medium">This shared folder is empty</h3>
+                        </CardContent>
+                    </Card>
+                ) : (
+                    <div className="grid gap-3">
+                        {shortcutFiles.map((file) => {
+                            const Icon = getFileIcon(file.type)
+                            return (
+                                <Card
+                                    key={file.id}
+                                    className="cursor-pointer transition-colors hover:bg-secondary"
+                                    onClick={() => file.type === "folder" && navigateShortcutFolder(file.id)}
+                                >
+                                    <CardContent className="flex items-center gap-3 p-4">
+                                        <div className="rounded-lg bg-secondary p-2.5">
+                                            <Icon className={cn("h-5 w-5", getFileColor(file.type))} />
+                                        </div>
+                                        <div className="min-w-0 flex-1">
+                                            <p className="truncate font-medium">{file.name}</p>
+                                            <p className="text-xs text-muted-foreground">{formatFileSize(file.size)}</p>
+                                        </div>
+                                        <Button
+                                            variant="outline"
+                                            size="sm"
+                                            className="gap-2"
+                                            disabled={browsingShortcut.share_allow_download === 0}
+                                            onClick={(event) => {
+                                                event.stopPropagation()
+                                                handleDownloadShortcutFolderFile(file)
+                                            }}
+                                        >
+                                            <Download className="h-3.5 w-3.5" />
+                                            {file.type === "folder" ? "ZIP" : "Download"}
+                                        </Button>
+                                    </CardContent>
+                                </Card>
+                            )
+                        })}
+                    </div>
+                )}
             </div>
         )
     }
@@ -999,10 +2438,10 @@ export function FilesContent() {
             {/* Drag & Drop Overlay */}
             {isDragging && (
                 <div className="fixed inset-0 z-50 bg-background/80 backdrop-blur-sm flex items-center justify-center">
-                    <div className="border-2 border-dashed border-primary rounded-2xl p-16 text-center animate-pulse">
-                        <Upload className="h-16 w-16 mx-auto mb-4 text-primary" />
-                        <p className="text-xl font-semibold text-primary">Drop files here to upload</p>
-                        <p className="text-sm text-muted-foreground mt-2">Files will be uploaded to the current folder</p>
+                    <div className="mx-4 rounded-2xl border-2 border-dashed border-primary p-8 text-center animate-pulse sm:p-16">
+                        <Upload className="mx-auto mb-4 h-12 w-12 text-primary sm:h-16 sm:w-16" />
+                        <p className="text-lg font-semibold text-primary sm:text-xl">Drop files here to upload</p>
+                        <p className="text-sm text-muted-foreground mt-2">Files and folders will be uploaded to the current folder</p>
                     </div>
                 </div>
             )}
@@ -1034,7 +2473,7 @@ export function FilesContent() {
 
             {/* Header Actions */}
             <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-                <div className="relative flex-1 max-w-md">
+                <div className="relative w-full flex-1 sm:max-w-md">
                     <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
                     <Input
                         placeholder="Search files..."
@@ -1043,21 +2482,21 @@ export function FilesContent() {
                         className="pl-9"
                     />
                 </div>
-                <div className="flex items-center gap-2">
+                <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto sm:justify-end">
                     {!isInsideVault && (
                         <Button
                             variant="outline"
-                            className="gap-2"
+                            className="min-w-0 flex-1 gap-2 sm:flex-none"
                             onClick={() => setShowSecureVaultDialog(true)}
                         >
                             <Lock className="h-4 w-4" />
-                            Secure Vault
+                            <span className="truncate">Secure Vault</span>
                         </Button>
                     )}
                     <Button
                         variant="outline"
                         size="icon"
-                            onClick={() => {
+                        onClick={() => {
                             clearOverlays()
                             setShowNewFolderDialog(true)
                         }}
@@ -1072,14 +2511,38 @@ export function FilesContent() {
                         onChange={handleUpload}
                         className="hidden"
                     />
-                    <Button
-                        className="gap-2"
-                        onClick={() => fileInputRef.current?.click()}
-                        disabled={isInsideVault && !isActiveVaultUnlocked}
-                    >
-                        <Upload className="h-4 w-4" />
-                        Upload
-                    </Button>
+                    <input
+                        type="file"
+                        multiple
+                        ref={folderInputRef}
+                        onChange={handleFolderUpload}
+                        className="hidden"
+                        {...{ webkitdirectory: "", directory: "" }}
+                    />
+                    <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                            <Button
+                                className="min-w-0 flex-1 gap-2 sm:flex-none"
+                                disabled={isInsideVault && !isActiveVaultUnlocked}
+                            >
+                                <Upload className="h-4 w-4" />
+                                <span>Upload</span>
+                            </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                            <DropdownMenuItem onClick={openUploadPicker}>
+                                <Upload className="h-4 w-4 mr-2" />
+                                Upload files
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                                disabled={isInsideVault}
+                                onClick={() => folderInputRef.current?.click()}
+                            >
+                                <FolderOpen className="h-4 w-4 mr-2" />
+                                Upload folder
+                            </DropdownMenuItem>
+                        </DropdownMenuContent>
+                    </DropdownMenu>
                     {isInsideVault && (
                         <>
                             {isActiveVaultUnlocked ? (
@@ -1100,11 +2563,22 @@ export function FilesContent() {
                         </>
                     )}
                     <Button
+                        variant="outline"
+                        size="icon"
+                        onClick={() => setShowKeyboardHelp(true)}
+                        title="Keyboard shortcuts"
+                    >
+                        <Keyboard className="h-4 w-4" />
+                    </Button>
+                    <Button
                         variant={isSelecting ? "default" : "outline"}
                         size="icon"
                         onClick={() => {
                             setIsSelecting(!isSelecting)
-                            if (isSelecting) setSelectedFiles([])
+                            if (isSelecting) {
+                                setSelectedFiles([])
+                                setLastSelectedFileId(null)
+                            }
                         }}
                         title={isSelecting ? "Cancel selection" : "Select files"}
                     >
@@ -1124,8 +2598,18 @@ export function FilesContent() {
                             size="icon"
                             onClick={() => setView("list")}
                             className={cn(view === "list" && "bg-secondary")}
+                            title="List view"
                         >
                             <List className="h-4 w-4" />
+                        </Button>
+                        <Button
+                            variant="ghost"
+                            size="icon"
+                            onClick={() => setView("columns")}
+                            className={cn(view === "columns" && "bg-secondary")}
+                            title="Columns view"
+                        >
+                            <Columns3 className="h-4 w-4" />
                         </Button>
                     </div>
                     <DropdownMenu>
@@ -1156,22 +2640,24 @@ export function FilesContent() {
             <div className="flex items-center gap-2 overflow-x-auto pb-1">
                 <Filter className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
                 {[
-                    { key: null, label: "All" },
-                    { key: "image", label: "🖼️ Images" },
-                    { key: "document", label: "📄 Docs" },
-                    { key: "video", label: "🎬 Videos" },
-                    { key: "audio", label: "🎵 Audio" },
-                    { key: "archive", label: "📦 Archives" },
-                    { key: "starred", label: "⭐ Starred" },
-                ].map((f) => (
+                    { key: null, label: "All", Icon: Filter },
+                    { key: "image", label: "Images", Icon: ImageIcon },
+                    { key: "document", label: "Docs", Icon: FileText },
+                    { key: "video", label: "Videos", Icon: Video },
+                    { key: "audio", label: "Audio", Icon: Music },
+                    { key: "archive", label: "Archives", Icon: Archive },
+                    { key: "other", label: "Other", Icon: FileIcon },
+                    { key: "starred", label: "Starred", Icon: Star },
+                ].map(({ key, label, Icon }) => (
                     <Button
-                        key={f.key ?? "all"}
-                        variant={filterType === f.key ? "default" : "outline"}
+                        key={key ?? "all"}
+                        variant={filterType === key ? "default" : "outline"}
                         size="sm"
-                        className="h-7 text-xs shrink-0 rounded-full"
-                        onClick={() => setFilterType(f.key)}
+                        className="h-7 gap-1.5 text-xs shrink-0 rounded-full"
+                        onClick={() => updateFilterType(key)}
                     >
-                        {f.label}
+                        <Icon className="h-3.5 w-3.5" />
+                        {label}
                     </Button>
                 ))}
             </div>
@@ -1282,9 +2768,9 @@ export function FilesContent() {
 
             {/* Selected Actions */}
             {isSelecting && (
-                <Card className="bg-secondary border-border">
-                    <CardContent className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 py-3">
-                        <div className="flex items-center gap-3">
+                <Card className="sticky bottom-3 z-30 bg-secondary/95 border-border shadow-lg backdrop-blur supports-[backdrop-filter]:bg-secondary/85">
+                    <CardContent className="flex flex-col gap-3 py-3 sm:flex-row sm:items-center sm:justify-between">
+                        <div className="flex flex-wrap items-center gap-2 sm:gap-3">
                             <span className="text-sm text-secondary-foreground">
                                 {selectedFiles.length} item(s) selected
                             </span>
@@ -1293,36 +2779,88 @@ export function FilesContent() {
                                 size="sm"
                                 className="gap-2"
                                 onClick={() => {
-                                    if (selectedFiles.length === filteredFiles.length) {
+                                    const selectableCount = filteredFiles.filter(f => !isShareShortcut(f)).length
+                                    if (selectedFiles.length === selectableCount) {
                                         setSelectedFiles([])
+                                        setLastSelectedFileId(null)
                                     } else {
-                                        setSelectedFiles(filteredFiles.map(f => f.id))
+                                        setSelectedFiles(filteredFiles.filter(f => !isShareShortcut(f)).map(f => f.id))
+                                        const selectable = filteredFiles.filter(f => !isShareShortcut(f)).map(f => f.id)
+                                        setLastSelectedFileId(selectable.length > 0 ? selectable[selectable.length - 1] : null)
                                     }
                                 }}
                             >
                                 <CheckSquare className="h-4 w-4" />
-                                {selectedFiles.length === filteredFiles.length ? "Deselect All" : "Select All"}
+                                {selectedFiles.length === filteredFiles.filter(f => !isShareShortcut(f)).length ? "Deselect All" : "Select All"}
                             </Button>
                         </div>
-                        <div className="flex items-center gap-2 flex-wrap">
+                        <div className="grid grid-cols-3 gap-2 sm:flex sm:flex-wrap sm:items-center">
                             {selectedFiles.length > 0 && (
-                                <Button
-                                    variant="ghost"
-                                    size="sm"
-                                    className="gap-2 text-destructive"
-                                    onClick={handleBulkDelete}
-                                >
-                                    <Trash2 className="h-4 w-4" />
-                                    <span className="hidden xs:inline">Delete</span>
-                                </Button>
+                                <>
+                                    <Button
+                                        variant="ghost"
+                                        size="sm"
+                                        className="gap-2 justify-center"
+                                        onClick={handleBulkDownload}
+                                    >
+                                        <Download className="h-4 w-4" />
+                                        <span className="hidden sm:inline">ZIP</span>
+                                    </Button>
+                                    <Button
+                                        variant="ghost"
+                                        size="sm"
+                                        className="gap-2 justify-center"
+                                        onClick={handleBulkStar}
+                                    >
+                                        <Star className="h-4 w-4" />
+                                        <span className="hidden sm:inline">Star</span>
+                                    </Button>
+                                    <Button
+                                        variant="ghost"
+                                        size="sm"
+                                        className="gap-2 justify-center"
+                                        onClick={() => openBulkLocationDialog("move")}
+                                    >
+                                        <Scissors className="h-4 w-4" />
+                                        <span className="hidden sm:inline">Move</span>
+                                    </Button>
+                                    <Button
+                                        variant="ghost"
+                                        size="sm"
+                                        className="gap-2 justify-center"
+                                        onClick={() => openBulkLocationDialog("copy")}
+                                    >
+                                        <Copy className="h-4 w-4" />
+                                        <span className="hidden sm:inline">Copy</span>
+                                    </Button>
+                                    <Button
+                                        variant="ghost"
+                                        size="sm"
+                                        className="gap-2 justify-center"
+                                        onClick={handleBulkShare}
+                                    >
+                                        <Link2 className="h-4 w-4" />
+                                        <span className="hidden sm:inline">Share</span>
+                                    </Button>
+                                    <Button
+                                        variant="ghost"
+                                        size="sm"
+                                        className="gap-2 justify-center text-destructive"
+                                        onClick={handleBulkDelete}
+                                    >
+                                        <Trash2 className="h-4 w-4" />
+                                        <span className="hidden sm:inline">Delete</span>
+                                    </Button>
+                                </>
                             )}
                             <Button
                                 variant="ghost"
                                 size="sm"
+                                className="justify-center"
                                 onClick={() => { setIsSelecting(false); setSelectedFiles([]) }}
                             >
                                 <X className="h-4 w-4" />
-                                <span className="hidden xs:inline">Cancel</span>
+                                <span className="hidden sm:inline">Cancel</span>
                             </Button>
                         </div>
                     </CardContent>
@@ -1346,29 +2884,214 @@ export function FilesContent() {
             )}
 
             {/* Empty State */}
-            {(!isInsideVault || isActiveVaultUnlocked) && filteredFiles.length === 0 && !isLoading && (
+            {(!isInsideVault || isActiveVaultUnlocked) && view !== "columns" && filteredFiles.length === 0 && !isLoading && (
                 <Card className="py-12">
                     <CardContent className="flex flex-col items-center justify-center text-center">
                         <FolderOpen className="h-16 w-16 text-muted-foreground mb-4" />
-                        <h3 className="text-lg font-medium">No files yet</h3>
+                        <h3 className="text-lg font-medium">
+                            {searchQuery || filterType ? "No matching files" : "This folder is empty"}
+                        </h3>
                         <p className="text-muted-foreground mt-1">
-                            {isInsideVault
-                                ? "Upload encrypted files or create encrypted folders to get started"
-                                : "Upload files or create a folder to get started"}
+                            {searchQuery || filterType
+                                ? "Try clearing search or filters to broaden the view"
+                                : isInsideVault
+                                    ? "Upload encrypted files or create encrypted folders to get started"
+                                    : "Upload files or create a folder to get started"}
                         </p>
-                        <div className="flex gap-2 mt-4">
-                            <Button
-                                variant="outline"
-                                onClick={() => setShowNewFolderDialog(true)}
-                            >
-                                <FolderPlus className="h-4 w-4 mr-2" />
-                                New Folder
-                            </Button>
-                            <Button onClick={() => fileInputRef.current?.click()}>
-                                <Upload className="h-4 w-4 mr-2" />
-                                Upload Files
-                            </Button>
+                        <div className="flex flex-wrap justify-center gap-2 mt-4">
+                            {searchQuery || filterType ? (
+                                <Button
+                                    variant="outline"
+                                    onClick={() => {
+                                        setSearchQuery("")
+                                        updateFilterType(null)
+                                    }}
+                                >
+                                    Clear filters
+                                </Button>
+                            ) : (
+                                <>
+                                    <Button
+                                        variant="outline"
+                                        onClick={() => setShowNewFolderDialog(true)}
+                                    >
+                                        <FolderPlus className="h-4 w-4 mr-2" />
+                                        New Folder
+                                    </Button>
+                                    <Button onClick={openUploadPicker}>
+                                        <Upload className="h-4 w-4 mr-2" />
+                                        Upload Files
+                                    </Button>
+                                    {!isInsideVault && (
+                                        <Button variant="outline" onClick={() => folderInputRef.current?.click()}>
+                                            <FolderOpen className="h-4 w-4 mr-2" />
+                                            Upload Folder
+                                        </Button>
+                                    )}
+                                </>
+                            )}
                         </div>
+                    </CardContent>
+                </Card>
+            )}
+
+            {/* Files Columns */}
+            {(!isInsideVault || isActiveVaultUnlocked) && view === "columns" && !isLoading && (
+                <Card className="bg-card border-border overflow-hidden">
+                    <CardHeader className="border-b border-border px-4 py-3">
+                        <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                            <div>
+                                <h3 className="text-sm font-medium">Columns</h3>
+                                <p className="text-xs text-muted-foreground">
+                                    Browse folders side by side. The rightmost column is your current folder.
+                                </p>
+                            </div>
+                            {columnsLoading && (
+                                <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                    Loading
+                                </div>
+                            )}
+                        </div>
+                    </CardHeader>
+                    <CardContent className="p-0">
+                        {columnsError ? (
+                            <div className="flex flex-col items-center justify-center gap-3 px-4 py-12 text-center">
+                                <AlertCircle className="h-10 w-10 text-destructive" />
+                                <div>
+                                    <p className="text-sm font-medium">Columns view could not load</p>
+                                    <p className="text-sm text-muted-foreground">{columnsError}</p>
+                                </div>
+                                <Button variant="outline" size="sm" onClick={loadColumnsForPath}>
+                                    Try again
+                                </Button>
+                            </div>
+                        ) : (
+                            <div className="overflow-x-auto">
+                                <div className="flex min-h-[420px] w-max min-w-full">
+                                    {(columns.length > 0 ? columns : [{ folderId: currentFolderId, title: currentFolder ? getDisplayName(currentFolder) : "My Files", files }]).map((column) => {
+                                        const visibleColumnFiles = getSortedVisibleFiles(column.files)
+                                        const isActiveColumn = column.folderId === currentFolderId
+                                        return (
+                                            <div
+                                                key={column.folderId ?? "root"}
+                                                className={cn(
+                                                    "w-[min(82vw,20rem)] shrink-0 border-r border-border last:border-r-0 sm:w-80",
+                                                    isActiveColumn && "bg-secondary/20"
+                                                )}
+                                            >
+                                                <div className="sticky top-0 z-10 flex items-center justify-between gap-2 border-b border-border bg-card/95 px-3 py-2 backdrop-blur">
+                                                    <div className="min-w-0">
+                                                        <p className="truncate text-sm font-medium">{getColumnTitle(column)}</p>
+                                                        <p className="text-xs text-muted-foreground">
+                                                            {visibleColumnFiles.length} item{visibleColumnFiles.length === 1 ? "" : "s"}
+                                                        </p>
+                                                    </div>
+                                                    {isActiveColumn && (
+                                                        <Badge variant="secondary" className="h-5 px-1.5 text-[10px]">
+                                                            Current
+                                                        </Badge>
+                                                    )}
+                                                </div>
+                                                <div className="space-y-1 p-2">
+                                                    {visibleColumnFiles.length === 0 ? (
+                                                        <div className="flex min-h-32 flex-col items-center justify-center rounded-md border border-dashed border-border px-3 py-8 text-center">
+                                                            <FolderOpen className="mb-2 h-8 w-8 text-muted-foreground" />
+                                                            <p className="text-sm font-medium">
+                                                                {searchQuery || filterType ? "No matching files" : "This folder is empty"}
+                                                            </p>
+                                                            <p className="text-xs text-muted-foreground">
+                                                                {searchQuery || filterType ? "Clear search or filters to show more" : "Drop files here or use Upload"}
+                                                            </p>
+                                                        </div>
+                                                    ) : (
+                                                        visibleColumnFiles.map((file) => {
+                                                            const Icon = getFileIcon(file.type)
+                                                            const isShortcut = isShareShortcut(file)
+                                                            const accessible = isFileAccessible(file)
+                                                            const draggable = canDragFile(file)
+                                                            const isDropTarget = dropTargetFolderId === file.id && canDropOnFolder(file)
+                                                            return (
+                                                                <ContextMenu key={file.id}>
+                                                                    <ContextMenuTrigger asChild>
+                                                                        <div
+                                                                            data-file-id={file.id}
+                                                                            draggable={draggable}
+                                                                            onDragStart={(event) => handleFileDragStart(event, file)}
+                                                                            onDragEnd={handleFileDragEnd}
+                                                                            onDragOver={(event) => handleFolderDragOver(event, file)}
+                                                                            onDragLeave={(event) => handleFolderDragLeave(event, file)}
+                                                                            onDrop={(event) => handleFolderDrop(event, file)}
+                                                                            className={cn(
+                                                                                "group flex min-h-11 cursor-pointer items-center gap-2 rounded-md px-2 py-2 text-sm transition-colors hover:bg-secondary",
+                                                                                draggable && "cursor-grab active:cursor-grabbing",
+                                                                                selectedFiles.includes(file.id) && "bg-primary/10 text-primary",
+                                                                                highlightedFileId === file.id && "bg-amber-400/10 ring-1 ring-inset ring-amber-400/60",
+                                                                                isDropTarget && "bg-primary/10 ring-1 ring-inset ring-primary",
+                                                                                !accessible && "opacity-50",
+                                                                                isSelecting && !isActiveColumn && "cursor-default"
+                                                                            )}
+                                                                            onClick={(event) => handleColumnItemClick(file, column, event)}
+                                                                            title={!accessible ? "Drive disconnected - file temporarily unavailable" : getDisplayName(file)}
+                                                                        >
+                                                                    {isSelecting && isActiveColumn && (
+                                                                        <Checkbox
+                                                                            checked={selectedFiles.includes(file.id)}
+                                                                            disabled={isShortcut}
+                                                                            onCheckedChange={() => toggleFileSelection(file.id)}
+                                                                            onClick={(event) => event.stopPropagation()}
+                                                                            aria-label={`Select ${getDisplayName(file)}`}
+                                                                        />
+                                                                    )}
+                                                                    <Icon className={cn("h-4 w-4 shrink-0", getFileColor(file.type))} />
+                                                                    <div className="min-w-0 flex-1">
+                                                                        <div className="flex min-w-0 items-center gap-1.5">
+                                                                            <span className="truncate font-medium">{getDisplayName(file)}</span>
+                                                                            {file.starred === 1 && !isShortcut && (
+                                                                                <Star className="h-3.5 w-3.5 shrink-0 fill-yellow-400 text-yellow-400" />
+                                                                            )}
+                                                                            {isSecureItem(file) && (
+                                                                                <Lock className="h-3.5 w-3.5 shrink-0 text-sky-400" />
+                                                                            )}
+                                                                        </div>
+                                                                        <div className="mt-0.5 flex items-center gap-1.5 text-xs text-muted-foreground">
+                                                                            <span>{file.type === "folder" ? "Folder" : formatFileSize(file.size)}</span>
+                                                                            {isShortcut && <span>Shortcut</span>}
+                                                                            {Number(file.shared_count || 0) > 0 && !isShortcut && <span>Shared</span>}
+                                                                        </div>
+                                                                    </div>
+                                                                    {file.type === "folder" ? (
+                                                                        <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
+                                                                    ) : (
+                                                                        <Button
+                                                                            variant="ghost"
+                                                                            size="icon"
+                                                                            className="h-7 w-7 shrink-0 opacity-100 sm:opacity-0 sm:group-hover:opacity-100"
+                                                                            onClick={(event) => {
+                                                                                event.stopPropagation()
+                                                                                setDetailFile(file)
+                                                                            }}
+                                                                            title="Details"
+                                                                        >
+                                                                            <Info className="h-3.5 w-3.5" />
+                                                                        </Button>
+                                                                    )}
+                                                                        </div>
+                                                                    </ContextMenuTrigger>
+                                                                    <ContextMenuContent className="w-56">
+                                                                        {renderFileContextMenuItems(file)}
+                                                                    </ContextMenuContent>
+                                                                </ContextMenu>
+                                                            )
+                                                        })
+                                                    )}
+                                                </div>
+                                            </div>
+                                        )
+                                    })}
+                                </div>
+                            </div>
+                        )}
                     </CardContent>
                 </Card>
             )}
@@ -1378,29 +3101,48 @@ export function FilesContent() {
                 <div className="grid gap-3 grid-cols-1 xs:grid-cols-2 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
                     {filteredFiles.map((file) => {
                         const Icon = getFileIcon(file.type)
+                        const isShortcut = isShareShortcut(file)
                         const accessible = isFileAccessible(file)
                         const previewAllowed = !isSecureItem(file) && file.type !== "folder"
+                        const draggable = canDragFile(file)
+                        const isDropTarget = dropTargetFolderId === file.id && canDropOnFolder(file)
                         return (
                             <ContextMenu key={file.id}>
                                 <ContextMenuTrigger asChild>
                                     <Card
+                                        data-file-id={file.id}
+                                        draggable={draggable}
+                                        onDragStart={(event) => handleFileDragStart(event, file)}
+                                        onDragEnd={handleFileDragEnd}
+                                        onDragOver={(event) => handleFolderDragOver(event, file)}
+                                        onDragLeave={(event) => handleFolderDragLeave(event, file)}
+                                        onDrop={(event) => handleFolderDrop(event, file)}
                                         className={cn(
                                             "group relative cursor-pointer transition-colors hover:bg-secondary",
+                                            draggable && "cursor-grab active:cursor-grabbing",
                                             selectedFiles.includes(file.id) && "ring-2 ring-primary bg-primary/5",
+                                            highlightedFileId === file.id && "ring-2 ring-amber-400 bg-amber-400/10",
+                                            isDropTarget && "ring-2 ring-primary bg-primary/10",
                                             !accessible && "opacity-50"
                                         )}
-                                        onClick={() => isSelecting ? toggleFileSelection(file.id) : (accessible ? handleFileClick(file) : null)}
+                                        onClick={(event) => isSelecting ? toggleFileSelection(file.id, event) : (accessible ? handleFileClick(file) : null)}
                                         title={!accessible ? "Drive disconnected — file temporarily unavailable" : undefined}
                                     >
                                         <CardContent className="p-4">
                                             <div className="absolute right-2 top-2 flex items-center gap-1">
+                                                {isShortcut && (
+                                                    <FolderPlus className="h-4 w-4 text-primary" />
+                                                )}
                                                 {isSecureItem(file) && (
                                                     <Lock className="h-4 w-4 text-sky-400" />
                                                 )}
-                                                {file.starred === 1 && (
+                                                {file.starred === 1 && !isShortcut && (
                                                     <Star className="h-4 w-4 fill-yellow-400 text-yellow-400" />
                                                 )}
-                                                {previewAllowed && (
+                                                {Number(file.shared_count || 0) > 0 && !isShortcut && (
+                                                    <Link2 className="h-4 w-4 text-primary" />
+                                                )}
+                                                {previewAllowed && !isSelecting && (
                                                     <Button
                                                         variant="ghost"
                                                         size="icon"
@@ -1416,12 +3158,43 @@ export function FilesContent() {
                                                             variant="ghost"
                                                             size="icon"
                                                             className="h-8 w-8 sm:opacity-0 sm:group-hover:opacity-100"
+                                                            onClick={(event) => event.stopPropagation()}
                                                         >
                                                             <MoreVertical className="h-4 w-4" />
                                                         </Button>
                                                     </DropdownMenuTrigger>
                                                     <DropdownMenuContent align="end">
-                                                        {file.type === "folder" ? (
+                                                        {isShortcut ? (
+                                                            <>
+                                                                <DropdownMenuItem onClick={() => handleFileClick(file)}>
+                                                                    {file.type === "folder" ? (
+                                                                        <FolderOpen className="h-4 w-4 mr-2" />
+                                                                    ) : (
+                                                                        <Eye className="h-4 w-4 mr-2" />
+                                                                    )}
+                                                                    {file.type === "folder" ? "Open shared folder" : "Preview"}
+                                                                </DropdownMenuItem>
+                                                                <DropdownMenuItem
+                                                                    onClick={() => handleDownload(file)}
+                                                                    disabled={file.share_allow_download === 0}
+                                                                >
+                                                                    <Download className="h-4 w-4 mr-2" />
+                                                                    {file.type === "folder" ? "Download ZIP" : "Download"}
+                                                                </DropdownMenuItem>
+                                                                <DropdownMenuItem onClick={() => setDetailFile(file)}>
+                                                                    <Info className="h-4 w-4 mr-2" />
+                                                                    Details
+                                                                </DropdownMenuItem>
+                                                                <DropdownMenuSeparator />
+                                                                <DropdownMenuItem
+                                                                    className="text-destructive"
+                                                                    onClick={() => handleRemoveShortcut(file)}
+                                                                >
+                                                                    <Trash2 className="h-4 w-4 mr-2" />
+                                                                    Remove shortcut
+                                                                </DropdownMenuItem>
+                                                            </>
+                                                        ) : file.type === "folder" ? (
                                                             <>
                                                                 <DropdownMenuItem onClick={() => handleFileClick(file)}>
                                                                     <FolderOpen className="h-4 w-4 mr-2" />
@@ -1454,53 +3227,70 @@ export function FilesContent() {
                                                                     <Download className="h-4 w-4 mr-2" />
                                                                     Download
                                                                 </DropdownMenuItem>
+                                                                <DropdownMenuItem onClick={() => openVersionHistory(file)}>
+                                                                    <History className="h-4 w-4 mr-2" />
+                                                                    Version history
+                                                                </DropdownMenuItem>
                                                             </>
                                                         )}
-                                                        <DropdownMenuItem onClick={() => openRenameDialog(file)}>
-                                                            <Pencil className="h-4 w-4 mr-2" />
-                                                            Rename
-                                                        </DropdownMenuItem>
-                                                        <DropdownMenuItem onClick={() => openLocationDialog(file, "move")}>
-                                                            <Scissors className="h-4 w-4 mr-2" />
-                                                            Move
-                                                        </DropdownMenuItem>
-                                                        <DropdownMenuItem onClick={() => openLocationDialog(file, "copy")}>
-                                                            <Copy className="h-4 w-4 mr-2" />
-                                                            Copy
-                                                        </DropdownMenuItem>
-                                                        <DropdownMenuItem onClick={() => handleToggleStar(file)}>
-                                                            <Star className="h-4 w-4 mr-2" />
-                                                            {file.starred ? "Unstar" : "Star"}
-                                                        </DropdownMenuItem>
-                                                        <DropdownMenuItem onClick={() => handleShare(file)}>
-                                                            <Link2 className="h-4 w-4 mr-2" />
-                                                            Share
-                                                        </DropdownMenuItem>
-                                                        <DropdownMenuItem onClick={() => setDetailFile(file)}>
-                                                            <Info className="h-4 w-4 mr-2" />
-                                                            Details
-                                                        </DropdownMenuItem>
-                                                        <DropdownMenuSeparator />
-                                                        <DropdownMenuItem
-                                                            className="text-destructive"
-                                                            onClick={() => openDeleteDialog(file)}
-                                                        >
-                                                            <Trash2 className="h-4 w-4 mr-2" />
-                                                            Delete
-                                                        </DropdownMenuItem>
+                                                        {!isShortcut && (
+                                                            <>
+                                                                <DropdownMenuItem onClick={() => openRenameDialog(file)}>
+                                                                    <Pencil className="h-4 w-4 mr-2" />
+                                                                    Rename
+                                                                </DropdownMenuItem>
+                                                                <DropdownMenuItem onClick={() => openLocationDialog(file, "move")}>
+                                                                    <Scissors className="h-4 w-4 mr-2" />
+                                                                    Move
+                                                                </DropdownMenuItem>
+                                                                <DropdownMenuItem onClick={() => openLocationDialog(file, "copy")}>
+                                                                    <Copy className="h-4 w-4 mr-2" />
+                                                                    Copy
+                                                                </DropdownMenuItem>
+                                                                <DropdownMenuItem onClick={() => handleDuplicate(file)}>
+                                                                    <Copy className="h-4 w-4 mr-2" />
+                                                                    Duplicate
+                                                                </DropdownMenuItem>
+                                                                <DropdownMenuItem onClick={() => handleToggleStar(file)}>
+                                                                    <Star className="h-4 w-4 mr-2" />
+                                                                    {file.starred ? "Unstar" : "Star"}
+                                                                </DropdownMenuItem>
+                                                                <DropdownMenuItem onClick={() => handleShare(file)}>
+                                                                    <Link2 className="h-4 w-4 mr-2" />
+                                                                    Share
+                                                                </DropdownMenuItem>
+                                                                <DropdownMenuItem onClick={() => setDetailFile(file)}>
+                                                                    <Info className="h-4 w-4 mr-2" />
+                                                                    Details
+                                                                </DropdownMenuItem>
+                                                                <DropdownMenuSeparator />
+                                                                <DropdownMenuItem
+                                                                    className="text-destructive"
+                                                                    onClick={() => openDeleteDialog(file)}
+                                                                >
+                                                                    <Trash2 className="h-4 w-4 mr-2" />
+                                                                    Delete
+                                                                </DropdownMenuItem>
+                                                            </>
+                                                        )}
                                                     </DropdownMenuContent>
                                                 </DropdownMenu>
                                             </div>
                                             <div
                                                 className="flex flex-col items-center pt-4"
-                                                onClick={() => {
+                                                onClick={(event) => {
                                                     if (!accessible) return
+                                                    if (isSelecting) {
+                                                        event.stopPropagation()
+                                                        toggleFileSelection(file.id, event)
+                                                        return
+                                                    }
                                                     if (file.type === "folder") handleFileClick(file)
                                                     else if (previewAllowed) openPreview(file)
-                                                    else handleDownload(file)
+                                                    else if (!isShortcut || file.share_allow_download !== 0) handleDownload(file)
                                                 }}
                                             >
-                                                {(file.type === "image" || file.type === "video") && !isSecureItem(file) ? (
+                                                {(file.type === "image" || file.type === "video") && !isSecureItem(file) && !isShortcut ? (
                                                     <div className="w-full h-20 sm:h-24 mb-2 sm:mb-3 rounded overflow-hidden bg-secondary flex items-center justify-center">
                                                         {!accessible || brokenThumbnails[file.id] ? (
                                                             <Icon className={cn("h-10 w-10 sm:h-12 sm:w-12", getFileColor(file.type))} />
@@ -1528,15 +3318,54 @@ export function FilesContent() {
                                                 <p className="text-xs sm:text-sm font-medium text-card-foreground text-center line-clamp-2 w-full px-1" title={getDisplayName(file)}>
                                                     {getDisplayName(file)}
                                                 </p>
-                                                <p className="text-xs text-muted-foreground mt-1">
-                                                    {formatFileSize(file.size)}
-                                                </p>
+                                                <div className="mt-1 flex items-center justify-center gap-2">
+                                                    <p className="text-xs text-muted-foreground">
+                                                        {formatFileSize(file.size)}
+                                                    </p>
+                                                    {isShortcut && (
+                                                        <Badge variant="outline" className="h-5 px-1.5 text-[10px]">
+                                                            Shortcut
+                                                        </Badge>
+                                                    )}
+                                                    {canShowVersions(file) && getVersionNumber(file) > 1 && (
+                                                        <Badge variant="secondary" className="h-5 px-1.5 text-[10px]">
+                                                            v{getVersionNumber(file)}
+                                                        </Badge>
+                                                    )}
+                                                </div>
                                             </div>
                                         </CardContent>
                                     </Card>
                                 </ContextMenuTrigger>
                                 <ContextMenuContent className="w-48">
-                                    {file.type === "folder" ? (
+                                    {isShortcut ? (
+                                        <>
+                                            <ContextMenuItem onClick={() => handleFileClick(file)}>
+                                                {file.type === "folder" ? (
+                                                    <FolderOpen className="h-4 w-4 mr-2" />
+                                                ) : (
+                                                    <Eye className="h-4 w-4 mr-2" />
+                                                )}
+                                                {file.type === "folder" ? "Open shared folder" : "Preview"}
+                                            </ContextMenuItem>
+                                            <ContextMenuItem
+                                                onClick={() => handleDownload(file)}
+                                                disabled={file.share_allow_download === 0}
+                                            >
+                                                <Download className="h-4 w-4 mr-2" />
+                                                {file.type === "folder" ? "Download ZIP" : "Download"}
+                                            </ContextMenuItem>
+                                            <ContextMenuItem onClick={() => setDetailFile(file)}>
+                                                <Info className="h-4 w-4 mr-2" />
+                                                Details
+                                            </ContextMenuItem>
+                                            <ContextMenuSeparator />
+                                            <ContextMenuItem className="text-destructive" onClick={() => handleRemoveShortcut(file)}>
+                                                <Trash2 className="h-4 w-4 mr-2" />
+                                                Remove shortcut
+                                            </ContextMenuItem>
+                                        </>
+                                    ) : file.type === "folder" ? (
                                         <>
                                             <ContextMenuItem onClick={() => handleFileClick(file)}>
                                                 <FolderOpen className="h-4 w-4 mr-2" />
@@ -1569,38 +3398,50 @@ export function FilesContent() {
                                                 <Download className="h-4 w-4 mr-2" />
                                                 Download
                                             </ContextMenuItem>
+                                            <ContextMenuItem onClick={() => openVersionHistory(file)}>
+                                                <History className="h-4 w-4 mr-2" />
+                                                Version history
+                                            </ContextMenuItem>
                                         </>
                                     )}
-                                    <ContextMenuSeparator />
-                                    <ContextMenuItem onClick={() => openRenameDialog(file)}>
-                                        <Pencil className="h-4 w-4 mr-2" />
-                                        Rename
-                                    </ContextMenuItem>
-                                    <ContextMenuItem onClick={() => openLocationDialog(file, "move")}>
-                                        <Scissors className="h-4 w-4 mr-2" />
-                                        Move
-                                    </ContextMenuItem>
-                                    <ContextMenuItem onClick={() => openLocationDialog(file, "copy")}>
-                                        <Copy className="h-4 w-4 mr-2" />
-                                        Copy
-                                    </ContextMenuItem>
-                                    <ContextMenuItem onClick={() => handleToggleStar(file)}>
-                                        <Star className="h-4 w-4 mr-2" />
-                                        {file.starred ? "Unstar" : "Star"}
-                                    </ContextMenuItem>
-                                    <ContextMenuItem onClick={() => handleShare(file)}>
-                                        <Link2 className="h-4 w-4 mr-2" />
-                                        Share
-                                    </ContextMenuItem>
-                                    <ContextMenuItem onClick={() => setDetailFile(file)}>
-                                        <Info className="h-4 w-4 mr-2" />
-                                        Details
-                                    </ContextMenuItem>
-                                    <ContextMenuSeparator />
-                                    <ContextMenuItem className="text-destructive" onClick={() => openDeleteDialog(file)}>
-                                        <Trash2 className="h-4 w-4 mr-2" />
-                                        Delete
-                                    </ContextMenuItem>
+                                    {!isShortcut && (
+                                        <>
+                                            <ContextMenuSeparator />
+                                            <ContextMenuItem onClick={() => openRenameDialog(file)}>
+                                                <Pencil className="h-4 w-4 mr-2" />
+                                                Rename
+                                            </ContextMenuItem>
+                                            <ContextMenuItem onClick={() => openLocationDialog(file, "move")}>
+                                                <Scissors className="h-4 w-4 mr-2" />
+                                                Move
+                                            </ContextMenuItem>
+                                            <ContextMenuItem onClick={() => openLocationDialog(file, "copy")}>
+                                                <Copy className="h-4 w-4 mr-2" />
+                                                Copy
+                                            </ContextMenuItem>
+                                            <ContextMenuItem onClick={() => handleDuplicate(file)}>
+                                                <Copy className="h-4 w-4 mr-2" />
+                                                Duplicate
+                                            </ContextMenuItem>
+                                            <ContextMenuItem onClick={() => handleToggleStar(file)}>
+                                                <Star className="h-4 w-4 mr-2" />
+                                                {file.starred ? "Unstar" : "Star"}
+                                            </ContextMenuItem>
+                                            <ContextMenuItem onClick={() => handleShare(file)}>
+                                                <Link2 className="h-4 w-4 mr-2" />
+                                                Share
+                                            </ContextMenuItem>
+                                            <ContextMenuItem onClick={() => setDetailFile(file)}>
+                                                <Info className="h-4 w-4 mr-2" />
+                                                Details
+                                            </ContextMenuItem>
+                                            <ContextMenuSeparator />
+                                            <ContextMenuItem className="text-destructive" onClick={() => openDeleteDialog(file)}>
+                                                <Trash2 className="h-4 w-4 mr-2" />
+                                                Delete
+                                            </ContextMenuItem>
+                                        </>
+                                    )}
                                 </ContextMenuContent>
                             </ContextMenu>
                         )
@@ -1613,7 +3454,28 @@ export function FilesContent() {
                 <Card className="bg-card border-border overflow-hidden">
                     <CardHeader className="border-b border-border py-3 hidden sm:block">
                         <div className="grid grid-cols-12 gap-4 text-xs font-medium text-muted-foreground">
-                            <div className="col-span-7 sm:col-span-6">Name</div>
+                            <div className="col-span-7 sm:col-span-6 flex items-center gap-3">
+                                {isSelecting && (
+                                    <Checkbox
+                                        checked={
+                                            filteredFiles.filter(f => !isShareShortcut(f)).length > 0 &&
+                                            selectedFiles.length === filteredFiles.filter(f => !isShareShortcut(f)).length
+                                        }
+                                        onCheckedChange={() => {
+                                            const selectable = filteredFiles.filter(f => !isShareShortcut(f)).map(f => f.id)
+                                            if (selectedFiles.length === selectable.length) {
+                                                setSelectedFiles([])
+                                                setLastSelectedFileId(null)
+                                            } else {
+                                                setSelectedFiles(selectable)
+                                                setLastSelectedFileId(selectable.length > 0 ? selectable[selectable.length - 1] : null)
+                                            }
+                                        }}
+                                        aria-label="Select all visible files"
+                                    />
+                                )}
+                                Name
+                            </div>
                             <div className="col-span-2 hidden sm:block">Size</div>
                             <div className="col-span-3 hidden md:block">Modified</div>
                             <div className="col-span-1" />
@@ -1622,23 +3484,46 @@ export function FilesContent() {
                     <CardContent className="p-0">
                         {filteredFiles.map((file) => {
                             const Icon = getFileIcon(file.type)
+                            const isShortcut = isShareShortcut(file)
                             const accessible = isFileAccessible(file)
                             const previewAllowed = !isSecureItem(file) && file.type !== "folder"
+                            const draggable = canDragFile(file)
+                            const isDropTarget = dropTargetFolderId === file.id && canDropOnFolder(file)
                             return (
-                                <div
-                                    key={file.id}
-                                    className={cn(
-                                        "flex sm:grid sm:grid-cols-12 gap-2 sm:gap-4 items-center px-4 sm:px-6 py-3 border-b border-border last:border-0 hover:bg-secondary cursor-pointer",
-                                        selectedFiles.includes(file.id) && "bg-primary/10",
-                                        !accessible && "opacity-50"
-                                    )}
-                                    onClick={() => isSelecting ? toggleFileSelection(file.id) : (accessible ? handleFileClick(file) : null)}
-                                    title={!accessible ? "Drive disconnected — file temporarily unavailable" : undefined}
-                                >
+                                <ContextMenu key={file.id}>
+                                    <ContextMenuTrigger asChild>
+                                        <div
+                                            data-file-id={file.id}
+                                            draggable={draggable}
+                                            onDragStart={(event) => handleFileDragStart(event, file)}
+                                            onDragEnd={handleFileDragEnd}
+                                            onDragOver={(event) => handleFolderDragOver(event, file)}
+                                            onDragLeave={(event) => handleFolderDragLeave(event, file)}
+                                            onDrop={(event) => handleFolderDrop(event, file)}
+                                            className={cn(
+                                                "flex sm:grid sm:grid-cols-12 gap-2 sm:gap-4 items-center px-4 sm:px-6 py-3 border-b border-border last:border-0 hover:bg-secondary cursor-pointer",
+                                                draggable && "cursor-grab active:cursor-grabbing",
+                                                selectedFiles.includes(file.id) && "bg-primary/10",
+                                                highlightedFileId === file.id && "bg-amber-400/10 ring-1 ring-inset ring-amber-400/60",
+                                                isDropTarget && "bg-primary/10 ring-1 ring-inset ring-primary",
+                                                !accessible && "opacity-50"
+                                            )}
+                                            onClick={(event) => isSelecting ? toggleFileSelection(file.id, event) : (accessible ? handleFileClick(file) : null)}
+                                            title={!accessible ? "Drive disconnected — file temporarily unavailable" : undefined}
+                                        >
                                     <div
                                         className="flex-1 sm:col-span-7 md:col-span-6 flex items-center gap-3 min-w-0"
                                     >
-                                        {(file.type === "image" || file.type === "video") && !isSecureItem(file) ? (
+                                        {isSelecting && (
+                                            <Checkbox
+                                                checked={selectedFiles.includes(file.id)}
+                                                disabled={isShortcut}
+                                                onCheckedChange={() => toggleFileSelection(file.id)}
+                                                onClick={(event) => event.stopPropagation()}
+                                                aria-label={`Select ${getDisplayName(file)}`}
+                                            />
+                                        )}
+                                        {(file.type === "image" || file.type === "video") && !isSecureItem(file) && !isShortcut ? (
                                             <div className="h-9 w-9 rounded overflow-hidden bg-secondary shrink-0 flex items-center justify-center">
                                                 {!accessible || brokenThumbnails[file.id] ? (
                                                     <Icon className={cn("h-5 w-5", getFileColor(file.type))} />
@@ -1664,15 +3549,35 @@ export function FilesContent() {
                                             <Icon className={cn("h-5 w-5 flex-shrink-0", getFileColor(file.type))} />
                                         )}
                                         <div className="min-w-0 flex-1">
-                                            <span className="text-sm font-medium text-card-foreground truncate block">
-                                                {getDisplayName(file)}
-                                            </span>
+                                            <div className="flex items-center gap-2 min-w-0">
+                                                <span className="text-sm font-medium text-card-foreground truncate">
+                                                    {getDisplayName(file)}
+                                                </span>
+                                                {canShowVersions(file) && getVersionNumber(file) > 1 && (
+                                                    <Badge variant="secondary" className="h-5 px-1.5 text-[10px]">
+                                                        v{getVersionNumber(file)}
+                                                    </Badge>
+                                                )}
+                                                {isShortcut && (
+                                                    <Badge variant="outline" className="h-5 px-1.5 text-[10px]">
+                                                        Shortcut
+                                                    </Badge>
+                                                )}
+                                                {Number(file.shared_count || 0) > 0 && !isShortcut && (
+                                                    <Badge variant="outline" className="h-5 px-1.5 text-[10px]">
+                                                        Shared
+                                                    </Badge>
+                                                )}
+                                            </div>
                                             <span className="text-xs text-muted-foreground sm:hidden">
                                                 {formatFileSize(file.size)}
                                             </span>
                                         </div>
-                                        {file.starred === 1 && (
+                                        {file.starred === 1 && !isShortcut && (
                                             <Star className="h-4 w-4 fill-yellow-400 text-yellow-400 flex-shrink-0" />
+                                        )}
+                                        {isShortcut && (
+                                            <FolderPlus className="h-4 w-4 text-primary flex-shrink-0" />
                                         )}
                                         {isSecureItem(file) && (
                                             <Lock className="h-4 w-4 text-sky-400 flex-shrink-0" />
@@ -1687,12 +3592,47 @@ export function FilesContent() {
                                     <div className="sm:col-span-1 flex justify-end flex-shrink-0">
                                         <DropdownMenu>
                                             <DropdownMenuTrigger asChild>
-                                                <Button variant="ghost" size="icon" className="h-8 w-8">
+                                                <Button
+                                                    variant="ghost"
+                                                    size="icon"
+                                                    className="h-8 w-8"
+                                                    onClick={(event) => event.stopPropagation()}
+                                                >
                                                     <MoreVertical className="h-4 w-4" />
                                                 </Button>
                                             </DropdownMenuTrigger>
                                             <DropdownMenuContent align="end">
-                                                {file.type === "folder" ? (
+                                                {isShortcut ? (
+                                                    <>
+                                                        <DropdownMenuItem onClick={() => handleFileClick(file)}>
+                                                            {file.type === "folder" ? (
+                                                                <FolderOpen className="h-4 w-4 mr-2" />
+                                                            ) : (
+                                                                <Eye className="h-4 w-4 mr-2" />
+                                                            )}
+                                                            {file.type === "folder" ? "Open shared folder" : "Preview"}
+                                                        </DropdownMenuItem>
+                                                        <DropdownMenuItem
+                                                            onClick={() => handleDownload(file)}
+                                                            disabled={file.share_allow_download === 0}
+                                                        >
+                                                            <Download className="h-4 w-4 mr-2" />
+                                                            {file.type === "folder" ? "Download ZIP" : "Download"}
+                                                        </DropdownMenuItem>
+                                                        <DropdownMenuItem onClick={() => setDetailFile(file)}>
+                                                            <Info className="h-4 w-4 mr-2" />
+                                                            Details
+                                                        </DropdownMenuItem>
+                                                        <DropdownMenuSeparator />
+                                                        <DropdownMenuItem
+                                                            className="text-destructive"
+                                                            onClick={() => handleRemoveShortcut(file)}
+                                                        >
+                                                            <Trash2 className="h-4 w-4 mr-2" />
+                                                            Remove shortcut
+                                                        </DropdownMenuItem>
+                                                    </>
+                                                ) : file.type === "folder" ? (
                                                     <>
                                                         <DropdownMenuItem onClick={() => handleFileClick(file)}>
                                                             <FolderOpen className="h-4 w-4 mr-2" />
@@ -1725,44 +3665,61 @@ export function FilesContent() {
                                                             <Download className="h-4 w-4 mr-2" />
                                                             Download
                                                         </DropdownMenuItem>
+                                                        <DropdownMenuItem onClick={() => openVersionHistory(file)}>
+                                                            <History className="h-4 w-4 mr-2" />
+                                                            Version history
+                                                        </DropdownMenuItem>
                                                     </>
                                                 )}
-                                                <DropdownMenuItem onClick={() => openRenameDialog(file)}>
-                                                    <Pencil className="h-4 w-4 mr-2" />
-                                                    Rename
-                                                </DropdownMenuItem>
-                                                <DropdownMenuItem onClick={() => openLocationDialog(file, "move")}>
-                                                    <Scissors className="h-4 w-4 mr-2" />
-                                                    Move
-                                                </DropdownMenuItem>
-                                                <DropdownMenuItem onClick={() => openLocationDialog(file, "copy")}>
-                                                    <Copy className="h-4 w-4 mr-2" />
-                                                    Copy
-                                                </DropdownMenuItem>
-                                                <DropdownMenuItem onClick={() => handleToggleStar(file)}>
-                                                    <Star className="h-4 w-4 mr-2" />
-                                                    {file.starred ? "Unstar" : "Star"}
-                                                </DropdownMenuItem>
-                                                <DropdownMenuItem onClick={() => handleShare(file)}>
-                                                    <Link2 className="h-4 w-4 mr-2" />
-                                                    Share
-                                                </DropdownMenuItem>
-                                                <DropdownMenuItem onClick={() => setDetailFile(file)}>
-                                                    <Info className="h-4 w-4 mr-2" />
-                                                    Details
-                                                </DropdownMenuItem>
-                                                <DropdownMenuSeparator />
-                                                <DropdownMenuItem
-                                                    className="text-destructive"
-                                                    onClick={() => openDeleteDialog(file)}
-                                                >
-                                                    <Trash2 className="h-4 w-4 mr-2" />
-                                                    Delete
-                                                </DropdownMenuItem>
+                                                {!isShortcut && (
+                                                    <>
+                                                        <DropdownMenuItem onClick={() => openRenameDialog(file)}>
+                                                            <Pencil className="h-4 w-4 mr-2" />
+                                                            Rename
+                                                        </DropdownMenuItem>
+                                                        <DropdownMenuItem onClick={() => openLocationDialog(file, "move")}>
+                                                            <Scissors className="h-4 w-4 mr-2" />
+                                                            Move
+                                                        </DropdownMenuItem>
+                                                        <DropdownMenuItem onClick={() => openLocationDialog(file, "copy")}>
+                                                            <Copy className="h-4 w-4 mr-2" />
+                                                            Copy
+                                                        </DropdownMenuItem>
+                                                        <DropdownMenuItem onClick={() => handleDuplicate(file)}>
+                                                            <Copy className="h-4 w-4 mr-2" />
+                                                            Duplicate
+                                                        </DropdownMenuItem>
+                                                        <DropdownMenuItem onClick={() => handleToggleStar(file)}>
+                                                            <Star className="h-4 w-4 mr-2" />
+                                                            {file.starred ? "Unstar" : "Star"}
+                                                        </DropdownMenuItem>
+                                                        <DropdownMenuItem onClick={() => handleShare(file)}>
+                                                            <Link2 className="h-4 w-4 mr-2" />
+                                                            Share
+                                                        </DropdownMenuItem>
+                                                        <DropdownMenuItem onClick={() => setDetailFile(file)}>
+                                                            <Info className="h-4 w-4 mr-2" />
+                                                            Details
+                                                        </DropdownMenuItem>
+                                                        <DropdownMenuSeparator />
+                                                        <DropdownMenuItem
+                                                            className="text-destructive"
+                                                            onClick={() => openDeleteDialog(file)}
+                                                        >
+                                                            <Trash2 className="h-4 w-4 mr-2" />
+                                                            Delete
+                                                        </DropdownMenuItem>
+                                                    </>
+                                                )}
                                             </DropdownMenuContent>
                                         </DropdownMenu>
                                     </div>
-                                </div>
+                                        </div>
+                                    </ContextMenuTrigger>
+                                    <ContextMenuContent className="w-56">
+                                        {renderFileContextMenuItems(file)}
+                                    </ContextMenuContent>
+                                </ContextMenu>
                             )
                         })}
                     </CardContent>
@@ -1770,7 +3727,7 @@ export function FilesContent() {
             )}
 
             <Dialog open={showSecureVaultDialog} onOpenChange={setShowSecureVaultDialog}>
-                <DialogContent>
+                <DialogContent className="max-h-[90vh] max-w-[calc(100vw-2rem)] overflow-y-auto sm:max-w-md">
                     <DialogHeader>
                         <DialogTitle>Create Secure Vault</DialogTitle>
                     </DialogHeader>
@@ -1824,7 +3781,7 @@ export function FilesContent() {
             </Dialog>
 
             <Dialog open={showUnlockVaultDialog} onOpenChange={setShowUnlockVaultDialog}>
-                <DialogContent>
+                <DialogContent className="max-h-[90vh] max-w-[calc(100vw-2rem)] overflow-y-auto sm:max-w-md">
                     <DialogHeader>
                         <DialogTitle>Unlock Secure Vault</DialogTitle>
                     </DialogHeader>
@@ -1857,7 +3814,7 @@ export function FilesContent() {
             </Dialog>
 
             <Dialog open={showChangePinDialog} onOpenChange={setShowChangePinDialog}>
-                <DialogContent>
+                <DialogContent className="max-h-[90vh] max-w-[calc(100vw-2rem)] overflow-y-auto sm:max-w-md">
                     <DialogHeader>
                         <DialogTitle>Change Vault PIN</DialogTitle>
                     </DialogHeader>
@@ -1910,7 +3867,7 @@ export function FilesContent() {
 
             {/* New Folder Dialog */}
             <Dialog open={showNewFolderDialog} onOpenChange={setShowNewFolderDialog}>
-                <DialogContent>
+                <DialogContent className="max-h-[90vh] max-w-[calc(100vw-2rem)] overflow-y-auto sm:max-w-md">
                     <DialogHeader>
                         <DialogTitle>{isInsideVault ? "Create Encrypted Folder" : "Create New Folder"}</DialogTitle>
                     </DialogHeader>
@@ -1943,13 +3900,14 @@ export function FilesContent() {
                     setShowLocationDialog(open)
                     if (!open) {
                         setLocationTarget(null)
+                        setLocationTargets([])
                         setDestinationFolders([])
                         setDestinationBreadcrumbs([])
                         setDestinationFolderId(null)
                     }
                 }}
             >
-                <DialogContent className="sm:max-w-lg">
+                <DialogContent className="max-h-[90vh] max-w-[calc(100vw-2rem)] overflow-y-auto sm:max-w-lg">
                     <DialogHeader>
                         <DialogTitle className="flex items-center gap-2">
                             {locationMode === "move" ? <Scissors className="h-5 w-5" /> : <Copy className="h-5 w-5" />}
@@ -1960,7 +3918,11 @@ export function FilesContent() {
                     <div className="space-y-4">
                         <div className="text-sm text-muted-foreground">
                             {locationMode === "move" ? "Moving" : "Copying"}{" "}
-                            <span className="font-medium text-foreground">"{locationTarget ? getDisplayName(locationTarget) : ""}"</span>
+                            <span className="font-medium text-foreground">
+                                {locationTargets.length > 1
+                                    ? `${locationTargets.length} items`
+                                    : `"${locationTargets[0] ? getDisplayName(locationTargets[0]) : locationTarget ? getDisplayName(locationTarget) : ""}"`}
+                            </span>
                         </div>
 
                         <div className="rounded-lg border border-border p-3 space-y-3">
@@ -2030,7 +3992,7 @@ export function FilesContent() {
                                 </div>
                             ) : (
                                 destinationFolders
-                                    .filter((folder) => folder.id !== locationTarget?.id)
+                                    .filter((folder) => !locationTargets.some((target) => target.id === folder.id) && folder.id !== locationTarget?.id)
                                     .map((folder) => (
                                             <Button
                                                 key={folder.id}
@@ -2071,7 +4033,7 @@ export function FilesContent() {
 
             {/* Rename Dialog */}
             <Dialog open={showRenameDialog} onOpenChange={setShowRenameDialog}>
-                <DialogContent>
+                <DialogContent className="max-h-[90vh] max-w-[calc(100vw-2rem)] overflow-y-auto sm:max-w-md">
                     <DialogHeader>
                         <DialogTitle>Rename {selectedItem?.type === "folder" ? "Folder" : "File"}</DialogTitle>
                     </DialogHeader>
@@ -2117,31 +4079,84 @@ export function FilesContent() {
             {/* File Preview Modal */}
             {previewFile && (
                 <div
-                    className="fixed inset-0 z-50 bg-black/90 flex items-center justify-center p-4"
+                    className="fixed inset-0 z-50 flex items-center justify-center overflow-hidden bg-black/90 p-2 sm:p-4"
                     onClick={() => closePreview()}
                     onKeyDown={(e) => e.key === 'Escape' && closePreview()}
                 >
-                    {/* Top bar */}
-                    <div className="absolute top-0 left-0 right-0 flex items-center justify-between p-4 z-10 bg-gradient-to-b from-black/60 to-transparent">
-                        <div className="flex items-center gap-3 min-w-0">
+                    <div className="absolute left-0 right-0 top-0 z-20 flex flex-col gap-3 bg-gradient-to-b from-black/80 to-transparent p-3 sm:flex-row sm:items-center sm:justify-between sm:p-4">
+                        <div className="flex min-w-0 items-center gap-3">
                             <FileIcon className="h-5 w-5 text-white/70 shrink-0" />
                             <div className="min-w-0">
                                 <p className="text-white text-sm font-medium truncate">{getDisplayName(previewFile)}</p>
-                                <p className="text-white/50 text-xs">{formatFileSize(previewFile.size)}</p>
+                                <p className="text-white/50 text-xs">
+                                    {formatFileSize(previewFile.size)}
+                                    {isTextPreviewFile(previewFile) && ` · ${getPreviewLanguageLabel(previewFile)}`}
+                                </p>
                             </div>
                         </div>
-                        <div className="flex items-center gap-2 shrink-0">
+                        <div className="flex flex-wrap items-center justify-end gap-2 shrink-0">
+                            {previewFile.type === "image" && (
+                                <div className="flex items-center gap-1 rounded-md bg-secondary/90 p-1">
+                                    <Button variant="ghost" size="icon" className="h-8 w-8" onClick={(e) => { e.stopPropagation(); zoomImage(-0.25) }}>
+                                        <ZoomOut className="h-4 w-4" />
+                                    </Button>
+                                    <span className="min-w-12 text-center text-xs font-medium text-secondary-foreground">
+                                        {Math.round(imageZoom * 100)}%
+                                    </span>
+                                    <Button variant="ghost" size="icon" className="h-8 w-8" onClick={(e) => { e.stopPropagation(); zoomImage(0.25) }}>
+                                        <ZoomIn className="h-4 w-4" />
+                                    </Button>
+                                    <Button variant="ghost" size="icon" className="h-8 w-8" onClick={(e) => { e.stopPropagation(); setImageRotation((value) => value - 90) }}>
+                                        <RotateCcw className="h-4 w-4" />
+                                    </Button>
+                                    <Button variant="ghost" size="icon" className="h-8 w-8" onClick={(e) => { e.stopPropagation(); setImageRotation((value) => value + 90) }}>
+                                        <RotateCw className="h-4 w-4" />
+                                    </Button>
+                                    <Button variant="ghost" size="sm" className="h-8 px-2 text-xs" onClick={(e) => { e.stopPropagation(); resetImagePreviewState() }}>
+                                        Reset
+                                    </Button>
+                                </div>
+                            )}
+                            {isTextPreviewFile(previewFile) && (
+                                <div className="flex items-center gap-1 rounded-md bg-secondary/90 p-1">
+                                    <Button
+                                        variant="ghost"
+                                        size="sm"
+                                        className="h-8 px-2 text-xs"
+                                        onClick={(e) => {
+                                            e.stopPropagation()
+                                            setPreviewTextWrap((value) => !value)
+                                        }}
+                                    >
+                                        {previewTextWrap ? "No wrap" : "Wrap"}
+                                    </Button>
+                                    <Button
+                                        variant="ghost"
+                                        size="sm"
+                                        className="h-8 gap-1 px-2 text-xs"
+                                        disabled={!previewTextContent}
+                                        onClick={(e) => {
+                                            e.stopPropagation()
+                                            copyPreviewText()
+                                        }}
+                                    >
+                                        {previewTextCopied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+                                        {previewTextCopied ? "Copied" : "Copy"}
+                                    </Button>
+                                </div>
+                            )}
                             <Button
                                 variant="secondary"
                                 size="sm"
                                 className="gap-2"
+                                disabled={isShareShortcut(previewFile) && previewFile.share_allow_download === 0}
                                 onClick={(e) => {
                                     e.stopPropagation()
                                     handleDownload(previewFile)
                                 }}
                             >
                                 <Download className="h-4 w-4" />
-                                Download
+                                <span className="hidden sm:inline">Download</span>
                             </Button>
                             <Button
                                 variant="secondary"
@@ -2154,54 +4169,131 @@ export function FilesContent() {
                         </div>
                     </div>
 
-                    {/* Preview content */}
-                    <div className="max-w-full max-h-[85vh] flex items-center justify-center" onClick={(e) => e.stopPropagation()}>
+                    <Button
+                        variant="secondary"
+                        size="icon"
+                        className="absolute left-2 top-1/2 z-20 h-10 w-10 -translate-y-1/2 rounded-full sm:left-4"
+                        disabled={!previewPreviousFile}
+                        onClick={(e) => {
+                            e.stopPropagation()
+                            navigatePreviewSibling(-1)
+                        }}
+                    >
+                        <ChevronLeft className="h-5 w-5" />
+                    </Button>
+                    <Button
+                        variant="secondary"
+                        size="icon"
+                        className="absolute right-2 top-1/2 z-20 h-10 w-10 -translate-y-1/2 rounded-full sm:right-4"
+                        disabled={!previewNextFile}
+                        onClick={(e) => {
+                            e.stopPropagation()
+                            navigatePreviewSibling(1)
+                        }}
+                    >
+                        <ChevronRight className="h-5 w-5" />
+                    </Button>
+
+                    <div className="flex max-h-[calc(100vh-7.5rem)] max-w-full items-center justify-center pt-24 sm:max-h-[calc(100vh-6rem)] sm:pt-14" onClick={(e) => e.stopPropagation()}>
                         {previewFile.type === 'image' && (
-                            <img
-                                src={getPreviewUrl(previewFile.id)}
-                                alt={getDisplayName(previewFile)}
-                                className="max-w-full max-h-[85vh] object-contain rounded-lg"
-                            />
-                        )}
-                        {previewFile.type === 'video' && (
-                            <video
-                                src={getPreviewUrl(previewFile.id)}
-                                controls
-                                autoPlay
-                                className="w-[90vw] max-h-[85vh] rounded-lg bg-black"
-                            />
-                        )}
-                        {previewFile.type === 'audio' && (
-                            <div className="bg-card rounded-2xl p-8 flex flex-col items-center gap-6 min-w-[320px]">
-                                <div className="w-24 h-24 rounded-full bg-primary/10 flex items-center justify-center">
-                                    <Music className="h-12 w-12 text-primary" />
-                                </div>
-                                <p className="text-card-foreground font-medium text-center">{getDisplayName(previewFile)}</p>
-                                <audio
-                                    src={getPreviewUrl(previewFile.id)}
-                                    controls
-                                    autoPlay
-                                    className="w-full"
+                            <div
+                                className={cn(
+                                    "flex h-[calc(100vh-8rem)] w-[94vw] touch-none items-center justify-center overflow-hidden rounded-lg sm:h-[calc(100vh-7rem)] sm:w-[90vw]",
+                                    imageZoom > 1 ? "cursor-grab active:cursor-grabbing" : "cursor-zoom-in"
+                                )}
+                                onClick={(e) => {
+                                    e.stopPropagation()
+                                    if (imageZoom === 1) updateImageZoom(1.75)
+                                }}
+                                onPointerDown={handleImagePointerDown}
+                                onPointerMove={handleImagePointerMove}
+                                onPointerUp={handleImagePointerUp}
+                                onPointerCancel={handleImagePointerUp}
+                                onWheel={handleImageWheel}
+                            >
+                                <img
+                                    src={getPreviewUrlForFile(previewFile)}
+                                    alt={getDisplayName(previewFile)}
+                                    className="max-h-full max-w-full select-none rounded-lg object-contain shadow-2xl"
+                                    draggable={false}
+                                    style={{
+                                        transform: `translate(${imagePan.x}px, ${imagePan.y}px) scale(${imageZoom}) rotate(${imageRotation}deg)`,
+                                        transition: isImagePanning ? "none" : "transform 120ms ease-out",
+                                    }}
                                 />
                             </div>
                         )}
-                        {previewFile.mime_type?.includes('pdf') && (
+                        {previewFile.type === 'video' && (
+                            <div className="flex w-[94vw] max-w-6xl flex-col overflow-hidden rounded-xl bg-card shadow-2xl sm:w-[88vw]">
+                                <video
+                                    src={getPreviewUrlForFile(previewFile)}
+                                    controls
+                                    preload="metadata"
+                                    className="max-h-[72vh] w-full bg-black"
+                                    ref={(element) => {
+                                        if (element) element.volume = 0.5
+                                    }}
+                                />
+                                <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border px-4 py-3 text-xs text-muted-foreground">
+                                    <span>Ready to play</span>
+                                    <span>Volume starts at 50%</span>
+                                </div>
+                            </div>
+                        )}
+                        {previewFile.type === 'audio' && (
+                            <div className="w-[90vw] max-w-[420px] bg-card rounded-2xl p-6 sm:p-8 flex flex-col items-center gap-6 shadow-2xl">
+                                <div className="flex h-28 w-28 items-center justify-center rounded-2xl bg-primary/10 shadow-inner">
+                                    <Music className="h-12 w-12 text-primary" />
+                                </div>
+                                <div className="text-center">
+                                    <p className="text-card-foreground font-medium break-words">{getDisplayName(previewFile)}</p>
+                                    <p className="mt-1 text-xs text-muted-foreground">Press play when you are ready · Volume 50%</p>
+                                </div>
+                                <audio
+                                    src={getPreviewUrlForFile(previewFile)}
+                                    controls
+                                    preload="metadata"
+                                    className="w-full"
+                                    ref={(element) => {
+                                        if (element) element.volume = 0.5
+                                    }}
+                                />
+                            </div>
+                        )}
+                        {isPdfPreviewFile(previewFile) && (
                             <div className="flex flex-col items-center gap-3">
                                 {pdfBlobUrl === null && (
-                                    <div className="bg-card rounded-2xl p-8 flex flex-col items-center gap-4 w-[400px]">
+                                    <div className="bg-card rounded-2xl p-8 flex flex-col items-center gap-4 w-[min(92vw,28rem)]">
                                         <Loader2 className="h-10 w-10 animate-spin text-primary" />
                                         <p className="text-card-foreground font-medium">Loading PDF...</p>
                                     </div>
                                 )}
                                 {pdfBlobUrl && pdfBlobUrl !== 'error' && (
-                                    <embed
-                                        src={pdfBlobUrl + '#toolbar=1&navpanes=0'}
+                                    <object
+                                        data={`${pdfBlobUrl}#toolbar=1&navpanes=0&view=FitH`}
                                         type="application/pdf"
-                                        className="w-[90vw] h-[80vh] max-w-4xl rounded-lg"
-                                    />
+                                        className="h-[72vh] w-[94vw] rounded-lg bg-card shadow-2xl sm:h-[80vh] sm:w-[90vw]"
+                                    >
+                                        <div className="flex h-full w-full flex-col items-center justify-center gap-3 rounded-lg bg-card p-6 text-center">
+                                            <FileIcon className="h-14 w-14 text-red-400" />
+                                            <p className="font-medium text-card-foreground">PDF preview unavailable</p>
+                                            <Button
+                                                variant="secondary"
+                                                size="sm"
+                                                className="gap-2"
+                                                onClick={(e) => {
+                                                    e.stopPropagation()
+                                                    window.open(getPreviewUrlForFile(previewFile), '_blank')
+                                                }}
+                                            >
+                                                <Maximize2 className="h-4 w-4" />
+                                                Open PDF
+                                            </Button>
+                                        </div>
+                                    </object>
                                 )}
                                 {pdfBlobUrl === 'error' && (
-                                    <div className="bg-card rounded-2xl p-8 flex flex-col items-center gap-4 w-[400px]">
+                                    <div className="bg-card rounded-2xl p-8 flex flex-col items-center gap-4 w-[min(92vw,28rem)]">
                                         <FileIcon className="h-16 w-16 text-red-400" />
                                         <p className="text-card-foreground font-medium text-center">{getDisplayName(previewFile)}</p>
                                         <p className="text-muted-foreground text-sm text-center">
@@ -2215,7 +4307,7 @@ export function FilesContent() {
                                     className="gap-2"
                                     onClick={(e) => {
                                         e.stopPropagation()
-                                        window.open(getPreviewUrl(previewFile.id), '_blank')
+                                        window.open(getPreviewUrlForFile(previewFile), '_blank')
                                     }}
                                 >
                                     <Maximize2 className="h-4 w-4" />
@@ -2223,19 +4315,61 @@ export function FilesContent() {
                                 </Button>
                             </div>
                         )}
-                        {previewFile.type === 'document' && !previewFile.mime_type?.includes('pdf') && (
-                            <div className="bg-card rounded-xl p-6 max-w-3xl w-[90vw] max-h-[85vh] overflow-auto">
-                                <pre className="text-sm text-card-foreground whitespace-pre-wrap font-mono leading-relaxed">
-                                    {previewTextContent ?? 'Loading...'}
-                                </pre>
+                        {isTextPreviewFile(previewFile) && (
+                            <div className="flex max-h-[78vh] w-[94vw] max-w-5xl flex-col overflow-hidden rounded-xl bg-card shadow-2xl sm:max-h-[80vh] sm:w-[90vw]">
+                                <div className="flex items-center justify-between gap-3 border-b border-border px-4 py-2 text-xs text-muted-foreground">
+                                    <span>{previewTextLines.length || 1} line{previewTextLines.length === 1 ? "" : "s"}</span>
+                                    <span>{previewTextWrap ? "Wrapped" : "No wrap"}</span>
+                                </div>
+                                <div className="overflow-auto">
+                                    {previewTextContent === null ? (
+                                        <div className="flex items-center justify-center gap-3 p-8 text-sm text-muted-foreground">
+                                            <Loader2 className="h-5 w-5 animate-spin text-primary" />
+                                            Loading text...
+                                        </div>
+                                    ) : (
+                                        <div className="min-w-full py-3 font-mono text-sm leading-6">
+                                            {previewTextLines.map((line, index) => (
+                                                <div
+                                                    key={index}
+                                                    className="grid min-w-full grid-cols-[3.5rem_minmax(0,1fr)] gap-3 px-4 hover:bg-secondary/50"
+                                                >
+                                                    <span className="select-none text-right text-xs text-muted-foreground/70">
+                                                        {index + 1}
+                                                    </span>
+                                                    <code className={cn(
+                                                        "text-card-foreground",
+                                                        previewTextWrap ? "whitespace-pre-wrap break-words" : "whitespace-pre"
+                                                    )}>
+                                                        {renderHighlightedLine(line, previewFile, index)}
+                                                    </code>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
                             </div>
                         )}
-                        {previewFile.type === 'archive' && (
-                            <div className="bg-card rounded-2xl p-8 flex flex-col items-center gap-4">
-                                <Archive className="h-16 w-16 text-amber-400" />
+                        {isUnsupportedPreviewFile(previewFile) && (
+                            <div className="w-[min(92vw,28rem)] bg-card rounded-2xl p-8 flex flex-col items-center gap-4 text-center shadow-2xl">
+                                {previewFile.type === "archive" ? (
+                                    <Archive className="h-16 w-16 text-amber-400" />
+                                ) : (
+                                    <FileIcon className="h-16 w-16 text-muted-foreground" />
+                                )}
                                 <p className="text-card-foreground font-medium">{getDisplayName(previewFile)}</p>
-                                <p className="text-muted-foreground text-sm">Archive files cannot be previewed</p>
-                                <Button onClick={(e) => { e.stopPropagation(); handleDownload(previewFile) }} className="gap-2">
+                                <p className="text-muted-foreground text-sm">
+                                    Preview unavailable for this file type
+                                </p>
+                                <div className="flex flex-wrap justify-center gap-2 text-xs text-muted-foreground">
+                                    <Badge variant="outline">{previewFile.type}</Badge>
+                                    <Badge variant="outline">{formatFileSize(previewFile.size)}</Badge>
+                                </div>
+                                <Button
+                                    disabled={isShareShortcut(previewFile) && previewFile.share_allow_download === 0}
+                                    onClick={(e) => { e.stopPropagation(); handleDownload(previewFile) }}
+                                    className="gap-2"
+                                >
                                     <Download className="h-4 w-4" />
                                     Download Instead
                                 </Button>
@@ -2250,13 +4384,19 @@ export function FilesContent() {
                 if (!open) {
                     setShareStatus(null)
                     setSelectedShareUsers([])
+                    setShareUserQuery("")
+                    setShareExpiry("")
+                    setShareFile(null)
+                    setShareFiles([])
                 }
             }}>
-                <DialogContent className="sm:max-w-md">
+                <DialogContent className="max-h-[90vh] max-w-[calc(100vw-2rem)] overflow-y-auto sm:max-w-md">
                     <DialogHeader>
                         <DialogTitle className="flex items-center gap-2">
                             <Users className="h-5 w-5" />
-                            Share "{shareFile ? getDisplayName(shareFile) : ""}"
+                            {shareFiles.length > 1
+                                ? `Share ${shareFiles.length} items`
+                                : `Share "${shareFile ? getDisplayName(shareFile) : ""}"`}
                         </DialogTitle>
                     </DialogHeader>
 
@@ -2277,70 +4417,328 @@ export function FilesContent() {
                         </div>
                     )}
 
-                    {/* User list */}
-                    <div className="space-y-1 max-h-60 overflow-y-auto">
-                        {shareLoading ? (
-                            <div className="flex items-center justify-center py-8">
-                                <Loader2 className="h-6 w-6 animate-spin text-primary" />
-                            </div>
-                        ) : shareUsers.length === 0 ? (
-                            <div className="text-center py-8 text-muted-foreground">
-                                <Users className="h-10 w-10 mx-auto mb-2 opacity-50" />
-                                <p>No other users found</p>
-                                <p className="text-xs mt-1">Create more users from the Admin panel</p>
-                            </div>
-                        ) : (
-                            shareUsers.map((user) => (
-                                <div
-                                    key={user.id}
-                                    className={cn(
-                                        "flex items-center gap-3 p-3 rounded-lg cursor-pointer transition-colors",
-                                        selectedShareUsers.includes(user.id)
-                                            ? "bg-primary/10 border border-primary/20"
-                                            : "hover:bg-secondary"
-                                    )}
-                                    onClick={() => toggleShareUser(user.id)}
-                                >
-                                    <Checkbox
-                                        checked={selectedShareUsers.includes(user.id)}
-                                        onCheckedChange={() => toggleShareUser(user.id)}
-                                        className="shrink-0"
-                                    />
-                                    <div className="h-9 w-9 rounded-full bg-primary/10 flex items-center justify-center text-primary font-medium text-sm shrink-0">
-                                        {user.username.charAt(0).toUpperCase()}
+                    <div className="space-y-4">
+                        <div className="space-y-2">
+                            <Label htmlFor="sharePeople">People</Label>
+                            <Input
+                                id="sharePeople"
+                                value={shareUserQuery}
+                                onChange={(e) => setShareUserQuery(e.target.value)}
+                                placeholder="Search username or email"
+                            />
+                            <div className="space-y-1 max-h-44 overflow-y-auto rounded-md border border-border p-1">
+                                {shareLoading ? (
+                                    <div className="flex items-center justify-center py-8">
+                                        <Loader2 className="h-6 w-6 animate-spin text-primary" />
                                     </div>
-                                    <div className="min-w-0">
-                                        <p className="text-sm font-medium">{user.username}</p>
+                                ) : shareUsers.length === 0 ? (
+                                    <div className="text-center py-8 text-muted-foreground">
+                                        <Users className="h-10 w-10 mx-auto mb-2 opacity-50" />
+                                        <p>No other users found</p>
+                                        <p className="text-xs mt-1">Create more users from the Admin panel</p>
                                     </div>
-                                </div>
-                            ))
-                        )}
+                                ) : filteredShareUsers.length === 0 ? (
+                                    <div className="px-3 py-6 text-center text-sm text-muted-foreground">
+                                        No matching users
+                                    </div>
+                                ) : (
+                                    filteredShareUsers.map((user) => (
+                                        <div
+                                            key={user.id}
+                                            className={cn(
+                                                "flex items-center gap-3 p-2.5 rounded-md cursor-pointer transition-colors",
+                                                selectedShareUsers.includes(user.id)
+                                                    ? "bg-primary/10 border border-primary/20"
+                                                    : "hover:bg-secondary"
+                                            )}
+                                            onClick={() => toggleShareUser(user.id)}
+                                        >
+                                            <Checkbox
+                                                checked={selectedShareUsers.includes(user.id)}
+                                                onCheckedChange={() => toggleShareUser(user.id)}
+                                                className="shrink-0"
+                                            />
+                                            <div className="h-8 w-8 rounded-full bg-primary/10 flex items-center justify-center text-primary font-medium text-xs shrink-0">
+                                                {user.username.charAt(0).toUpperCase()}
+                                            </div>
+                                            <div className="min-w-0">
+                                                <p className="text-sm font-medium truncate">{user.username}</p>
+                                                {user.email && (
+                                                    <p className="text-xs text-muted-foreground truncate">{user.email}</p>
+                                                )}
+                                            </div>
+                                        </div>
+                                    ))
+                                )}
+                            </div>
+                        </div>
+
+                        <div className="grid gap-3 sm:grid-cols-2">
+                            <div className="space-y-2">
+                                <Label>Permission</Label>
+                                <Select value={sharePermission} onValueChange={(value) => setSharePermission(value as SharePermission)}>
+                                    <SelectTrigger className="w-full">
+                                        <SelectValue />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                        <SelectItem value="view">View only</SelectItem>
+                                        <SelectItem value="comment">Can comment</SelectItem>
+                                        <SelectItem value="edit">Can edit/download</SelectItem>
+                                        {shareFiles.length === 1 && shareFile?.type === "folder" && <SelectItem value="upload">Upload only</SelectItem>}
+                                    </SelectContent>
+                                </Select>
+                            </div>
+                            <div className="space-y-2">
+                                <Label htmlFor="shareExpiry">Expiry</Label>
+                                <Input
+                                    id="shareExpiry"
+                                    type="datetime-local"
+                                    value={shareExpiry}
+                                    onChange={(e) => setShareExpiry(e.target.value)}
+                                />
+                            </div>
+                        </div>
+
+                        <div className="flex items-center justify-between rounded-md border border-border p-3">
+                            <div>
+                                <Label htmlFor="shareDownload" className="text-sm">Allow downloads</Label>
+                                <p className="text-xs text-muted-foreground">Recipients can save a copy.</p>
+                            </div>
+                            <Switch
+                                id="shareDownload"
+                                checked={allowShareDownload}
+                                onCheckedChange={setAllowShareDownload}
+                            />
+                        </div>
+
+                        <div className="rounded-md border border-border bg-secondary/40 p-3 text-xs text-muted-foreground">
+                            Sharing is limited to CloudPi users on your private network.
+                        </div>
                     </div>
 
-                    {/* Share button */}
-                    {shareUsers.length > 0 && (
-                        <DialogFooter>
-                            <Button
-                                onClick={handleShareWithSelected}
-                                disabled={selectedShareUsers.length === 0 || isSharing}
-                                className="w-full gap-2"
-                            >
-                                {isSharing ? (
-                                    <Loader2 className="h-4 w-4 animate-spin" />
-                                ) : (
-                                    <Link2 className="h-4 w-4" />
-                                )}
-                                {isSharing
-                                    ? "Sharing..."
-                                    : selectedShareUsers.length === 0
-                                        ? "Select users to share"
-                                        : `Share with ${selectedShareUsers.length} user${selectedShareUsers.length > 1 ? 's' : ''}`
-                                }
-                            </Button>
-                        </DialogFooter>
-                    )}
+                    <DialogFooter>
+                        <Button
+                            onClick={handleShareWithSelected}
+                            disabled={selectedShareUsers.length === 0 || isSharing}
+                            className="w-full gap-2"
+                        >
+                            {isSharing ? (
+                                <Loader2 className="h-4 w-4 animate-spin" />
+                            ) : (
+                                <Link2 className="h-4 w-4" />
+                            )}
+                            {isSharing
+                                ? "Sharing..."
+                                : selectedShareUsers.length === 0
+                                    ? "Choose people to share"
+                                    : "Save Share"
+                            }
+                        </Button>
+                    </DialogFooter>
                 </DialogContent>
             </Dialog>
+
+            <Dialog open={showKeyboardHelp} onOpenChange={setShowKeyboardHelp}>
+                <DialogContent className="max-h-[90vh] max-w-[calc(100vw-2rem)] overflow-y-auto sm:max-w-lg">
+                    <DialogHeader>
+                        <DialogTitle className="flex items-center gap-2">
+                            <Keyboard className="h-5 w-5" />
+                            Keyboard Shortcuts
+                        </DialogTitle>
+                    </DialogHeader>
+                    <div className="grid gap-2 py-2 text-sm">
+                        {[
+                            ["Enter", "Open selected item"],
+                            ["Backspace", "Go up one folder"],
+                            ["Alt + Left", "Go up one folder"],
+                            ["F2", "Rename selected item"],
+                            ["Delete", "Move selected item to trash"],
+                            ["Ctrl/Cmd + A", "Select all visible items"],
+                            ["Ctrl/Cmd + U", "Upload files"],
+                            ["Esc", "Close preview or clear selection"],
+                            ["Left / Right", "Previous or next file while previewing"],
+                            ["?", "Show this reference"],
+                        ].map(([shortcut, action]) => (
+                            <div key={shortcut} className="flex items-center justify-between gap-4 rounded-md border border-border px-3 py-2">
+                                <kbd className="shrink-0 rounded border border-border bg-secondary px-2 py-1 text-xs font-medium text-secondary-foreground">
+                                    {shortcut}
+                                </kbd>
+                                <span className="text-right text-muted-foreground">{action}</span>
+                            </div>
+                        ))}
+                    </div>
+                </DialogContent>
+            </Dialog>
+
+            {/* Version History */}
+            <Sheet
+                open={Boolean(versionFile)}
+                onOpenChange={(open) => {
+                    if (!open) closeVersionHistory()
+                }}
+            >
+                <SheetContent className="w-full gap-0 p-0 sm:max-w-lg">
+                    <SheetHeader className="border-b border-border pr-12">
+                        <SheetTitle className="flex items-center gap-2">
+                            <History className="h-5 w-5" />
+                            Version History
+                        </SheetTitle>
+                        <SheetDescription className="truncate">
+                            {versionFile ? getDisplayName(versionFile) : ""}
+                        </SheetDescription>
+                    </SheetHeader>
+
+                    <div className="flex-1 overflow-y-auto p-4">
+                        {versionFile && (
+                            <div className="space-y-4">
+                                <div className="rounded-lg border border-border bg-card p-4">
+                                    <div className="flex items-start justify-between gap-3">
+                                        <div className="min-w-0">
+                                            <p className="text-sm font-semibold text-card-foreground">Current version</p>
+                                            <p className="text-xs text-muted-foreground">
+                                                v{versionHistory?.currentVersion ?? getVersionNumber(versionFile)} · {formatFileSize(versionFile.size)}
+                                            </p>
+                                        </div>
+                                        <Badge className="shrink-0">Live</Badge>
+                                    </div>
+                                    <div className="mt-3 grid grid-cols-2 gap-3 text-xs">
+                                        <div>
+                                            <p className="text-muted-foreground">Modified</p>
+                                            <p className="text-card-foreground">{new Date(versionFile.modified_at).toLocaleString()}</p>
+                                        </div>
+                                        <div>
+                                            <p className="text-muted-foreground">History storage</p>
+                                            <p className="text-card-foreground">{formatFileSize(versionHistory?.versionStorageBytes ?? 0)}</p>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {versionLoading && (
+                                    <div className="flex items-center justify-center py-12">
+                                        <Loader2 className="h-6 w-6 animate-spin text-primary" />
+                                    </div>
+                                )}
+
+                                {versionError && !versionLoading && (
+                                    <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4">
+                                        <div className="flex items-start gap-3">
+                                            <AlertCircle className="h-5 w-5 shrink-0 text-destructive" />
+                                            <div className="min-w-0">
+                                                <p className="text-sm font-medium text-destructive">{versionError}</p>
+                                                <Button
+                                                    variant="outline"
+                                                    size="sm"
+                                                    className="mt-3 gap-2"
+                                                    onClick={() => loadVersionHistory(versionFile.id)}
+                                                >
+                                                    <RefreshCw className="h-3.5 w-3.5" />
+                                                    Retry
+                                                </Button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+
+                                {!versionLoading && !versionError && versionHistory?.versions.length === 0 && (
+                                    <div className="rounded-lg border border-dashed border-border p-8 text-center">
+                                        <History className="mx-auto h-10 w-10 text-muted-foreground" />
+                                        <p className="mt-3 text-sm font-medium text-card-foreground">No archived versions</p>
+                                    </div>
+                                )}
+
+                                {!versionLoading && !versionError && versionHistory && versionHistory.versions.length > 0 && (
+                                    <div className="space-y-3">
+                                        {versionHistory.versions.map((version) => (
+                                            <div key={version.id} className="rounded-lg border border-border bg-card p-4">
+                                                <div className="flex items-start justify-between gap-3">
+                                                    <div className="min-w-0">
+                                                        <p className="text-sm font-semibold text-card-foreground">Version {version.version_number}</p>
+                                                        <p className="text-xs text-muted-foreground">{new Date(version.archived_at).toLocaleString()}</p>
+                                                    </div>
+                                                    <Badge variant="outline" className="shrink-0">
+                                                        {formatFileSize(version.size)}
+                                                    </Badge>
+                                                </div>
+                                                <div className="mt-3 grid grid-cols-2 gap-3 text-xs">
+                                                    <div>
+                                                        <p className="text-muted-foreground">Type</p>
+                                                        <p className="text-card-foreground capitalize">{version.type}</p>
+                                                    </div>
+                                                    <div>
+                                                        <p className="text-muted-foreground">MIME</p>
+                                                        <p className="truncate text-card-foreground">{version.mime_type || "—"}</p>
+                                                    </div>
+                                                </div>
+                                                {version.integrity_failed ? (
+                                                    <div className="mt-3 flex items-center gap-2 rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                                                        <ShieldAlert className="h-3.5 w-3.5" />
+                                                        Integrity check failed
+                                                    </div>
+                                                ) : null}
+                                                <div className="mt-4 flex justify-end gap-2">
+                                                    <Button
+                                                        variant="outline"
+                                                        size="sm"
+                                                        className="gap-2"
+                                                        onClick={() => setVersionAction({ type: "restore", version })}
+                                                    >
+                                                        <RotateCcw className="h-3.5 w-3.5" />
+                                                        Restore
+                                                    </Button>
+                                                    <Button
+                                                        variant="outline"
+                                                        size="sm"
+                                                        className="gap-2 text-destructive"
+                                                        onClick={() => setVersionAction({ type: "delete", version })}
+                                                    >
+                                                        <Trash2 className="h-3.5 w-3.5" />
+                                                        Delete
+                                                    </Button>
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
+                            </div>
+                        )}
+                    </div>
+                </SheetContent>
+            </Sheet>
+
+            <AlertDialog open={Boolean(versionAction)} onOpenChange={(open) => {
+                if (!open && !versionActionBusy) setVersionAction(null)
+            }}>
+                <AlertDialogContent>
+                    <AlertDialogHeader>
+                        <AlertDialogTitle>
+                            {versionAction?.type === "restore"
+                                ? `Restore version ${versionAction.version.version_number}?`
+                                : `Delete version ${versionAction?.version.version_number}?`}
+                        </AlertDialogTitle>
+                        <AlertDialogDescription>
+                            {versionAction?.type === "restore"
+                                ? "The current live file will be archived first, then this version becomes current."
+                                : "This removes the archived file data from storage and cannot be undone."}
+                        </AlertDialogDescription>
+                    </AlertDialogHeader>
+                    <AlertDialogFooter>
+                        <AlertDialogCancel disabled={versionActionBusy}>Cancel</AlertDialogCancel>
+                        <AlertDialogAction
+                            onClick={(event) => {
+                                event.preventDefault()
+                                handleVersionAction()
+                            }}
+                            disabled={versionActionBusy}
+                            className={cn(
+                                versionAction?.type === "delete" && "bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                            )}
+                        >
+                            {versionActionBusy && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                            {versionAction?.type === "restore" ? "Restore" : "Delete"}
+                        </AlertDialogAction>
+                    </AlertDialogFooter>
+                </AlertDialogContent>
+            </AlertDialog>
 
             {/* File Details Sidebar */}
             {detailFile && (
@@ -2364,7 +4762,7 @@ export function FilesContent() {
                                 {detailFile.type === "image" && !isSecureItem(detailFile) ? (
                                     <div className="w-32 h-32 rounded-lg overflow-hidden bg-secondary">
                                         <img
-                                            src={getPreviewUrl(detailFile.id)}
+                                            src={isShareShortcut(detailFile) ? getShareShortcutPreviewUrl(detailFile) : getPreviewUrl(detailFile.id)}
                                             alt={getDisplayName(detailFile)}
                                             className="w-full h-full object-cover"
                                             onError={(e) => {
@@ -2382,10 +4780,30 @@ export function FilesContent() {
                                     </div>
                                 )}
                                 <p className="text-sm font-semibold text-card-foreground break-all">{getDisplayName(detailFile)}</p>
+                                {isShareShortcut(detailFile) && (
+                                    <Badge variant="outline" className="gap-1">
+                                        <FolderPlus className="h-3 w-3" />
+                                        Shared shortcut
+                                    </Badge>
+                                )}
                             </div>
 
                             {/* Metadata grid */}
                             <div className="space-y-3">
+                                {isShareShortcut(detailFile) && (
+                                    <div className="flex items-start gap-3 p-3 rounded-lg bg-secondary">
+                                        <Users className="h-4 w-4 text-muted-foreground mt-0.5 shrink-0" />
+                                        <div>
+                                            <p className="text-xs text-muted-foreground">Shared by</p>
+                                            <p className="text-sm text-card-foreground">{detailFile.shared_by_name || "Another user"}</p>
+                                            <p className="text-xs text-muted-foreground mt-0.5 capitalize">
+                                                {detailFile.share_permission || "view"} access
+                                                {detailFile.share_allow_download === 0 ? " · downloads disabled" : ""}
+                                            </p>
+                                        </div>
+                                    </div>
+                                )}
+
                                 <div className="flex items-start gap-3 p-3 rounded-lg bg-secondary">
                                     <FileIcon className="h-4 w-4 text-muted-foreground mt-0.5 shrink-0" />
                                     <div>
@@ -2407,6 +4825,16 @@ export function FilesContent() {
                                         )}
                                     </div>
                                 </div>
+
+                                {canShowVersions(detailFile) && (
+                                    <div className="flex items-start gap-3 p-3 rounded-lg bg-secondary">
+                                        <History className="h-4 w-4 text-muted-foreground mt-0.5 shrink-0" />
+                                        <div>
+                                            <p className="text-xs text-muted-foreground">Version</p>
+                                            <p className="text-sm text-card-foreground">v{getVersionNumber(detailFile)}</p>
+                                        </div>
+                                    </div>
+                                )}
 
                                 <div className="flex items-start gap-3 p-3 rounded-lg bg-secondary">
                                     <Calendar className="h-4 w-4 text-muted-foreground mt-0.5 shrink-0" />
@@ -2442,32 +4870,76 @@ export function FilesContent() {
                             <div className="space-y-2 pt-2 border-t border-border">
                                 <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider">Actions</p>
                                 <div className="flex flex-wrap gap-2">
-                                    {detailFile.type !== "folder" && (
-                                        <Button variant="outline" size="sm" className="gap-2" onClick={() => { handleDownload(detailFile); }}>
-                                            <Download className="h-3.5 w-3.5" />
-                                            Download
-                                        </Button>
+                                    {isShareShortcut(detailFile) ? (
+                                        <>
+                                            <Button variant="outline" size="sm" className="gap-2" onClick={() => { setDetailFile(null); handleFileClick(detailFile); }}>
+                                                {detailFile.type === "folder" ? (
+                                                    <FolderOpen className="h-3.5 w-3.5" />
+                                                ) : (
+                                                    <Eye className="h-3.5 w-3.5" />
+                                                )}
+                                                {detailFile.type === "folder" ? "Open" : "Preview"}
+                                            </Button>
+                                            <Button
+                                                variant="outline"
+                                                size="sm"
+                                                className="gap-2"
+                                                disabled={detailFile.share_allow_download === 0}
+                                                onClick={() => { handleDownload(detailFile); }}
+                                            >
+                                                <Download className="h-3.5 w-3.5" />
+                                                {detailFile.type === "folder" ? "Download ZIP" : "Download"}
+                                            </Button>
+                                            <Button
+                                                variant="outline"
+                                                size="sm"
+                                                className="gap-2 text-destructive"
+                                                onClick={() => { handleRemoveShortcut(detailFile); }}
+                                            >
+                                                <Trash2 className="h-3.5 w-3.5" />
+                                                Remove shortcut
+                                            </Button>
+                                        </>
+                                    ) : (
+                                        <>
+                                            {detailFile.type !== "folder" && (
+                                                <Button variant="outline" size="sm" className="gap-2" onClick={() => { handleDownload(detailFile); }}>
+                                                    <Download className="h-3.5 w-3.5" />
+                                                    Download
+                                                </Button>
+                                            )}
+                                            <Button variant="outline" size="sm" className="gap-2" onClick={() => { setDetailFile(null); openRenameDialog(detailFile); }}>
+                                                <Pencil className="h-3.5 w-3.5" />
+                                                Rename
+                                            </Button>
+                                            <Button variant="outline" size="sm" className="gap-2" onClick={() => { setDetailFile(null); openLocationDialog(detailFile, "move"); }}>
+                                                <Scissors className="h-3.5 w-3.5" />
+                                                Move
+                                            </Button>
+                                            <Button variant="outline" size="sm" className="gap-2" onClick={() => { setDetailFile(null); openLocationDialog(detailFile, "copy"); }}>
+                                                <Copy className="h-3.5 w-3.5" />
+                                                Copy
+                                            </Button>
+                                            <Button variant="outline" size="sm" className="gap-2" onClick={() => { setDetailFile(null); handleDuplicate(detailFile); }}>
+                                                <Copy className="h-3.5 w-3.5" />
+                                                Duplicate
+                                            </Button>
+                                            <Button variant="outline" size="sm" className="gap-2" onClick={() => { setDetailFile(null); handleShare(detailFile); }}>
+                                                <Link2 className="h-3.5 w-3.5" />
+                                                Share
+                                            </Button>
+                                            {canShowVersions(detailFile) && (
+                                                <Button variant="outline" size="sm" className="gap-2" onClick={() => openVersionHistory(detailFile)}>
+                                                    <History className="h-3.5 w-3.5" />
+                                                    Versions
+                                                </Button>
+                                            )}
+                                            <Button variant="outline" size="sm" className="gap-2 text-destructive" onClick={() => { setDetailFile(null); openDeleteDialog(detailFile); }}>
+                                                <Trash2 className="h-3.5 w-3.5" />
+                                                Delete
+                                            </Button>
+                                        </>
                                     )}
-                                    <Button variant="outline" size="sm" className="gap-2" onClick={() => { setDetailFile(null); openRenameDialog(detailFile); }}>
-                                        <Pencil className="h-3.5 w-3.5" />
-                                        Rename
-                                    </Button>
-                                    <Button variant="outline" size="sm" className="gap-2" onClick={() => { setDetailFile(null); openLocationDialog(detailFile, "move"); }}>
-                                        <Scissors className="h-3.5 w-3.5" />
-                                        Move
-                                    </Button>
-                                    <Button variant="outline" size="sm" className="gap-2" onClick={() => { setDetailFile(null); openLocationDialog(detailFile, "copy"); }}>
-                                        <Copy className="h-3.5 w-3.5" />
-                                        Copy
-                                    </Button>
-                                    <Button variant="outline" size="sm" className="gap-2" onClick={() => { setDetailFile(null); handleShare(detailFile); }}>
-                                        <Link2 className="h-3.5 w-3.5" />
-                                        Share
-                                    </Button>
-                                    <Button variant="outline" size="sm" className="gap-2 text-destructive" onClick={() => { setDetailFile(null); openDeleteDialog(detailFile); }}>
-                                        <Trash2 className="h-3.5 w-3.5" />
-                                        Delete
-                                    </Button>
                                 </div>
                             </div>
                         </div>

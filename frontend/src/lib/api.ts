@@ -359,13 +359,16 @@ export async function unlockUser(
 export interface FileItem {
     id: number;
     name: string;
-    type: 'folder' | 'document' | 'image' | 'video' | 'audio' | 'archive';
+    type: 'folder' | 'document' | 'image' | 'video' | 'audio' | 'archive' | 'other';
     size: number;
     mime_type: string | null;
     parent_id: number | null;
     starred: number;
     created_at: string;
     modified_at: string;
+    accessed_at?: string | null;
+    recent_at?: string;
+    recent_action?: 'uploaded' | 'modified' | 'viewed';
     trashed_at?: string;
     is_accessible?: boolean | number;  // from JOIN with storage_sources
     storage_source_id?: string;
@@ -376,6 +379,38 @@ export interface FileItem {
     chunk_count?: number;
     vault_root_id?: number | null;
     is_secure_vault?: number | boolean;
+    version_number?: number;
+    shared_count?: number;
+    public_share_count?: number;
+    is_share_shortcut?: number | boolean;
+    shortcut_id?: number;
+    share_id?: number;
+    target_file_id?: number;
+    share_permission?: SharePermission;
+    share_allow_download?: number;
+    share_expires_at?: string | null;
+    shared_by_name?: string;
+    location?: string;
+}
+
+export interface FileVersion {
+    id: number;
+    file_id: number;
+    version_number: number;
+    type: FileItem['type'];
+    size: number;
+    mime_type: string | null;
+    sha256_hash: string | null;
+    encrypted: number;
+    integrity_failed: number;
+    archived_at: string;
+}
+
+export interface FileVersionsResponse {
+    fileId: number;
+    currentVersion: number;
+    versionStorageBytes: number;
+    versions: FileVersion[];
 }
 
 export interface Breadcrumb {
@@ -396,6 +431,7 @@ export interface FilesResponse {
 export interface StorageStats {
     totalBytes: number;
     usedBytes: number;
+    versionBytes?: number;
 }
 
 // List files in a folder
@@ -419,9 +455,15 @@ export async function getRecentFiles(): Promise<{ files: FileItem[] }> {
     return apiRequest<{ files: FileItem[] }>('/files/recent');
 }
 
+export interface TrashResponse {
+    files: FileItem[];
+    retentionDays: number;
+    purged?: EmptyTrashResponse;
+}
+
 // List trash
-export async function getTrash(): Promise<{ files: FileItem[] }> {
-    return apiRequest<{ files: FileItem[] }>('/files/trash');
+export async function getTrash(): Promise<TrashResponse> {
+    return apiRequest<TrashResponse>('/files/trash');
 }
 
 // Search across all files
@@ -429,8 +471,30 @@ export interface SearchResult extends FileItem {
     location: string; // breadcrumb path like "Documents / Work"
 }
 
-export async function searchFiles(query: string): Promise<{ files: SearchResult[]; query: string }> {
-    return apiRequest<{ files: SearchResult[]; query: string }>(`/files/search?q=${encodeURIComponent(query)}`);
+export interface SearchFilters {
+    type?: string;
+    starred?: boolean;
+    shared?: boolean;
+    minSize?: number | null;
+    maxSize?: number | null;
+    modifiedAfter?: string;
+    modifiedBefore?: string;
+    sort?: 'relevance' | 'name' | 'modified' | 'size' | 'type';
+    direction?: 'asc' | 'desc';
+}
+
+export async function searchFiles(query: string, filters: SearchFilters = {}): Promise<{ files: SearchResult[]; query: string }> {
+    const params = new URLSearchParams({ q: query });
+    if (filters.type && filters.type !== 'all') params.set('type', filters.type);
+    if (filters.starred) params.set('starred', 'true');
+    if (filters.shared) params.set('shared', 'true');
+    if (filters.minSize !== undefined && filters.minSize !== null) params.set('min_size', String(filters.minSize));
+    if (filters.maxSize !== undefined && filters.maxSize !== null) params.set('max_size', String(filters.maxSize));
+    if (filters.modifiedAfter) params.set('modified_after', filters.modifiedAfter);
+    if (filters.modifiedBefore) params.set('modified_before', filters.modifiedBefore);
+    if (filters.sort && filters.sort !== 'relevance') params.set('sort', filters.sort);
+    if (filters.direction) params.set('direction', filters.direction);
+    return apiRequest<{ files: SearchResult[]; query: string }>(`/files/search?${params.toString()}`);
 }
 
 // Create folder
@@ -442,9 +506,20 @@ export async function createFolder(name: string, parentId: number | null = null)
 }
 
 // Upload files
-export async function uploadFiles(files: File[], parentId: number | null = null): Promise<{ message: string; files: FileItem[] }> {
+export async function uploadFiles(
+    files: File[],
+    parentId: number | null = null,
+    signal?: AbortSignal
+): Promise<{ message: string; files: FileItem[] }> {
     const formData = new FormData();
-    files.forEach(file => formData.append('files', file));
+    files.forEach(file => {
+        formData.append('files', file);
+        const relativePath =
+            (file as File & { cloudpiRelativePath?: string; webkitRelativePath?: string }).cloudpiRelativePath ||
+            (file as File & { webkitRelativePath?: string }).webkitRelativePath ||
+            file.name;
+        formData.append('relative_paths', relativePath);
+    });
     if (parentId) formData.append('parent_id', String(parentId));
 
     const token = getToken();
@@ -454,6 +529,7 @@ export async function uploadFiles(files: File[], parentId: number | null = null)
             'Authorization': `Bearer ${token}`,
         },
         body: formData,
+        signal,
     });
 
     // Safe JSON parse for upload responses too
@@ -469,6 +545,56 @@ export async function uploadFiles(files: File[], parentId: number | null = null)
     }
     if (!response.ok) throw new Error(data.error || 'Upload failed');
     return data;
+}
+
+export async function initFileUpload(payload: {
+    parent_id: number | null;
+    name: string;
+    size: number;
+    mime_type: string;
+    relative_path?: string;
+    chunk_count: number;
+}): Promise<{ upload: { id: string; chunk_count: number; chunk_size: number } }> {
+    return apiRequest<{ upload: { id: string; chunk_count: number; chunk_size: number } }>('/files/uploads/init', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+    });
+}
+
+export async function uploadFileChunk(uploadId: string, index: number, bytes: Uint8Array, signal?: AbortSignal): Promise<void> {
+    const token = getToken();
+    const response = await fetch(`${API_BASE}/files/uploads/${uploadId}/chunks/${index}`, {
+        method: 'PUT',
+        headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/octet-stream',
+        },
+        body: new Uint8Array(bytes).buffer,
+        signal,
+    });
+
+    if (!response.ok) {
+        let message = 'Chunk upload failed';
+        try {
+            const data = await response.json();
+            message = data.error || message;
+        } catch {
+            // keep default message
+        }
+        throw new Error(message);
+    }
+}
+
+export async function completeFileUpload(uploadId: string): Promise<{ message: string; file: FileItem }> {
+    return apiRequest<{ message: string; file: FileItem }>(`/files/uploads/${uploadId}/complete`, {
+        method: 'POST',
+    });
+}
+
+export async function abortFileUpload(uploadId: string): Promise<{ message: string }> {
+    return apiRequest<{ message: string }>(`/files/uploads/${uploadId}`, {
+        method: 'DELETE',
+    });
 }
 
 // Download file
@@ -497,6 +623,39 @@ export async function downloadFile(fileId: number, fileName: string): Promise<vo
     });
 
     if (!response.ok) throw new Error('Download failed');
+
+    const blob = await response.blob();
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    window.URL.revokeObjectURL(url);
+    a.remove();
+}
+
+export async function downloadFilesZip(fileIds: number[], fileName = 'cloudpi-selection.zip'): Promise<void> {
+    const token = getToken();
+    const response = await fetch(`${API_BASE}/files/bulk-download`, {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ fileIds }),
+    });
+
+    if (!response.ok) {
+        let message = 'Download failed';
+        try {
+            const data = await response.json();
+            message = data.error || message;
+        } catch {
+            // keep default message
+        }
+        throw new Error(message);
+    }
 
     const blob = await response.blob();
     const url = window.URL.createObjectURL(blob);
@@ -557,6 +716,29 @@ export async function restoreFile(fileId: number): Promise<{ message: string }> 
 // Permanent delete
 export async function permanentDeleteFile(fileId: number): Promise<{ message: string }> {
     return apiRequest<{ message: string }>(`/files/${fileId}/permanent`, {
+        method: 'DELETE',
+    });
+}
+
+// File versions
+export async function getFileVersions(fileId: number): Promise<FileVersionsResponse> {
+    return apiRequest<FileVersionsResponse>(`/files/${fileId}/versions`);
+}
+
+export async function restoreFileVersion(
+    fileId: number,
+    versionId: number
+): Promise<{ message: string; file: FileItem }> {
+    return apiRequest<{ message: string; file: FileItem }>(`/files/${fileId}/versions/${versionId}/restore`, {
+        method: 'POST',
+    });
+}
+
+export async function deleteFileVersion(
+    fileId: number,
+    versionId: number
+): Promise<{ message: string }> {
+    return apiRequest<{ message: string }>(`/files/${fileId}/versions/${versionId}`, {
         method: 'DELETE',
     });
 }
@@ -662,7 +844,7 @@ export async function initVaultUpload(
     });
 }
 
-export async function uploadVaultChunk(uploadId: string, index: number, bytes: Uint8Array): Promise<void> {
+export async function uploadVaultChunk(uploadId: string, index: number, bytes: Uint8Array, signal?: AbortSignal): Promise<void> {
     const token = getToken();
     const body = new Uint8Array(bytes).buffer;
     const response = await fetch(`${API_BASE}/vaults/uploads/${uploadId}/chunks/${index}`, {
@@ -672,6 +854,7 @@ export async function uploadVaultChunk(uploadId: string, index: number, bytes: U
             'Content-Type': 'application/octet-stream',
         },
         body,
+        signal,
     });
 
     if (!response.ok) {
@@ -725,15 +908,32 @@ export async function fetchVaultChunk(fileId: number, index: number): Promise<Ar
 export interface ShareUser {
     id: number;
     username: string;
+    email?: string | null;
+}
+
+export type SharePermission = 'view' | 'comment' | 'edit' | 'upload';
+
+export interface ShareOptions {
+    expiresAt?: string | null;
+    allowDownload?: boolean;
+    password?: string;
 }
 
 export interface ShareItem {
     id: number;
     file_id: number;
     shared_by: number;
-    shared_with: number;
-    permission: string;
+    shared_with: number | null;
+    shared_with_email?: string | null;
+    permission: SharePermission;
     share_link: string;
+    share_type?: 'user' | 'link';
+    expires_at?: string | null;
+    allow_download?: number;
+    password_protected?: number;
+    access_count?: number;
+    last_accessed_at?: string | null;
+    is_expired?: number;
     created_at: string;
     file_name: string;
     file_type: string;
@@ -743,16 +943,32 @@ export interface ShareItem {
     shared_with_name?: string;
     // For shared-with-me
     shared_by_name?: string;
+    shortcut_id?: number | null;
 }
 
 export interface ShareAccessItem {
     id: number;
     file_id: number;
-    shared_with: number;
-    permission: string;
+    shared_with: number | null;
+    permission: SharePermission;
     created_at: string;
     share_link: string;
+    share_type?: 'user' | 'link';
+    expires_at?: string | null;
+    allow_download?: number;
+    password_protected?: number;
+    is_expired?: number;
     shared_with_name?: string;
+}
+
+export interface ShareActivityItem {
+    id: number;
+    ip_address: string | null;
+    user_agent: string | null;
+    action: string;
+    created_at: string;
+    accessed_by: number | null;
+    accessed_by_name?: string | null;
 }
 
 // List users to share with
@@ -761,10 +977,21 @@ export async function getShareUsers(): Promise<{ users: ShareUser[] }> {
 }
 
 // Share a file with a user
-export async function createShareLink(fileId: number, sharedWithId: number, permission: string = 'view'): Promise<{ message: string; share: ShareItem }> {
+export async function createShareLink(
+    fileId: number,
+    sharedWithId: number,
+    permission: SharePermission = 'view',
+    options: ShareOptions = {}
+): Promise<{ message: string; share: ShareItem }> {
     return apiRequest<{ message: string; share: ShareItem }>('/shares', {
         method: 'POST',
-        body: JSON.stringify({ fileId, sharedWithId, permission }),
+        body: JSON.stringify({
+            fileId,
+            sharedWithId,
+            permission,
+            expiresAt: options.expiresAt || null,
+            allowDownload: options.allowDownload ?? true,
+        }),
     });
 }
 
@@ -791,6 +1018,61 @@ export async function revokeShare(shareId: number): Promise<{ message: string }>
     return apiRequest<{ message: string }>(`/shares/${shareId}`, {
         method: 'DELETE',
     });
+}
+
+export async function updateShare(
+    shareId: number,
+    updates: {
+        permission?: SharePermission;
+        expiresAt?: string | null;
+        allowDownload?: boolean;
+        password?: string;
+    }
+): Promise<{ message: string; share: ShareItem }> {
+    return apiRequest<{ message: string; share: ShareItem }>(`/shares/${shareId}`, {
+        method: 'PATCH',
+        body: JSON.stringify(updates),
+    });
+}
+
+export async function bulkShareAction(
+    shareIds: number[],
+    action: 'revoke' | 'update',
+    updates: {
+        permission?: SharePermission;
+        expiresAt?: string | null;
+        allowDownload?: boolean;
+    } = {}
+): Promise<{ message: string; count: number }> {
+    return apiRequest<{ message: string; count: number }>('/shares/bulk', {
+        method: 'POST',
+        body: JSON.stringify({ shareIds, action, ...updates }),
+    });
+}
+
+export async function leaveShare(shareId: number): Promise<{ message: string }> {
+    return apiRequest<{ message: string }>(`/shares/shared-with-me/${shareId}`, {
+        method: 'DELETE',
+    });
+}
+
+export async function addShareShortcut(shareId: number): Promise<{
+    message: string;
+    shortcut: { id: number; user_id: number; share_id: number; created_at: string };
+}> {
+    return apiRequest(`/shares/${shareId}/shortcut`, {
+        method: 'POST',
+    });
+}
+
+export async function removeShareShortcut(shareId: number): Promise<{ message: string }> {
+    return apiRequest<{ message: string }>(`/shares/${shareId}/shortcut`, {
+        method: 'DELETE',
+    });
+}
+
+export async function getShareActivity(shareId: number): Promise<{ logs: ShareActivityItem[] }> {
+    return apiRequest<{ logs: ShareActivityItem[] }>(`/shares/${shareId}/activity`);
 }
 
 // Revoke a specific user's access from a shared file
@@ -846,6 +1128,7 @@ export function getSharedFilePreviewUrl(shareId: number, fileId: number): string
 export interface DashboardStats {
     totalFiles: number;
     totalStorage: number;
+    versionStorage?: number;
     totalFolders: number;
     storageQuota: number | null;
     trashFiles: number;
@@ -856,8 +1139,17 @@ export interface DashboardStats {
         name: string;
         type: string;
         size: number;
-        mime_type: string;
+        mime_type: string | null;
+        parent_id: number | null;
+        location?: string;
         created_at: string;
+        modified_at: string;
+        accessed_at?: string | null;
+        recent_at?: string;
+        recent_action?: 'uploaded' | 'modified' | 'viewed';
+        is_accessible?: boolean | number;
+        is_secure_vault?: boolean | number;
+        vault_root_id?: number | null;
     }[];
     sharedByMe: number;
     sharedWithMe: number;
@@ -873,12 +1165,28 @@ export interface SystemHealth {
     ip: string;
 }
 
+export interface DashboardActivityItem {
+    id: string;
+    type: string;
+    title: string;
+    body: string;
+    link: string | null;
+    created_at: string;
+    metadata: Record<string, unknown> | null;
+}
+
 export async function getDashboardStats(): Promise<DashboardStats> {
     return apiRequest<DashboardStats>('/dashboard/stats');
 }
 
 export async function getSystemHealth(): Promise<SystemHealth> {
     return apiRequest<SystemHealth>('/dashboard/health');
+}
+
+export async function getDashboardActivity(limit = 8): Promise<{ activity: DashboardActivityItem[] }> {
+    const params = new URLSearchParams();
+    params.set('limit', String(limit));
+    return apiRequest<{ activity: DashboardActivityItem[] }>(`/dashboard/activity?${params.toString()}`);
 }
 
 // ============= ADMIN SETTINGS =============
@@ -909,6 +1217,110 @@ export async function testSmtpSettings(
     return apiRequest<{ message: string }>('/admin/settings/test-smtp', {
         method: 'POST',
         body: JSON.stringify(settings),
+    });
+}
+
+export async function downloadIncomingShare(shareId: number, fileName: string): Promise<void> {
+    const token = getToken();
+    const response = await fetch(`${API_BASE}/shares/${shareId}/download`, {
+        headers: {
+            'Authorization': `Bearer ${token}`,
+        },
+    });
+
+    if (!response.ok) throw new Error('Download failed');
+
+    const blob = await response.blob();
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    window.URL.revokeObjectURL(url);
+    a.remove();
+}
+
+export function getIncomingSharePreviewUrl(shareId: number): string {
+    const token = getToken();
+    return `${API_BASE}/shares/${shareId}/preview?token=${token}`;
+}
+
+// ============= NOTIFICATIONS =============
+
+export interface NotificationItem {
+    id: number;
+    user_id: number;
+    type: string;
+    title: string;
+    body: string;
+    link: string | null;
+    read_at: string | null;
+    created_at: string;
+    metadata: Record<string, unknown> | null;
+}
+
+export interface NotificationsResponse {
+    notifications: NotificationItem[];
+    total: number;
+    limit: number;
+    offset: number;
+    unreadCount: number;
+}
+
+export interface NotificationPreferences {
+    share_notifications: boolean;
+    storage_warnings: boolean;
+}
+
+export async function getNotifications(options: {
+    limit?: number;
+    offset?: number;
+    status?: 'all' | 'read' | 'unread';
+} = {}): Promise<NotificationsResponse> {
+    const params = new URLSearchParams();
+    if (options.limit) params.set('limit', String(options.limit));
+    if (options.offset) params.set('offset', String(options.offset));
+    if (options.status && options.status !== 'all') params.set('status', options.status);
+    const query = params.toString();
+    return apiRequest<NotificationsResponse>(`/notifications${query ? `?${query}` : ''}`);
+}
+
+export async function getUnreadNotificationCount(): Promise<{ unreadCount: number }> {
+    return apiRequest<{ unreadCount: number }>('/notifications/unread-count');
+}
+
+export async function getNotificationPreferences(): Promise<{ preferences: NotificationPreferences }> {
+    return apiRequest<{ preferences: NotificationPreferences }>('/notifications/preferences');
+}
+
+export async function updateNotificationPreferences(
+    preferences: Partial<NotificationPreferences>
+): Promise<{ preferences: NotificationPreferences }> {
+    return apiRequest<{ preferences: NotificationPreferences }>('/notifications/preferences', {
+        method: 'PATCH',
+        body: JSON.stringify(preferences),
+    });
+}
+
+export async function markNotificationRead(notificationId: number): Promise<{
+    notification: NotificationItem;
+    unreadCount: number;
+}> {
+    return apiRequest<{ notification: NotificationItem; unreadCount: number }>(`/notifications/${notificationId}/read`, {
+        method: 'PATCH',
+    });
+}
+
+export async function markAllNotificationsRead(): Promise<{ updated: number; unreadCount: number }> {
+    return apiRequest<{ updated: number; unreadCount: number }>('/notifications/read-all', {
+        method: 'PATCH',
+    });
+}
+
+export async function clearReadNotifications(): Promise<{ deleted: number; unreadCount: number }> {
+    return apiRequest<{ deleted: number; unreadCount: number }>('/notifications/read', {
+        method: 'DELETE',
     });
 }
 

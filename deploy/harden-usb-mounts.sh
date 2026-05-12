@@ -9,10 +9,11 @@
 #   sudo bash deploy/harden-usb-mounts.sh
 #
 # What it does:
-#   1. Installs usbmount (if not present)
-#   2. Sets nosuid,nodev,noexec,noatime mount options
-#   3. Restricts mount points to /media/pi
-#   4. Creates a systemd override for proper permissions
+#   1. Removes legacy usbmount if present
+#   2. Installs common filesystem helpers
+#   3. Sets nosuid,nodev,noexec,noatime mount options
+#   4. Mounts USB partitions/filesystems under /media/pi
+#   5. Creates a systemd override for mount propagation
 # ==============================================================
 
 set -euo pipefail
@@ -39,29 +40,78 @@ if dpkg -l | grep -q usbmount; then
     apt-get remove -y -qq usbmount
 fi
 
+# Install common filesystem helpers. Kernel-backed filesystems such as ext4
+# already work, but these packages improve USB-drive compatibility.
+echo -e "${YELLOW}→ Installing common filesystem support...${NC}"
+apt-get update -qq
+FS_PACKAGES=()
+for pkg in exfatprogs ntfs-3g dosfstools e2fsprogs xfsprogs btrfs-progs f2fs-tools; do
+    if apt-cache show "$pkg" >/dev/null 2>&1; then
+        FS_PACKAGES+=("$pkg")
+    fi
+done
+if [ "${#FS_PACKAGES[@]}" -gt 0 ]; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${FS_PACKAGES[@]}"
+    apt-get clean
+fi
+
 # 1. Create custom mount script
 MOUNT_SCRIPT="/usr/local/bin/cloudpi-usbmount"
 cat > "$MOUNT_SCRIPT" << 'EOF'
 #!/bin/bash
+set -euo pipefail
+
 ACTION=$1
 DEVBASE=$2
 DEVICE="/dev/${DEVBASE}"
 MOUNT_POINT="/media/pi/${DEVBASE}"
 
 # SECURITY: Hardened mount options — no setuid, no devices, no executables
-OPTIONS="nosuid,nodev,noexec,noatime"
+BASE_OPTIONS="nosuid,nodev,noexec,noatime"
+CLOUDPI_UID="${CLOUDPI_UID:-1000}"
+CLOUDPI_GID="${CLOUDPI_GID:-1000}"
+
+get_fstype() {
+    blkid -o value -s TYPE "$DEVICE" 2>/dev/null || lsblk -n -o FSTYPE "$DEVICE" 2>/dev/null | tr -d '[:space:]'
+}
+
+mount_options_for() {
+    local fstype="$1"
+    case "$fstype" in
+        vfat|msdos|exfat|ntfs|ntfs3)
+            echo "${BASE_OPTIONS},uid=${CLOUDPI_UID},gid=${CLOUDPI_GID},umask=027"
+            ;;
+        ext2|ext3|ext4|xfs|btrfs|f2fs)
+            echo "${BASE_OPTIONS}"
+            ;;
+        *)
+            echo "${BASE_OPTIONS}"
+            ;;
+    esac
+}
 
 if [ "$ACTION" == "mount" ]; then
-    mkdir -p "$MOUNT_POINT"
-    # Find filesystem type
-    FSTYPE=$(lsblk -n -o FSTYPE "$DEVICE" | tr -d '[:space:]')
-    
-    # FAT/NTFS specific: pin ownership to the cloudpi user (uid 1000)
-    if [[ "$FSTYPE" == "vfat" || "$FSTYPE" == "exfat" || "$FSTYPE" == "ntfs" || "$FSTYPE" == "msdos" ]]; then
-        OPTIONS="${OPTIONS},uid=1000,gid=1000,umask=027"
+    if [ ! -b "$DEVICE" ]; then
+        echo "Device does not exist or is not a block device: $DEVICE" >&2
+        exit 1
     fi
-    
+
+    mkdir -p "$MOUNT_POINT"
+    FSTYPE="$(get_fstype)"
+
+    if [ -z "$FSTYPE" ]; then
+        rmdir "$MOUNT_POINT" 2>/dev/null || true
+        echo "No mountable filesystem detected on $DEVICE" >&2
+        exit 1
+    fi
+
+    OPTIONS="$(mount_options_for "$FSTYPE")"
     mount -o "$OPTIONS" "$DEVICE" "$MOUNT_POINT"
+
+    # For POSIX filesystems, make a writable CloudPi data root for uid 1000
+    # without recursively changing ownership of an existing user drive.
+    mkdir -p "$MOUNT_POINT/cloudpi-data"
+    chown "$CLOUDPI_UID:$CLOUDPI_GID" "$MOUNT_POINT" "$MOUNT_POINT/cloudpi-data" 2>/dev/null || true
 elif [ "$ACTION" == "umount" ]; then
     umount -l "$MOUNT_POINT" || true
     # Clean up orphan files that may persist on root after lazy unmount.
@@ -115,8 +165,13 @@ echo -e "${GREEN}✓ Created systemd mount service (with notification)${NC}"
 # 5. Create udev rule to trigger systemd on USB plug/unplug
 UDEV_RULE="/etc/udev/rules.d/99-cloudpi-usb.rules"
 cat > "$UDEV_RULE" << 'EOF'
-KERNEL=="sd[a-z][0-9]", SUBSYSTEMS=="usb", ACTION=="add", ENV{SYSTEMD_WANTS}="cloudpi-usb@%k.service"
-KERNEL=="sd[a-z][0-9]", SUBSYSTEMS=="usb", ACTION=="remove", RUN+="/usr/local/bin/cloudpi-drive-notify remove %k"
+# Normal USB partitions, e.g. /dev/sda1, /dev/sdb1
+KERNEL=="sd[a-z][0-9]", SUBSYSTEM=="block", SUBSYSTEMS=="usb", ENV{ID_FS_USAGE}=="filesystem", ACTION=="add", ENV{SYSTEMD_WANTS}+="cloudpi-usb@%k.service"
+KERNEL=="sd[a-z][0-9]", SUBSYSTEM=="block", SUBSYSTEMS=="usb", ACTION=="remove", RUN+="/usr/local/bin/cloudpi-drive-notify remove %k"
+
+# Whole-disk filesystems, e.g. a USB formatted directly as /dev/sda with no /dev/sda1
+KERNEL=="sd[a-z]", SUBSYSTEM=="block", SUBSYSTEMS=="usb", ENV{ID_FS_USAGE}=="filesystem", ACTION=="add", ENV{SYSTEMD_WANTS}+="cloudpi-usb@%k.service"
+KERNEL=="sd[a-z]", SUBSYSTEM=="block", SUBSYSTEMS=="usb", ENV{ID_FS_USAGE}=="filesystem", ACTION=="remove", RUN+="/usr/local/bin/cloudpi-drive-notify remove %k"
 EOF
 echo -e "${GREEN}✓ Created udev rule for auto-mounting${NC}"
 
@@ -142,6 +197,7 @@ echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━
 echo ""
 echo "Mount options applied: nosuid,nodev,noexec,noatime"
 echo "Mount points:          /media/pi/sda1, /media/pi/sdb1, etc."
+echo "Filesystem support:    exFAT, FAT32, NTFS, ext2/3/4, XFS, Btrfs, F2FS"
 echo "Event notification:    udev → cloudpi-drive-notify → backend webhook"
 echo ""
 echo -e "${YELLOW}IMPORTANT: Add the webhook secret to your backend .env:${NC}"

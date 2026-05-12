@@ -57,15 +57,15 @@ router.get('/', (req, res) => {
     try {
         decoded = jwt.verify(token, JWT_SECRET);
     } catch (err) {
-        return res.status(401).json({ error: 'Invalid or expired token' });
+        return res.status(401).json({ error: err.name === 'TokenExpiredError' ? 'Token expired' : 'Invalid token' });
     }
 
     // Validate token_version
     const user = db.prepare('SELECT token_version, is_disabled FROM users WHERE id = ?').get(decoded.userId);
     if (!user) return res.status(401).json({ error: 'User not found' });
     if (user.is_disabled) return res.status(403).json({ error: 'Account is disabled' });
-    if (decoded.tokenVersion !== undefined && decoded.tokenVersion !== (user.token_version || 1)) {
-        return res.status(401).json({ error: 'Token invalidated' });
+    if (decoded.tokenVersion === undefined || decoded.tokenVersion !== (user.token_version || 1)) {
+        return res.status(401).json({ error: 'Token expired or invalidated' });
     }
 
     // Set SSE headers

@@ -33,9 +33,22 @@ const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const db = require('../database/db');
+const { createNotification } = require('../utils/notifications');
+
+function formatQuota(bytes) {
+    if (!bytes || bytes <= 0) return 'Unlimited';
+    const mb = Number(bytes) / (1024 * 1024);
+    if (mb < 1024) return `${Number.isInteger(mb) ? mb : mb.toFixed(1)} MB`;
+    const gb = mb / 1024;
+    return `${Number.isInteger(gb) ? gb : gb.toFixed(1)} GB`;
+}
 const { JWT_SECRET, SALT_ROUNDS } = require('../utils/auth-config');
 const { sendEmail } = require('../utils/mailer');
 const { isInternalStorageAccessible, syncInternalStorageState } = require('../utils/storage-status');
+const {
+    getTotalUsedBytesForUser,
+    getStorageSourceReferenceCount,
+} = require('../utils/file-versioning');
 
 const router = express.Router();
 
@@ -182,6 +195,9 @@ function requireAdmin(req, res, next) {
         if (error.name === 'JsonWebTokenError') {
             return res.status(401).json({ error: 'Invalid token' });
         }
+        if (error.name === 'TokenExpiredError') {
+            return res.status(401).json({ error: 'Token expired' });
+        }
         console.error('Admin auth error:', error);
         res.status(500).json({ error: 'Server error' });
     }
@@ -199,10 +215,7 @@ router.get('/users', requireAdmin, (req, res) => {
 
         // Calculate used bytes for each user
         const enriched = users.map(user => {
-            const usedRow = db.prepare(
-                "SELECT COALESCE(SUM(size), 0) as used FROM files WHERE user_id = ? AND trashed = 0 AND type != 'folder'"
-            ).get(user.id);
-            return { ...user, used_bytes: usedRow.used || 0 };
+            return { ...user, used_bytes: getTotalUsedBytesForUser(db, user.id) };
         });
 
         res.json({ users: enriched });
@@ -384,20 +397,37 @@ router.put('/users/:id/quota', requireAdmin, (req, res) => {
         const userId = parseInt(req.params.id);
         const { quota_mb } = req.body;
 
-        const user = db.prepare('SELECT id, username FROM users WHERE id = ?').get(userId);
+        const user = db.prepare('SELECT id, username, storage_quota FROM users WHERE id = ?').get(userId);
         if (!user) {
             return res.status(404).json({ error: 'User not found' });
         }
 
         // Convert MB to bytes, or NULL for unlimited
-        const quotaBytes = (quota_mb && quota_mb > 0) ? Math.round(quota_mb * 1024 * 1024) : null;
+        const quotaMb = Number(quota_mb);
+        const quotaBytes = (Number.isFinite(quotaMb) && quotaMb > 0) ? Math.round(quotaMb * 1024 * 1024) : null;
+        const oldQuotaBytes = user.storage_quota || null;
 
         db.prepare('UPDATE users SET storage_quota = ? WHERE id = ?').run(quotaBytes, userId);
 
-        console.log(`📊 Set quota for ${user.username}: ${quota_mb ? quota_mb + ' MB' : 'Unlimited'}`);
+        if (oldQuotaBytes !== quotaBytes) {
+            createNotification({
+                userId: user.id,
+                type: 'storage.quota_changed',
+                title: 'Storage quota changed',
+                body: `Your storage quota changed from ${formatQuota(oldQuotaBytes)} to ${formatQuota(quotaBytes)}.`,
+                link: '/settings',
+                metadata: {
+                    oldQuotaBytes,
+                    newQuotaBytes: quotaBytes,
+                    changedBy: currentUserId,
+                },
+            });
+        }
+
+        console.log(`📊 Set quota for ${user.username}: ${formatQuota(quotaBytes)}`);
 
         res.json({
-            message: `Quota ${quota_mb ? `set to ${quota_mb} MB` : 'removed (unlimited)'} for ${user.username}`,
+            message: `Quota ${quotaBytes ? `set to ${formatQuota(quotaBytes)}` : 'removed (unlimited)'} for ${user.username}`,
             storage_quota: quotaBytes,
         });
     } catch (error) {
@@ -622,6 +652,7 @@ router.put('/settings', requireAdmin, (req, res) => {
             'password_min_length',
             'account_lockout_attempts', 'account_lockout_duration',
             'encryption_enabled',
+            'trash_retention_days',
         ];
         
         const allowedStringKeys = [
@@ -641,9 +672,11 @@ router.put('/settings', requireAdmin, (req, res) => {
             if (allowedNumericKeys.includes(key)) {
                 // Validate numeric values
                 const numValue = parseInt(value, 10);
-                if (isNaN(numValue) || numValue < 0 || numValue > 1000) {
+                const minValue = key === 'trash_retention_days' ? 1 : 0;
+                const maxValue = key === 'trash_retention_days' ? 3650 : 1000;
+                if (isNaN(numValue) || numValue < minValue || numValue > maxValue) {
                     return res.status(400).json({ 
-                        error: `Invalid value for ${key}: must be a number between 0 and 1000` 
+                        error: `Invalid value for ${key}: must be a number between ${minValue} and ${maxValue}` 
                     });
                 }
                 finalValue = String(numValue);
@@ -769,11 +802,21 @@ router.get('/storage', requireAdmin, (req, res) => {
 
         const sources = db.prepare(`
             SELECT s.*,
-                   COALESCE(SUM(f.size), 0) as used_bytes,
-                   COUNT(f.id) as file_count
+                   COALESCE(live.used_bytes, 0) + COALESCE(versions.used_bytes, 0) as used_bytes,
+                   COALESCE(live.file_count, 0) + COALESCE(versions.file_count, 0) as file_count,
+                   COALESCE(versions.used_bytes, 0) as version_bytes
             FROM storage_sources s
-            LEFT JOIN files f ON f.storage_source_id = s.id AND f.type != 'folder'
-            GROUP BY s.id
+            LEFT JOIN (
+                SELECT storage_source_id, COALESCE(SUM(size), 0) as used_bytes, COUNT(id) as file_count
+                FROM files
+                WHERE type != 'folder'
+                GROUP BY storage_source_id
+            ) live ON live.storage_source_id = s.id
+            LEFT JOIN (
+                SELECT storage_source_id, COALESCE(SUM(size), 0) as used_bytes, COUNT(id) as file_count
+                FROM file_versions
+                GROUP BY storage_source_id
+            ) versions ON versions.storage_source_id = s.id
             ORDER BY s.type ASC, s.created_at ASC
         `).all();
 
@@ -970,7 +1013,11 @@ router.put('/storage/:id', requireAdmin, (req, res) => {
 
         const { label, is_active } = req.body;
         if (label !== undefined) {
-            db.prepare('UPDATE storage_sources SET label = ? WHERE id = ?').run(label, sourceId);
+            const nextLabel = String(label).trim();
+            if (!nextLabel) {
+                return res.status(400).json({ error: 'Storage source label is required' });
+            }
+            db.prepare('UPDATE storage_sources SET label = ? WHERE id = ?').run(nextLabel, sourceId);
         }
         if (is_active !== undefined) {
             db.prepare('UPDATE storage_sources SET is_active = ? WHERE id = ?').run(is_active ? 1 : 0, sourceId);
@@ -1008,9 +1055,7 @@ router.delete('/storage/:id', requireAdmin, (req, res) => {
         }
 
         // Check if files exist on this source
-        const fileCount = db.prepare(
-            'SELECT COUNT(*) as count FROM files WHERE storage_source_id = ?'
-        ).get(sourceId);
+        const fileCount = { count: getStorageSourceReferenceCount(db, sourceId) };
 
         if (fileCount.count > 0) {
             return res.status(400).json({
@@ -1184,12 +1229,16 @@ router.get('/drives', requireAdmin, async (req, res) => {
                 freeBytes = stats.bsize * stats.bavail;
             } catch (e) { /* not critical */ }
 
+            const registeredSource = registeredId
+                ? registeredSources.find(s => s.id === registeredId)
+                : null;
+
             drives.push({
                 name: entry.name,
                 path: drivePath,
                 size: totalBytes,
                 freeBytes,
-                label: entry.name,
+                label: registeredSource?.label || entry.name,
                 isMounted: true,  // It's in the directory, so it's auto-mounted
                 isRegistered,
                 registeredId,

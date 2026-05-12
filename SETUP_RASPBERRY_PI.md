@@ -5,14 +5,15 @@ This guide takes a fresh Raspberry Pi from first boot to a running CloudPi deplo
 - Raspberry Pi OS Lite 64-bit
 - Docker Compose
 - Tailscale HTTPS
-- LUKS encrypted storage
+- Application-level AES-256-GCM file encryption
 
 Target paths and names used throughout:
 
 - Pi user: `pi`
 - Project directory: `/home/pi/cloudpi`
 - App URL: `https://<pi-hostname>.<tailnet>.ts.net`
-- LUKS mount point: `/media/cloudpi-data`
+- Internal storage: Docker-managed volumes, or optional bind mounts you choose
+- External USB drive mount root: `/media/pi`
 
 Replace placeholder values like `<pi-hostname>.<tailnet>.ts.net` with the values from your Raspberry Pi.
 
@@ -57,7 +58,7 @@ Run these commands after your first SSH login:
 ```bash
 sudo apt update
 sudo apt full-upgrade -y
-sudo apt install -y git curl ca-certificates gnupg jq openssl cryptsetup lsblk sqlite3
+sudo apt install -y git curl ca-certificates gnupg jq openssl sqlite3 util-linux
 sudo reboot
 ```
 
@@ -188,7 +189,7 @@ and verify the expected files exist:
 
 ```bash
 cd /home/pi/cloudpi
-ls docker-compose.yml Dockerfile backend/server.js frontend/package.json deploy/cloudpi-luks-setup.sh
+ls docker-compose.yml Dockerfile backend/server.js frontend/package.json deploy/docker-nginx.conf
 ```
 
 ## 6. Create Backend Environment
@@ -214,7 +215,7 @@ chmod 600 backend/.env
 These values are important:
 
 - `JWT_SECRET` signs login tokens. It must be strong in production.
-- `CLOUDPI_ENCRYPTION_KEY` protects stored SMTP passwords and signs external drive IDs. It must be exactly 64 hex characters.
+- `CLOUDPI_ENCRYPTION_KEY` protects AES-256-GCM file encryption, stored SMTP passwords, and signed external drive IDs. It must be exactly 64 hex characters.
 - `CLOUDPI_ALLOWED_ORIGINS` allows the Tailscale HTTPS origin.
 - `CLOUDPI_UDEV_SECRET` authenticates host USB drive-change notifications.
 
@@ -248,72 +249,104 @@ grep -R "$TS_HOSTNAME" docker-compose.yml deploy/docker-nginx.conf
 grep -R "taild54945" docker-compose.yml deploy/docker-nginx.conf || true
 ```
 
-## 8. Prepare Encrypted LUKS Storage
+## 8. Prepare Storage And Encryption
 
-CloudPi can store its database, uploads, and internal storage on an encrypted LUKS partition mounted at `/media/cloudpi-data`.
+CloudPi no longer uses LUKS. Files are encrypted by the Node.js backend with AES-256-GCM before they are written to disk when the admin encryption toggle is enabled.
 
-Warning: the setup script formats the selected partition. It destroys all data on that partition. Do not continue until you are certain which device is the external storage partition.
+The encryption key comes from:
 
-Plug in the USB SSD, USB hard drive, or USB flash drive you want to use for encrypted CloudPi storage.
-
-List block devices:
-
-```bash
-lsblk -o NAME,SIZE,FSTYPE,TYPE,MOUNTPOINT,MODEL
+```text
+backend/.env -> CLOUDPI_ENCRYPTION_KEY
 ```
 
-Typical examples:
+Keep this key safe. If you lose it, encrypted files cannot be decrypted.
 
-- Pi boot storage: `mmcblk0`, `mmcblk0p1`, `mmcblk0p2`
-- External USB storage: `sda`, `sda1`
+By default, Docker stores CloudPi data in named volumes:
 
-In most simple USB-drive setups, the target partition is `/dev/sda1`, but always confirm with `lsblk`.
+```text
+cloudpi-db       -> SQLite database at /data/cloudpi.db
+cloudpi-storage  -> internal file storage at /app/backend/storage
+cloudpi-uploads  -> profile uploads at /app/backend/uploads
+```
 
-Run the CloudPi LUKS bootstrap:
+For most installs, no root `.env` file is needed. Use the default Docker volumes unless you intentionally want bind mounts.
+
+Optional bind mounts:
 
 ```bash
 cd /home/pi/cloudpi
-sudo bash deploy/cloudpi-luks-setup.sh
+mkdir -p /home/pi/cloudpi-data/db /home/pi/cloudpi-data/storage /home/pi/cloudpi-data/uploads
+sudo chown -R 1000:1000 /home/pi/cloudpi-data
+cat > .env <<'EOF'
+CLOUDPI_DB_MOUNT=/home/pi/cloudpi-data/db
+CLOUDPI_STORAGE_MOUNT=/home/pi/cloudpi-data/storage
+CLOUDPI_UPLOADS_MOUNT=/home/pi/cloudpi-data/uploads
+EOF
 ```
 
-When prompted:
-
-1. Select the target partition, for example `/dev/sda1`.
-2. Keep mapper name as `cloudpi-data` unless you have a reason to change it.
-3. Keep mount point as `/media/cloudpi-data`.
-4. Enter and confirm a strong LUKS passphrase.
-5. Type the exact destructive confirmation requested by the script.
-
-The script will:
-
-- Format the selected partition as LUKS2.
-- Create an ext4 filesystem inside it.
-- Mount it at `/media/cloudpi-data`.
-- Create CloudPi data directories.
-- Write root `.env` values used by `docker-compose.yml`.
-- Start the Docker stack with the encrypted bind mounts.
-
-The root `.env` file should contain values like:
+Do not run the old LUKS scripts for the AES-256-GCM version:
 
 ```text
-LUKS_DEVICE=/dev/disk/by-uuid/<uuid>
-LUKS_MAPPER_NAME=cloudpi-data
-LUKS_MOUNT_POINT=/media/cloudpi-data
-CLOUDPI_INTERNAL_STORAGE_REQUIRES_LUKS=1
-CLOUDPI_DB_MOUNT=/media/cloudpi-data/appdata
-CLOUDPI_STORAGE_MOUNT=/media/cloudpi-data/storage
-CLOUDPI_UPLOADS_MOUNT=/media/cloudpi-data/uploads
+deploy/cloudpi-luks-setup.sh
+deploy/cloudpi-luks-stack.sh
 ```
 
-Check LUKS status:
+Those scripts belong to the retired LUKS architecture.
+
+### Cleanup From The Old LUKS Version
+
+Skip this subsection on a fresh Pi.
+
+If this Pi already ran the old LUKS version, stop CloudPi and remove the old root `.env` overrides before starting the new version:
 
 ```bash
-sudo bash deploy/cloudpi-luks-stack.sh status
+cd /home/pi/cloudpi
+docker compose down --remove-orphans
+mv .env .env.luks.old 2>/dev/null || true
 ```
+
+If you want a completely fresh CloudPi install, remove the old Docker volumes too:
+
+```bash
+docker compose down -v --remove-orphans
+docker volume rm cloudpi_cloudpi-db cloudpi_cloudpi-storage cloudpi_cloudpi-uploads 2>/dev/null || true
+```
+
+Only wipe the old LUKS disk if you are certain you no longer need its data. First identify the device:
+
+```bash
+lsblk -o NAME,PATH,SIZE,FSTYPE,LABEL,MOUNTPOINTS,MODEL
+```
+
+Example for an old LUKS partition at `/dev/sda1`:
+
+```bash
+sudo umount /media/cloudpi-data 2>/dev/null || true
+sudo cryptsetup luksClose cloudpi-data 2>/dev/null || true
+sudo wipefs -n /dev/sda1
+```
+
+If the dry run shows the expected old LUKS signature and `/dev/sda1` is definitely the correct partition, wipe it:
+
+```bash
+sudo wipefs -a /dev/sda1
+sudo dd if=/dev/zero of=/dev/sda1 bs=1M count=32 conv=fsync
+sudo mkfs.ext4 -F -L cloudpi-usb /dev/sda1
+```
+
+Remove old host-level LUKS leftovers:
+
+```bash
+sudo rm -f /etc/sudoers.d/cloudpi-luks
+sudo rmdir /media/cloudpi-data 2>/dev/null || true
+sudo grep -n "cloudpi-data\|LUKS" /etc/fstab /etc/crypttab 2>/dev/null || true
+```
+
+If the last command prints matching `/etc/fstab` or `/etc/crypttab` lines, remove only the CloudPi LUKS lines from those files.
 
 ## 9. Build And Start CloudPi
 
-If the LUKS bootstrap already started the stack, rebuild once after all hostname changes:
+Build and start the stack after the hostname and environment files are ready:
 
 ```bash
 cd /home/pi/cloudpi
@@ -373,9 +406,10 @@ Complete the first-run setup:
 1. Create the first admin account.
 2. Save the recovery or backup code if CloudPi shows one.
 3. Sign in.
-4. Check the LUKS or storage status in the admin area.
-5. Upload a small test file.
-6. Download or preview the file to confirm storage works.
+4. Open Settings and confirm the File Encryption card loads.
+5. Enable "Encrypt new uploads" if you want all new uploads encrypted on disk.
+6. Upload a small test file.
+7. Download or preview the file to confirm storage works.
 
 ## Daily Operation
 
@@ -424,35 +458,39 @@ git pull
 docker compose up -d --build
 ```
 
-## LUKS Operations
+## Encryption Operations
 
-Check encrypted storage status:
-
-```bash
-cd /home/pi/cloudpi
-sudo bash deploy/cloudpi-luks-stack.sh status
-```
-
-Lock encrypted storage and stop CloudPi:
+Check that the application encryption key is configured:
 
 ```bash
 cd /home/pi/cloudpi
-sudo bash deploy/cloudpi-luks-stack.sh lock
+awk -F= '/^CLOUDPI_ENCRYPTION_KEY=/{ print length($2) " hex characters configured" }' backend/.env
 ```
 
-Unlock encrypted storage and start CloudPi:
+The value must be exactly 64 hex characters after the `=`.
+
+Enable encryption for new uploads from the web UI:
+
+```text
+Settings -> File Encryption -> Encrypt new uploads
+```
+
+Or enable it from the Pi shell:
 
 ```bash
 cd /home/pi/cloudpi
-sudo bash deploy/cloudpi-luks-stack.sh unlock --start
+docker compose exec backend node -e "const Database=require('better-sqlite3'); const db=new Database('/data/cloudpi.db'); db.prepare(\"UPDATE settings SET value='1' WHERE key='encryption_enabled'\").run(); console.log('encryption enabled')"
+docker compose restart backend
 ```
 
-Start Docker only if the encrypted mount is already present:
+Check encryption file counts from the database:
 
 ```bash
 cd /home/pi/cloudpi
-sudo bash deploy/cloudpi-luks-stack.sh start
+docker compose exec backend node -e "const Database=require('better-sqlite3'); const db=new Database('/data/cloudpi.db'); console.log(db.prepare(\"SELECT key,value FROM settings WHERE key='encryption_enabled'\").get()); console.log(db.prepare(\"SELECT encrypted, COUNT(*) count FROM files WHERE type!='folder' GROUP BY encrypted\").all())"
 ```
+
+The Settings page shows the same counts in the File Encryption card.
 
 ## Optional USB Drive Auto-Mounting
 
@@ -465,12 +503,33 @@ cd /home/pi/cloudpi
 sudo bash deploy/harden-usb-mounts.sh
 ```
 
+The script installs common filesystem helpers and mounts supported USB filesystems under `/media/pi`:
+
+```text
+exFAT, FAT32, NTFS, ext2/3/4, XFS, Btrfs, F2FS
+```
+
+It supports normal partitions such as `/dev/sda1` and whole-disk filesystems such as `/dev/sda`. A blank disk or a disk with only a partition table is not mountable until you create and format a partition.
+
 The script prints a `CLOUDPI_UDEV_SECRET=...` value. If you want event notifications to use that generated secret, copy it into `backend/.env` and restart:
 
 ```bash
 cd /home/pi/cloudpi
 nano backend/.env
 docker compose up -d
+```
+
+After installing the automount rules, reboot once, then unplug and replug the USB drive:
+
+```bash
+sudo reboot
+```
+
+Check the mount:
+
+```bash
+lsblk -o NAME,PATH,FSTYPE,SIZE,MOUNTPOINTS,MODEL
+mount | grep /media/pi
 ```
 
 ## Troubleshooting
@@ -547,51 +606,38 @@ Common causes:
 - `backend/.env` does not exist.
 - `JWT_SECRET` is missing.
 - `CLOUDPI_ENCRYPTION_KEY` is not exactly 64 hex characters.
-- LUKS storage paths are configured but `/media/cloudpi-data` is not mounted.
+- A leftover root `.env` from the old LUKS deployment is overriding Docker volumes.
+- The Tailscale hostname in `docker-compose.yml` or `deploy/docker-nginx.conf` does not match the certificate files.
 
 Validate environment files:
 
 ```bash
 cd /home/pi/cloudpi
 test -f backend/.env && echo "backend/.env exists"
-test -f .env && echo "root .env exists"
 grep -E '^(NODE_ENV|PORT|CLOUDPI_ALLOWED_ORIGINS)=' backend/.env
-grep -E '^(LUKS_DEVICE|LUKS_MOUNT_POINT|CLOUDPI_DB_MOUNT|CLOUDPI_STORAGE_MOUNT|CLOUDPI_UPLOADS_MOUNT)=' .env
+awk -F= '/^CLOUDPI_ENCRYPTION_KEY=/{ print length($2) " hex characters configured" }' backend/.env
+test -f .env && cat .env || true
 ```
 
-### Wrong LUKS Device
-
-Check devices:
-
-```bash
-lsblk -o NAME,SIZE,FSTYPE,TYPE,MOUNTPOINT,MODEL
-sudo blkid
-```
-
-Check CloudPi's configured LUKS device:
+If `.env` contains old `LUKS_...` values, rename it and restart:
 
 ```bash
 cd /home/pi/cloudpi
-grep '^LUKS_DEVICE=' .env
+mv .env .env.luks.old
+docker compose up -d
 ```
 
-Prefer persistent `/dev/disk/by-uuid/<uuid>` paths over `/dev/sda1`, because `/dev/sdX` names can change across boots.
+### Encryption Toggle Is Off
 
-### LUKS Is Locked After Reboot
+`CLOUDPI_ENCRYPTION_KEY` only makes encryption possible. New uploads are encrypted only when the admin setting is enabled.
 
-Unlock and start:
+Enable it in:
 
-```bash
-cd /home/pi/cloudpi
-sudo bash deploy/cloudpi-luks-stack.sh unlock --start
+```text
+Settings -> File Encryption -> Encrypt new uploads
 ```
 
-Then verify:
-
-```bash
-sudo bash deploy/cloudpi-luks-stack.sh status
-docker compose ps
-```
+Existing files are not rewritten when you toggle this setting. Files uploaded before encryption was enabled remain unencrypted until they are re-uploaded.
 
 ### Re-run Compose Validation
 
@@ -612,7 +658,8 @@ The setup is complete when all checks pass:
 - `curl -k "https://${TS_HOSTNAME}/api/test"` returns CloudPi backend JSON.
 - `https://${TS_HOSTNAME}` loads the CloudPi setup or login page.
 - The first admin account can be created.
-- `sudo bash deploy/cloudpi-luks-stack.sh status` shows the encrypted mount is ready.
+- The Settings page shows the File Encryption card.
+- "Encrypt new uploads" can be enabled.
 - A small file upload succeeds from the web UI.
 - The uploaded file can be downloaded or previewed.
 

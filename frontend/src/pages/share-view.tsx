@@ -14,6 +14,7 @@ import {
     Download,
     Loader2,
     CloudOff,
+    Lock,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 
@@ -59,6 +60,13 @@ interface SharedFile {
     shared_by: string
     permission: string
     created_at: string
+    expires_at?: string | null
+    allow_download?: number
+}
+
+interface PublicShareResponse {
+    passwordRequired?: boolean
+    file?: SharedFile
 }
 
 export function ShareViewPage() {
@@ -66,22 +74,33 @@ export function ShareViewPage() {
     const [file, setFile] = useState<SharedFile | null>(null)
     const [isLoading, setIsLoading] = useState(true)
     const [error, setError] = useState<string | null>(null)
+    const [passwordRequired, setPasswordRequired] = useState(false)
+    const [password, setPassword] = useState("")
+    const [accessToken, setAccessToken] = useState<string | null>(null)
+    const [isVerifying, setIsVerifying] = useState(false)
 
     useEffect(() => {
         if (!link) return
         fetchShareInfo()
     }, [link])
 
-    async function fetchShareInfo() {
+    async function fetchShareInfo(token: string | null = accessToken) {
         setIsLoading(true)
         try {
-            const res = await fetch(`${API_BASE}/shares/public/${link}`)
+            const suffix = token ? `?access_token=${encodeURIComponent(token)}` : ""
+            const res = await fetch(`${API_BASE}/shares/public/${link}${suffix}`)
             if (!res.ok) {
                 const data = await res.json()
                 throw new Error(data.error || "Share not found")
             }
-            const data = await res.json()
-            setFile(data.file)
+            const data = await res.json() as PublicShareResponse
+            if (data.passwordRequired) {
+                setPasswordRequired(true)
+                setFile(null)
+            } else {
+                setPasswordRequired(false)
+                setFile(data.file || null)
+            }
         } catch (err) {
             setError(err instanceof Error ? err.message : "Failed to load shared file")
         } finally {
@@ -89,14 +108,71 @@ export function ShareViewPage() {
         }
     }
 
+    async function verifyPassword() {
+        if (!link || !password.trim()) return
+        setIsVerifying(true)
+        setError(null)
+        try {
+            const res = await fetch(`${API_BASE}/shares/public/${link}/verify`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ password }),
+            })
+            const data = await res.json()
+            if (!res.ok) throw new Error(data.error || "Password failed")
+            setAccessToken(data.accessToken)
+            await fetchShareInfo(data.accessToken)
+        } catch (err) {
+            setError(err instanceof Error ? err.message : "Incorrect password")
+        } finally {
+            setIsVerifying(false)
+        }
+    }
+
     function handleDownload() {
-        window.open(`${API_BASE}/shares/public/${link}/download`, '_blank')
+        const suffix = accessToken ? `?access_token=${encodeURIComponent(accessToken)}` : ""
+        window.open(`${API_BASE}/shares/public/${link}/download${suffix}`, '_blank')
     }
 
     if (isLoading) {
         return (
             <div className="min-h-screen bg-background flex items-center justify-center">
                 <Loader2 className="h-8 w-8 animate-spin text-primary" />
+            </div>
+        )
+    }
+
+    if (passwordRequired) {
+        return (
+            <div className="min-h-screen bg-background flex items-center justify-center p-4">
+                <Card className="w-full max-w-md bg-card border-border">
+                    <CardContent className="flex flex-col items-center py-10 text-center gap-4">
+                        <div className="rounded-2xl bg-secondary p-4">
+                            <Lock className="h-10 w-10 text-primary" />
+                        </div>
+                        <div>
+                            <h2 className="text-xl font-bold text-card-foreground">Password Required</h2>
+                            <p className="text-muted-foreground mt-2">
+                                Enter the share password to continue.
+                            </p>
+                        </div>
+                        <input
+                            className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                            type="password"
+                            value={password}
+                            onChange={(e) => setPassword(e.target.value)}
+                            onKeyDown={(e) => {
+                                if (e.key === "Enter") verifyPassword()
+                            }}
+                            autoFocus
+                        />
+                        {error && <p className="text-sm text-destructive">{error}</p>}
+                        <Button className="w-full" onClick={verifyPassword} disabled={isVerifying || !password.trim()}>
+                            {isVerifying && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                            Unlock
+                        </Button>
+                    </CardContent>
+                </Card>
             </div>
         )
     }
@@ -121,7 +197,9 @@ export function ShareViewPage() {
 
     const Icon = getFileIcon(file.type)
     const isImage = file.type === "image"
-    const previewUrl = `${API_BASE}/shares/public/${link}/preview`
+    const accessSuffix = accessToken ? `?access_token=${encodeURIComponent(accessToken)}` : ""
+    const previewUrl = `${API_BASE}/shares/public/${link}/preview${accessSuffix}`
+    const canDownload = file.allow_download !== 0
 
     return (
         <div className="min-h-screen bg-background flex items-center justify-center p-4">
@@ -165,15 +243,19 @@ export function ShareViewPage() {
                     </div>
 
                     {/* Download button */}
-                    {file.type !== "folder" && (
+                    {canDownload ? (
                         <Button
                             className="w-full gap-2"
                             size="lg"
                             onClick={handleDownload}
                         >
                             <Download className="h-5 w-5" />
-                            Download
+                            {file.type === "folder" ? "Download ZIP" : "Download"}
                         </Button>
+                    ) : (
+                        <div className="rounded-md bg-secondary px-3 py-2 text-center text-sm text-muted-foreground">
+                            Downloads are disabled for this share.
+                        </div>
                     )}
                 </CardContent>
             </Card>

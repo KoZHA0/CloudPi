@@ -186,6 +186,10 @@ app.use('/api/vaults', vaultRoutes);
 const shareRoutes = require('./routes/shares');
 app.use('/api/shares', shareRoutes);
 
+// Notification routes (in-app awareness)
+const notificationRoutes = require('./routes/notifications');
+app.use('/api/notifications', notificationRoutes);
+
 // Dashboard routes (stats, system health)
 const dashboardRoutes = require('./routes/dashboard');
 app.use('/api/dashboard', dashboardRoutes);

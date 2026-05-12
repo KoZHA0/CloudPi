@@ -42,6 +42,14 @@ function buildTestDb() {
             size INTEGER DEFAULT 0,
             type TEXT DEFAULT 'file'
         );
+
+        CREATE TABLE file_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            storage_source_id TEXT REFERENCES storage_sources(id),
+            path TEXT NOT NULL,
+            size INTEGER DEFAULT 0
+        );
     `);
 
     return db;
@@ -56,10 +64,13 @@ function deleteStorage(db, sourceId) {
     if (!source) return { ok: false, error: 'not_found' };
     if (source.type === 'internal') return { ok: false, error: 'internal' };
 
-    const fileCount = db.prepare(
+    const liveCount = db.prepare(
         'SELECT COUNT(*) as count FROM files WHERE storage_source_id = ?'
-    ).get(sourceId);
-    if (fileCount.count > 0) return { ok: false, error: 'has_files' };
+    ).get(sourceId).count;
+    const versionCount = db.prepare(
+        'SELECT COUNT(*) as count FROM file_versions WHERE storage_source_id = ?'
+    ).get(sourceId).count;
+    if (liveCount + versionCount > 0) return { ok: false, error: 'has_files' };
 
     // Clear dependent user default_storage_id references before deletion
     const affectedUsers = db.prepare(
@@ -149,7 +160,33 @@ function assert(condition, message) {
     assert(driveRow !== undefined, 'storage source is NOT removed (still has files)');
 }
 
-// ─── Test 4: delete blocked for internal storage ─────────────────────────────
+// ─── Test 4: delete blocked when versions reference the source ───────────────
+{
+    const db = buildTestDb();
+    db.prepare('INSERT INTO storage_sources (id, label, path, type) VALUES (?, ?, ?, ?)').run(
+        'drive-4', 'USB Drive 4', '/media/pi/USB4', 'external'
+    );
+    db.prepare('INSERT INTO storage_sources (id, label, path, type) VALUES (?, ?, ?, ?)').run(
+        'internal', 'Internal Storage', '/app/backend/storage', 'internal'
+    );
+    db.prepare('INSERT INTO users (username) VALUES (?)').run('carol');
+    const user = db.prepare('SELECT * FROM users WHERE username = ?').get('carol');
+    const file = db.prepare('INSERT INTO files (user_id, storage_source_id, name, path) VALUES (?, ?, ?, ?)').run(
+        user.id, 'internal', 'report.pdf', 'live.pdf'
+    );
+    db.prepare('INSERT INTO file_versions (file_id, storage_source_id, path, size) VALUES (?, ?, ?, ?)').run(
+        file.lastInsertRowid, 'drive-4', 'old-report.pdf', 10
+    );
+
+    const result = deleteStorage(db, 'drive-4');
+    assert(result.ok === false && result.error === 'has_files',
+        'delete is blocked when file versions still reference the storage source');
+
+    const driveRow = db.prepare('SELECT * FROM storage_sources WHERE id = ?').get('drive-4');
+    assert(driveRow !== undefined, 'storage source is NOT removed (still has versions)');
+}
+
+// ─── Test 5: delete blocked for internal storage ─────────────────────────────
 {
     const db = buildTestDb();
     db.prepare('INSERT INTO storage_sources (id, label, path, type) VALUES (?, ?, ?, ?)').run(

@@ -27,6 +27,7 @@ import {
     Unlock,
     ShieldCheck,
     ShieldOff,
+    Pencil,
 } from "lucide-react"
 import {
     Dialog,
@@ -65,6 +66,7 @@ import {
     updateUserStorage,
     scanDrives,
     addStorageSource,
+    updateStorageSource,
     removeStorageSource,
     setUserQuota,
     disableUser,
@@ -108,6 +110,10 @@ export function AdminContent() {
     const [driveMessage, setDriveMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null)
     const [platformMessage, setPlatformMessage] = useState<string | null>(null)
     const [registeringDevice, setRegisteringDevice] = useState<string | null>(null)
+    const [driveLabels, setDriveLabels] = useState<Record<string, string>>({})
+    const [editingSourceId, setEditingSourceId] = useState<string | null>(null)
+    const [sourceLabelDraft, setSourceLabelDraft] = useState("")
+    const [savingSourceLabelId, setSavingSourceLabelId] = useState<string | null>(null)
 
     // Quota editing state
     const [editingQuotaUserId, setEditingQuotaUserId] = useState<number | null>(null)
@@ -239,6 +245,13 @@ export function AdminContent() {
             const result = await scanDrives()
             setDetectedDrives(result.drives)
             setRegisteredDriveSources(result.registeredSources)
+            setDriveLabels((current) => {
+                const next = { ...current }
+                result.drives.forEach((drive) => {
+                    if (!next[drive.name]) next[drive.name] = drive.label || drive.name
+                })
+                return next
+            })
             const skippedCandidates = result.skippedCandidates ?? []
             if (result.message) {
                 setPlatformMessage(result.message)
@@ -268,7 +281,7 @@ export function AdminContent() {
         setRegisteringDevice(drive.name)
         setDriveMessage(null)
         try {
-            const label = drive.label || `USB Drive (${drive.name})`
+            const label = driveLabels[drive.name]?.trim() || drive.label || `USB Drive (${drive.name})`
             await addStorageSource(drive.path, label)
             setDriveMessage({ type: 'success', text: `"${label}" registered as storage source!` })
             // Rescan drives + reload storage sources
@@ -277,6 +290,42 @@ export function AdminContent() {
             setDriveMessage({ type: 'error', text: err instanceof Error ? err.message : 'Failed to register drive' })
         } finally {
             setRegisteringDevice(null)
+        }
+    }
+
+    const handleStartEditSourceLabel = (source: RegisteredSource) => {
+        setEditingSourceId(source.id)
+        setSourceLabelDraft(source.label)
+        setDriveMessage(null)
+    }
+
+    const handleSaveSourceLabel = async (source: RegisteredSource) => {
+        const nextLabel = sourceLabelDraft.trim()
+        if (!nextLabel) {
+            setDriveMessage({ type: 'error', text: 'Drive label is required' })
+            return
+        }
+
+        setSavingSourceLabelId(source.id)
+        setDriveMessage(null)
+        try {
+            await updateStorageSource(source.id, { label: nextLabel })
+            setRegisteredDriveSources((current) =>
+                current.map((item) => item.id === source.id ? { ...item, label: nextLabel } : item)
+            )
+            setStorageSources((current) =>
+                current.map((item) => item.id === source.id ? { ...item, label: nextLabel } : item)
+            )
+            setDetectedDrives((current) =>
+                current.map((drive) => drive.registeredId === source.id ? { ...drive, label: nextLabel } : drive)
+            )
+            setEditingSourceId(null)
+            setSourceLabelDraft("")
+            setDriveMessage({ type: 'success', text: `Drive label updated to "${nextLabel}"` })
+        } catch (err) {
+            setDriveMessage({ type: 'error', text: err instanceof Error ? err.message : 'Failed to update drive label' })
+        } finally {
+            setSavingSourceLabelId(null)
         }
     }
 
@@ -747,16 +796,37 @@ export function AdminContent() {
                                                 <p className="text-xs text-muted-foreground mt-1">
                                                     {formatQuota(drive.size)} • {drive.path}
                                                 </p>
+                                                {!drive.isRegistered ? (
+                                                    <div className="mt-3 max-w-sm space-y-1">
+                                                        <Label htmlFor={`drive-label-${drive.name}`} className="text-xs text-muted-foreground">
+                                                            CloudPi label
+                                                        </Label>
+                                                        <Input
+                                                            id={`drive-label-${drive.name}`}
+                                                            className="h-8 bg-background text-sm"
+                                                            value={driveLabels[drive.name] ?? drive.label ?? ""}
+                                                            onChange={(event) => setDriveLabels({
+                                                                ...driveLabels,
+                                                                [drive.name]: event.target.value,
+                                                            })}
+                                                            placeholder="e.g. Family Photos Backup"
+                                                        />
+                                                    </div>
+                                                ) : (
+                                                    <p className="mt-2 text-xs text-muted-foreground">
+                                                        Registered as <span className="font-medium text-foreground">{drive.label}</span>
+                                                    </p>
+                                                )}
                                             </div>
                                         </div>
-                                        <div className="flex items-center gap-2">
+                                        <div className="flex items-center gap-2 sm:justify-end">
                                             {!drive.isRegistered && (
                                                 <Button
                                                     size="sm"
                                                     variant="outline"
-                                                    className="gap-1"
+                                                    className="w-full gap-1 sm:w-auto"
                                                     onClick={() => handleRegister(drive)}
-                                                    disabled={registeringDevice === drive.name}
+                                                    disabled={registeringDevice === drive.name || !(driveLabels[drive.name] ?? drive.label).trim()}
                                                 >
                                                     {registeringDevice === drive.name ? (
                                                         <Loader2 className="h-3 w-3 animate-spin" />
@@ -779,20 +849,64 @@ export function AdminContent() {
                                 {registeredDriveSources.map((src) => (
                                     <div
                                         key={src.id}
-                                        className="p-3 rounded-lg bg-secondary/50 flex items-center justify-between"
+                                        className="flex flex-col gap-3 rounded-lg bg-secondary/50 p-3 sm:flex-row sm:items-center sm:justify-between"
                                     >
-                                        <div className="flex items-center gap-3">
+                                        <div className="flex min-w-0 items-start gap-3">
                                             <HardDrive className={`h-4 w-4 ${
                                                 src.status === 'online' ? 'text-green-400' :
                                                 src.status === 'offline' ? 'text-destructive' :
                                                 'text-amber-400'
-                                            }`} />
-                                            <div>
-                                                <p className="text-sm font-medium">{src.label}</p>
-                                                <p className="text-xs text-muted-foreground">{src.path}</p>
+                                            } mt-1 shrink-0`} />
+                                            <div className="min-w-0 flex-1">
+                                                {editingSourceId === src.id ? (
+                                                    <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                                                        <Input
+                                                            className="h-8 bg-background text-sm"
+                                                            value={sourceLabelDraft}
+                                                            onChange={(event) => setSourceLabelDraft(event.target.value)}
+                                                            onKeyDown={(event) => {
+                                                                if (event.key === 'Enter') handleSaveSourceLabel(src)
+                                                                if (event.key === 'Escape') {
+                                                                    setEditingSourceId(null)
+                                                                    setSourceLabelDraft("")
+                                                                }
+                                                            }}
+                                                            autoFocus
+                                                        />
+                                                        <div className="flex gap-2">
+                                                            <Button
+                                                                size="sm"
+                                                                className="h-8 gap-1"
+                                                                onClick={() => handleSaveSourceLabel(src)}
+                                                                disabled={savingSourceLabelId === src.id || !sourceLabelDraft.trim()}
+                                                            >
+                                                                {savingSourceLabelId === src.id ? (
+                                                                    <Loader2 className="h-3 w-3 animate-spin" />
+                                                                ) : (
+                                                                    <Check className="h-3 w-3" />
+                                                                )}
+                                                                Save
+                                                            </Button>
+                                                            <Button
+                                                                size="sm"
+                                                                variant="ghost"
+                                                                className="h-8"
+                                                                onClick={() => {
+                                                                    setEditingSourceId(null)
+                                                                    setSourceLabelDraft("")
+                                                                }}
+                                                            >
+                                                                Cancel
+                                                            </Button>
+                                                        </div>
+                                                    </div>
+                                                ) : (
+                                                    <p className="break-words text-sm font-medium">{src.label}</p>
+                                                )}
+                                                <p className="break-all text-xs text-muted-foreground">{src.path}</p>
                                             </div>
                                         </div>
-                                        <div className="flex items-center gap-2">
+                                        <div className="flex flex-wrap items-center gap-2 sm:justify-end">
                                             <Badge
                                                 variant="outline"
                                                 className={`text-xs ${
@@ -805,6 +919,17 @@ export function AdminContent() {
                                                  src.status === 'offline' ? 'Offline (Unplugged)' :
                                                  'Detected'}
                                             </Badge>
+                                            {editingSourceId !== src.id && (
+                                                <Button
+                                                    variant="ghost"
+                                                    size="sm"
+                                                    className="h-8 w-8 p-0 text-muted-foreground hover:text-foreground"
+                                                    onClick={() => handleStartEditSourceLabel(src)}
+                                                    title="Rename drive label"
+                                                >
+                                                    <Pencil className="h-4 w-4" />
+                                                </Button>
+                                            )}
                                             <Button 
                                                 variant="ghost" 
                                                 size="sm" 

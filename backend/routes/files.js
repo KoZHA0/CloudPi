@@ -11,6 +11,7 @@
  * GET    /api/files/search       - Global file/folder search
  * POST   /api/files/folder       - Create new folder
  * POST   /api/files/upload       - Upload file(s)
+ * POST   /api/files/bulk-download - Download selected files/folders as ZIP
  * GET    /api/files/:id/thumbnail - Get rich media thumbnail
  * GET    /api/files/:id/download - Download file or folder (ZIP)
  * PUT    /api/files/:id          - Rename file/folder
@@ -36,12 +37,30 @@ const { spawn } = require('child_process');
 const { computeFileHash, verifyFileHash, encryptFile, decryptToStream, createDecryptStream, isEncryptionEnabled } = require('../utils/crypto-utils');
 const { JWT_SECRET } = require('../utils/auth-config');
 const { ensureProtectedInternalStorageAvailable } = require('../utils/protected-storage');
+const { evaluateStorageQuotaNotification } = require('../utils/notifications');
+const { createActivityEvent } = require('../utils/activity');
+const {
+    saveUploadedFileVersionAware,
+    listFileVersions,
+    restoreFileVersion,
+    deleteFileVersion,
+    deleteAllVersionsForFile,
+    pruneFileVersions,
+    getTotalUsedBytesForUser,
+    getVersionBytesForUser,
+    getVersionBytesForStorageSource,
+} = require('../utils/file-versioning');
 
 const router = express.Router();
 
 // Default storage directory for internal storage (backward compatible)
 const DEFAULT_STORAGE_DIR = path.join(__dirname, '..', 'storage');
 const THUMBNAILS_DIR = path.join(DEFAULT_STORAGE_DIR, '.thumbnails');
+const REGULAR_UPLOAD_TEMP_ROOT = '.upload-tmp';
+const MAX_REGULAR_CHUNK_UPLOAD_BYTES = 6 * 1024 * 1024;
+const DEFAULT_TRASH_RETENTION_DAYS = 30;
+const MAX_TRASH_RETENTION_DAYS = 3650;
+const regularUploadSessions = new Map();
 
 let sharp = null;
 try {
@@ -55,6 +74,11 @@ try {
     ffmpegPath = require('ffmpeg-static');
 } catch (e) {
     console.warn('ffmpeg-static is not installed - video thumbnails are unavailable');
+}
+
+if (ffmpegPath && !fs.existsSync(ffmpegPath)) {
+    console.warn(`ffmpeg binary was not found at ${ffmpegPath} - video thumbnails are unavailable`);
+    ffmpegPath = null;
 }
 
 // Ensure internal storage directory exists
@@ -92,8 +116,80 @@ function resolveFilePath(file) {
     return path.join(basePath, file.path);
 }
 
+function ensureDir(dirPath) {
+    if (!fs.existsSync(dirPath)) {
+        fs.mkdirSync(dirPath, { recursive: true });
+    }
+}
+
+function removePathRecursive(targetPath) {
+    if (!targetPath || !fs.existsSync(targetPath)) return;
+    fs.rmSync(targetPath, { recursive: true, force: true });
+}
+
+function getRegularUploadTempPath(storageSourceId, userId, uploadId) {
+    return path.join(getStorageBasePath(storageSourceId, userId), REGULAR_UPLOAD_TEMP_ROOT, uploadId);
+}
+
+function getRegularUploadChunkPath(tempPath, index) {
+    return path.join(tempPath, `chunk-${String(index).padStart(6, '0')}.part`);
+}
+
 function isVaultItem(file) {
     return !!file && (file.is_secure_vault === 1 || Number.isInteger(file.vault_root_id));
+}
+
+function sanitizeArchiveSegment(segment) {
+    const value = String(segment || 'untitled').replace(/[\\/:*?"<>|]+/g, '_').trim();
+    return value || 'untitled';
+}
+
+function uniqueArchivePathFactory() {
+    const used = new Set();
+    return (archivePath) => {
+        const sanitized = String(archivePath || 'download')
+            .split('/')
+            .filter(Boolean)
+            .map(sanitizeArchiveSegment)
+            .join('/') || 'download';
+
+        if (!used.has(sanitized)) {
+            used.add(sanitized);
+            return sanitized;
+        }
+
+        const ext = path.extname(sanitized);
+        const base = ext ? sanitized.slice(0, -ext.length) : sanitized;
+        let index = 2;
+        let candidate = ext ? `${base} (${index})${ext}` : `${base} (${index})`;
+        while (used.has(candidate)) {
+            index += 1;
+            candidate = ext ? `${base} (${index})${ext}` : `${base} (${index})`;
+        }
+        used.add(candidate);
+        return candidate;
+    };
+}
+
+function sendFileSafely(res, filePath, notFoundMessage = 'File not found on disk') {
+    return res.sendFile(filePath, (err) => {
+        if (!err) return;
+
+        const status = err.statusCode || err.status || 500;
+        if (err.code === 'ECONNABORTED' || err.message === 'Request aborted') {
+            return;
+        }
+
+        if (status !== 404) {
+            console.error('sendFile error:', err.message);
+        }
+
+        if (!res.headersSent) {
+            res.status(status === 404 ? 404 : 500).json({
+                error: status === 404 ? notFoundMessage : 'Failed to send file'
+            });
+        }
+    });
 }
 
 function deleteStoredItem(file) {
@@ -107,6 +203,34 @@ function deleteStoredItem(file) {
     }
 
     fs.unlinkSync(filePath);
+}
+
+function deleteStoredVersionBlob(version) {
+    if (!version || !version.path) return;
+    const filePath = resolveFilePath({
+        user_id: version.user_id,
+        storage_source_id: version.storage_source_id,
+        path: version.path,
+    });
+    if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+    }
+}
+
+function pruneVersionsForFile(fileId) {
+    return pruneFileVersions(db, fileId, deleteStoredVersionBlob);
+}
+
+function pruneAllFileVersions() {
+    const fileIds = db.prepare('SELECT DISTINCT file_id FROM file_versions').all();
+    let pruned = 0;
+    for (const row of fileIds) {
+        pruned += pruneVersionsForFile(row.file_id);
+    }
+    if (pruned > 0) {
+        console.log(`🧹 Pruned ${pruned} old file version(s)`);
+    }
+    return pruned;
 }
 
 function getCurrentFolderContext(userId, folderId) {
@@ -133,6 +257,71 @@ function getCurrentFolderContext(userId, folderId) {
 
     return { folder, vault: vault || null };
 }
+
+function buildFileLocation(userId, parentId) {
+    const pathParts = [];
+    let currentParentId = parentId;
+    const seen = new Set();
+
+    while (currentParentId && !seen.has(currentParentId)) {
+        seen.add(currentParentId);
+        const parent = db.prepare(
+            'SELECT id, name, parent_id FROM files WHERE id = ? AND user_id = ?'
+        ).get(currentParentId, userId);
+        if (!parent) break;
+        pathParts.unshift(parent.name);
+        currentParentId = parent.parent_id;
+    }
+
+    return pathParts.length > 0 ? pathParts.join(' / ') : 'My Files';
+}
+
+function buildFileLink(file) {
+    const params = new URLSearchParams();
+    if (file.parent_id) params.set('folder', String(file.parent_id));
+    if (file.id) params.set('highlight', String(file.id));
+    return `/files?${params.toString()}`;
+}
+
+function logFileActivity(userId, type, file, title, body = null, metadata = {}) {
+    if (!file) return;
+    createActivityEvent({
+        userId,
+        actorId: userId,
+        type,
+        title,
+        body: body || buildFileLocation(userId, file.parent_id),
+        link: type === 'file.deleted' ? null : buildFileLink(file),
+        metadata: {
+            fileId: file.id,
+            fileName: file.name,
+            fileType: file.type,
+            parentId: file.parent_id,
+            ...metadata,
+        },
+    });
+}
+
+const RECENT_TIMESTAMP_SQL = `
+    strftime('%Y-%m-%dT%H:%M:%SZ', max(
+        CAST(strftime('%s', COALESCE(f.created_at, '1970-01-01 00:00:00')) AS INTEGER),
+        CAST(strftime('%s', COALESCE(f.modified_at, f.created_at, '1970-01-01 00:00:00')) AS INTEGER),
+        CAST(strftime('%s', COALESCE(f.accessed_at, f.created_at, '1970-01-01 00:00:00')) AS INTEGER)
+    ), 'unixepoch')
+`;
+
+const RECENT_ACTION_SQL = `
+    CASE
+        WHEN f.accessed_at IS NOT NULL
+             AND datetime(f.accessed_at) >= datetime(COALESCE(f.modified_at, f.created_at))
+             AND datetime(f.accessed_at) >= datetime(f.created_at)
+            THEN 'viewed'
+        WHEN f.modified_at IS NOT NULL
+             AND datetime(f.modified_at) > datetime(f.created_at)
+            THEN 'modified'
+        ELSE 'uploaded'
+    END
+`;
 
 /**
  * Get the user's default storage source ID.
@@ -228,6 +417,66 @@ function getUploadSetting(key, fallback) {
     return row ? parseInt(row.value, 10) : fallback;
 }
 
+function getTrashRetentionDays() {
+    const configuredDays = getUploadSetting('trash_retention_days', DEFAULT_TRASH_RETENTION_DAYS);
+    if (!Number.isFinite(configuredDays) || configuredDays < 1) {
+        return DEFAULT_TRASH_RETENTION_DAYS;
+    }
+    return Math.min(Math.floor(configuredDays), MAX_TRASH_RETENTION_DAYS);
+}
+
+function purgeExpiredTrashForUser(userId, retentionDays = getTrashRetentionDays()) {
+    const days = Math.max(1, Math.min(Number(retentionDays) || DEFAULT_TRASH_RETENTION_DAYS, MAX_TRASH_RETENTION_DAYS));
+    const cutoffModifier = `-${days} days`;
+    const trashedItems = db.prepare(`
+        SELECT id, user_id, path, type, size, storage_source_id, vault_root_id, is_secure_vault
+        FROM files
+        WHERE user_id = ?
+          AND trashed = 1
+          AND trashed_at IS NOT NULL
+          AND datetime(trashed_at) <= datetime('now', ?)
+        ORDER BY CASE WHEN type = 'folder' THEN 0 ELSE 1 END, id ASC
+    `).all(userId, cutoffModifier);
+
+    if (trashedItems.length === 0) {
+        return {
+            deletedItems: 0,
+            deletedFiles: 0,
+            freedBytes: 0,
+        };
+    }
+
+    let deletedFiles = 0;
+    let freedBytes = 0;
+
+    for (const item of trashedItems) {
+        const versionBytes = item.type !== 'folder'
+            ? db.prepare('SELECT COALESCE(SUM(size), 0) as bytes FROM file_versions WHERE file_id = ?').get(item.id).bytes || 0
+            : 0;
+
+        if (item.type !== 'folder') {
+            deleteAllVersionsForFile(db, item.id, deleteStoredVersionBlob);
+            if (item.path) deleteStoredItem(item);
+            deletedFiles += 1;
+            freedBytes += (Number(item.size) || 0) + versionBytes;
+        }
+    }
+
+    db.prepare(`
+        DELETE FROM files
+        WHERE user_id = ?
+          AND trashed = 1
+          AND trashed_at IS NOT NULL
+          AND datetime(trashed_at) <= datetime('now', ?)
+    `).run(userId, cutoffModifier);
+
+    return {
+        deletedItems: trashedItems.length,
+        deletedFiles,
+        freedBytes,
+    };
+}
+
 const uploadHits = new Map(); // IP -> [timestamp, ...]
 const uploadLimiter = (req, res, next) => {
     // Skip CORS preflight
@@ -290,11 +539,19 @@ async function uploadWorker(task, callback) {
     try {
         const { userId, parentId, files, storageSourceId } = task;
         const uploadedFiles = [];
+        const folderCache = new Map();
 
         // Check once per batch whether encryption is enabled
         const shouldEncrypt = isEncryptionEnabled(db);
 
         for (const file of files) {
+            const uploadDestination = resolveUploadDestination(
+                userId,
+                parentId,
+                file.relativePath || file.originalname,
+                storageSourceId || 'internal',
+                folderCache
+            );
             const fileType = getFileType(file.mimetype);
             const diskPath = file.path;
 
@@ -340,28 +597,37 @@ async function uploadWorker(task, callback) {
                 }
             }
 
-            const result = db.prepare(`
-                INSERT INTO files (user_id, name, path, type, size, mime_type, parent_id, storage_source_id, sha256_hash, encrypted, e2ee_iv, encryption_auth_tag)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            `).run(
+            const uploaded = saveUploadedFileVersionAware(db, {
                 userId,
-                file.originalname,
-                file.filename,
-                fileType,
-                finalSize,
-                file.mimetype,
-                parentId,
-                storageSourceId || 'internal',
+                parentId: uploadDestination.parentId,
+                name: uploadDestination.fileName,
+                path: file.filename,
+                type: fileType,
+                size: finalSize,
+                mimeType: file.mimetype,
+                storageSourceId: storageSourceId || 'internal',
                 sha256Hash,
                 encrypted,
-                encryptionIv,
-                encryptionAuthTag
-            );
-
-            const uploaded = db.prepare('SELECT * FROM files WHERE id = ?').get(result.lastInsertRowid);
+                e2eeIv: encryptionIv,
+                encryptionAuthTag,
+            });
+            file._cloudpiCommitted = true;
+            pruneVersionsForFile(uploaded.id);
             uploadedFiles.push(uploaded);
+            const isNewVersion = Number(uploaded.version_number || 1) > 1;
+            logFileActivity(
+                userId,
+                isNewVersion ? 'file.versioned' : 'file.uploaded',
+                uploaded,
+                isNewVersion
+                    ? `Uploaded new version of "${uploaded.name}"`
+                    : `Uploaded "${uploaded.name}"`,
+                null,
+                { versionNumber: uploaded.version_number || 1 }
+            );
         }
 
+        evaluateStorageQuotaNotification(userId);
         callback(null, uploadedFiles);
     } catch (error) {
         callback(error);
@@ -370,6 +636,18 @@ async function uploadWorker(task, callback) {
 
 // Create the queue: concurrency = 1 (one upload processed at a time)
 const uploadQueue = fastq(uploadWorker, 1);
+
+const versionPruneInterval = setInterval(() => {
+    try {
+        pruneAllFileVersions();
+        cleanupStaleRegularUploadSessions();
+    } catch (error) {
+        console.error('Nightly version pruning failed:', error);
+    }
+}, 24 * 60 * 60 * 1000);
+if (typeof versionPruneInterval.unref === 'function') {
+    versionPruneInterval.unref();
+}
 
 /**
  * AUTH MIDDLEWARE
@@ -411,6 +689,9 @@ function requireAuth(req, res, next) {
         if (error.name === 'JsonWebTokenError') {
             return res.status(401).json({ error: 'Invalid token' });
         }
+        if (error.name === 'TokenExpiredError') {
+            return res.status(401).json({ error: 'Token expired' });
+        }
         console.error('Auth error:', error);
         res.status(500).json({ error: 'Server error' });
     }
@@ -435,6 +716,30 @@ function normalizeParentId(parentId) {
     return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
 }
 
+function normalizeUploadRelativePath(relativePath, fallbackName) {
+    const raw = String(relativePath || fallbackName || '').replace(/\\/g, '/');
+    const segments = raw
+        .split('/')
+        .map((segment) => sanitizeArchiveSegment(segment))
+        .filter((segment) => segment && segment !== '.' && segment !== '..');
+
+    if (segments.length === 0) {
+        return sanitizeArchiveSegment(fallbackName || 'upload');
+    }
+
+    return segments.join('/');
+}
+
+function normalizeRelativePathList(value, files) {
+    const list = Array.isArray(value)
+        ? value
+        : value === undefined || value === null
+            ? []
+            : [value];
+
+    return files.map((file, index) => normalizeUploadRelativePath(list[index], file.originalname));
+}
+
 function splitFileName(name) {
     const ext = path.extname(name);
     if (!ext) return { base: name, ext: '' };
@@ -446,7 +751,7 @@ function splitFileName(name) {
 
 function hasNameConflict(userId, parentId, name, excludeId = null) {
     const baseParams = [userId, name];
-    let query = 'SELECT id FROM files WHERE user_id = ? AND name = ? AND trashed = 0';
+    let query = 'SELECT id FROM files WHERE user_id = ? AND name = ? AND trashed = 0 AND (vault_root_id IS NULL OR is_secure_vault = 1)';
 
     if (excludeId) {
         query += ' AND id != ?';
@@ -481,6 +786,134 @@ function getUniqueSiblingName(userId, parentId, originalName, excludeId = null) 
     return `${base} (${Date.now()})${ext}`;
 }
 
+function getUploadFolderCacheKey(parentId, folderName) {
+    return `${parentId ?? 'root'}\u0000${folderName}`;
+}
+
+function getOrCreateUploadFolder(userId, parentId, folderName, storageSourceId, folderCache) {
+    const cacheKey = getUploadFolderCacheKey(parentId, folderName);
+    if (folderCache.has(cacheKey)) {
+        return folderCache.get(cacheKey);
+    }
+
+    const existing = parentId
+        ? db.prepare(`
+            SELECT id
+            FROM files
+            WHERE user_id = ?
+              AND parent_id = ?
+              AND name = ?
+              AND type = 'folder'
+              AND trashed = 0
+              AND (vault_root_id IS NULL OR is_secure_vault = 1)
+        `).get(userId, parentId, folderName)
+        : db.prepare(`
+            SELECT id
+            FROM files
+            WHERE user_id = ?
+              AND parent_id IS NULL
+              AND name = ?
+              AND type = 'folder'
+              AND trashed = 0
+              AND (vault_root_id IS NULL OR is_secure_vault = 1)
+        `).get(userId, folderName);
+
+    if (existing) {
+        folderCache.set(cacheKey, existing.id);
+        return existing.id;
+    }
+
+    const safeName = getUniqueSiblingName(userId, parentId, folderName);
+    const inserted = db.prepare(`
+        INSERT INTO files (user_id, name, path, type, size, mime_type, parent_id, storage_source_id)
+        VALUES (?, ?, '', 'folder', 0, NULL, ?, ?)
+    `).run(userId, safeName, parentId, storageSourceId || 'internal');
+
+    folderCache.set(cacheKey, inserted.lastInsertRowid);
+    logFileActivity(userId, 'folder.created', {
+        id: inserted.lastInsertRowid,
+        name: safeName,
+        type: 'folder',
+        parent_id: parentId,
+    }, `Created folder "${safeName}"`);
+    return inserted.lastInsertRowid;
+}
+
+function resolveUploadDestination(userId, rootParentId, relativePath, storageSourceId, folderCache) {
+    const parts = normalizeUploadRelativePath(relativePath, 'upload').split('/');
+    const fileName = parts.pop() || 'upload';
+    let parentId = rootParentId;
+
+    for (const part of parts) {
+        parentId = getOrCreateUploadFolder(userId, parentId, part, storageSourceId, folderCache);
+    }
+
+    return {
+        parentId,
+        fileName: sanitizeArchiveSegment(fileName),
+    };
+}
+
+function validateUploadParent(userId, parentId) {
+    if (!parentId) return null;
+    const parentFolder = db.prepare(
+        "SELECT id, is_secure_vault, vault_root_id FROM files WHERE id = ? AND user_id = ? AND type = 'folder' AND trashed = 0"
+    ).get(parentId, userId);
+    if (!parentFolder) {
+        const error = new Error('Parent folder not found');
+        error.statusCode = 400;
+        throw error;
+    }
+    if (parentFolder.is_secure_vault === 1 || parentFolder.vault_root_id !== null) {
+        const error = new Error('Encrypted vault uploads must use the secure vault uploader');
+        error.statusCode = 400;
+        throw error;
+    }
+    return parentFolder;
+}
+
+function ensureUploadQuotaAvailable(userId, uploadSize) {
+    const userRow = db.prepare('SELECT storage_quota FROM users WHERE id = ?').get(userId);
+    const quota = userRow?.storage_quota;
+    if (!quota || quota <= 0) return;
+
+    const currentUsed = getTotalUsedBytesForUser(db, userId);
+    if (currentUsed + uploadSize <= quota) return;
+
+    evaluateStorageQuotaNotification(userId, {
+        usedBytes: currentUsed + uploadSize,
+        quotaBytes: quota,
+        forceBucket: 'quota_reached',
+    });
+    const usedMB = (currentUsed / (1024 * 1024)).toFixed(1);
+    const quotaMB = (quota / (1024 * 1024)).toFixed(1);
+    const error = new Error(`Storage quota exceeded. You've used ${usedMB} MB of your ${quotaMB} MB limit.`);
+    error.statusCode = 413;
+    throw error;
+}
+
+function queueUploadedFiles({ userId, parentId, files, storageSourceId, isAdmin }) {
+    const queueMethod = isAdmin ? 'unshift' : 'push';
+    return new Promise((resolve, reject) => {
+        uploadQueue[queueMethod](
+            { userId, parentId, files, storageSourceId },
+            (err, result) => {
+                if (err) reject(err);
+                else resolve(result);
+            }
+        );
+    });
+}
+
+function cleanupStaleRegularUploadSessions(maxAgeHours = 24) {
+    const cutoff = Date.now() - (maxAgeHours * 60 * 60 * 1000);
+    for (const [uploadId, session] of regularUploadSessions.entries()) {
+        if (session.createdAt >= cutoff) continue;
+        removePathRecursive(session.tempPath);
+        regularUploadSessions.delete(uploadId);
+    }
+}
+
 function isFolderDescendant(userId, ancestorId, targetFolderId) {
     let currentId = targetFolderId;
     while (currentId) {
@@ -497,6 +930,11 @@ function isFolderDescendant(userId, ancestorId, targetFolderId) {
 
 function runFfmpeg(args) {
     return new Promise((resolve, reject) => {
+        if (!ffmpegPath) {
+            reject(new Error('ffmpeg binary is unavailable'));
+            return;
+        }
+
         const child = spawn(ffmpegPath, args, { windowsHide: true });
         let stderr = '';
 
@@ -535,15 +973,31 @@ router.get('/', requireAuth, (req, res) => {
 
         let query = `
             SELECT f.id, f.name, f.type, f.size, f.mime_type, f.parent_id, f.starred,
+                   f.version_number,
                    f.created_at, f.modified_at, f.storage_source_id,
                    f.encrypted_metadata, f.storage_id, f.e2ee_iv, f.is_chunked,
                    f.chunk_count, f.vault_root_id, f.is_secure_vault,
-                   COALESCE(ss.is_accessible, 1) as is_accessible
+                   COALESCE(ss.is_accessible, 1) as is_accessible,
+                   (
+                       SELECT COUNT(*)
+                       FROM shares s
+                       WHERE s.file_id = f.id
+                         AND s.shared_by = ?
+                         AND (s.expires_at IS NULL OR datetime(s.expires_at) > datetime('now'))
+                   ) as shared_count,
+                   (
+                       SELECT COUNT(*)
+                       FROM shares s
+                       WHERE s.file_id = f.id
+                         AND s.shared_by = ?
+                         AND (COALESCE(s.share_type, CASE WHEN s.shared_with IS NULL THEN 'link' ELSE 'user' END) = 'link')
+                         AND (s.expires_at IS NULL OR datetime(s.expires_at) > datetime('now'))
+                   ) as public_share_count
             FROM files f
             LEFT JOIN storage_sources ss ON f.storage_source_id = ss.id
             WHERE f.user_id = ? AND f.trashed = 0
         `;
-        const params = [userId];
+        const params = [userId, userId, userId];
 
         if (starredOnly) {
             query += ' AND f.starred = 1';
@@ -556,7 +1010,67 @@ router.get('/', requireAuth, (req, res) => {
 
         query += " ORDER BY CASE WHEN f.type = 'folder' THEN 0 ELSE 1 END, f.name ASC";
 
-        const files = db.prepare(query).all(...params);
+        let files = db.prepare(query).all(...params);
+
+        if (starredOnly) {
+            files = files.map(file => ({
+                ...file,
+                location: buildFileLocation(userId, file.parent_id),
+            }));
+        }
+
+        if (!starredOnly && !parentId) {
+            const shortcuts = db.prepare(`
+                SELECT
+                    -sc.id as id,
+                    f.name,
+                    f.type,
+                    f.size,
+                    f.mime_type,
+                    NULL as parent_id,
+                    0 as starred,
+                    f.version_number,
+                    sc.created_at,
+                    f.modified_at,
+                    f.storage_source_id,
+                    NULL as encrypted_metadata,
+                    f.storage_id,
+                    f.e2ee_iv,
+                    f.is_chunked,
+                    f.chunk_count,
+                    f.vault_root_id,
+                    f.is_secure_vault,
+                    COALESCE(ss.is_accessible, 1) as is_accessible,
+                    0 as shared_count,
+                    0 as public_share_count,
+                    1 as is_share_shortcut,
+                    sc.id as shortcut_id,
+                    s.id as share_id,
+                    s.file_id as target_file_id,
+                    s.permission as share_permission,
+                    s.allow_download as share_allow_download,
+                    s.expires_at as share_expires_at,
+                    u.username as shared_by_name
+                FROM share_shortcuts sc
+                JOIN shares s ON sc.share_id = s.id
+                JOIN files f ON s.file_id = f.id
+                JOIN users u ON s.shared_by = u.id
+                LEFT JOIN storage_sources ss ON f.storage_source_id = ss.id
+                WHERE sc.user_id = ?
+                  AND s.shared_with = ?
+                  AND f.trashed = 0
+                  AND COALESCE(s.share_type, 'user') = 'user'
+                  AND s.permission != 'upload'
+                  AND (s.expires_at IS NULL OR datetime(s.expires_at) > datetime('now'))
+                ORDER BY CASE WHEN f.type = 'folder' THEN 0 ELSE 1 END, f.name ASC
+            `).all(userId, userId);
+
+            files = [...files, ...shortcuts].sort((a, b) => {
+                if (a.type === 'folder' && b.type !== 'folder') return -1;
+                if (a.type !== 'folder' && b.type === 'folder') return 1;
+                return String(a.name || '').localeCompare(String(b.name || ''));
+            });
+        }
 
         // Get breadcrumb path
         let breadcrumbs = [];
@@ -616,18 +1130,41 @@ router.get('/', requireAuth, (req, res) => {
 router.get('/trash', requireAuth, (req, res) => {
     try {
         const userId = req.user.userId;
+        const retentionDays = getTrashRetentionDays();
+        let purged = {
+            deletedItems: 0,
+            deletedFiles: 0,
+            freedBytes: 0,
+        };
+
+        try {
+            purged = purgeExpiredTrashForUser(userId, retentionDays);
+        } catch (cleanupError) {
+            console.error('Trash retention cleanup error:', cleanupError);
+        }
 
         const files = db.prepare(`
-            SELECT id, name, type, size, mime_type, trashed_at
-            FROM files 
-            WHERE user_id = ? AND trashed = 1
-            AND (parent_id IS NULL OR parent_id NOT IN (
-                SELECT id FROM files WHERE trashed = 1
+            SELECT f.id, f.name, f.type, f.size, f.mime_type, f.parent_id, f.starred,
+                   f.version_number,
+                   f.created_at, f.modified_at, f.trashed_at, f.storage_source_id,
+                   f.encrypted_metadata, f.storage_id, f.e2ee_iv, f.is_chunked,
+                   f.chunk_count, f.vault_root_id, f.is_secure_vault,
+                   COALESCE(ss.is_accessible, 1) as is_accessible,
+                   0 as shared_count,
+                   0 as public_share_count
+            FROM files f
+            LEFT JOIN storage_sources ss ON f.storage_source_id = ss.id
+            WHERE f.user_id = ? AND f.trashed = 1
+            AND (f.parent_id IS NULL OR f.parent_id NOT IN (
+                SELECT id FROM files WHERE trashed = 1 AND user_id = ?
             ))
             ORDER BY trashed_at DESC
-        `).all(userId);
+        `).all(userId, userId).map(file => ({
+            ...file,
+            location: buildFileLocation(userId, file.parent_id),
+        }));
 
-        res.json({ files });
+        res.json({ files, retentionDays, purged });
     } catch (error) {
         console.error('List trash error:', error);
         res.status(500).json({ error: 'Server error' });
@@ -636,21 +1173,45 @@ router.get('/trash', requireAuth, (req, res) => {
 
 /**
  * GET /api/files/recent
- * Get recently modified files (MUST come before /:id routes)
+ * Get recently active files (MUST come before /:id routes)
  */
 router.get('/recent', requireAuth, (req, res) => {
     try {
         const userId = req.user.userId;
 
         const files = db.prepare(`
-            SELECT f.id, f.name, f.type, f.size, f.mime_type, f.parent_id, f.starred, f.modified_at,
-                   COALESCE(ss.is_accessible, 1) as is_accessible
+            SELECT f.id, f.name, f.type, f.size, f.mime_type, f.parent_id, f.starred,
+                   f.version_number,
+                   f.created_at, f.modified_at, f.accessed_at, f.storage_source_id,
+                   f.encrypted_metadata, f.storage_id, f.e2ee_iv, f.is_chunked,
+                   f.chunk_count, f.vault_root_id, f.is_secure_vault,
+                   COALESCE(ss.is_accessible, 1) as is_accessible,
+                   ${RECENT_TIMESTAMP_SQL} as recent_at,
+                   ${RECENT_ACTION_SQL} as recent_action,
+                   (
+                       SELECT COUNT(*)
+                       FROM shares s
+                       WHERE s.file_id = f.id
+                         AND s.shared_by = ?
+                         AND (s.expires_at IS NULL OR datetime(s.expires_at) > datetime('now'))
+                   ) as shared_count,
+                   (
+                       SELECT COUNT(*)
+                       FROM shares s
+                       WHERE s.file_id = f.id
+                         AND s.shared_by = ?
+                         AND (COALESCE(s.share_type, CASE WHEN s.shared_with IS NULL THEN 'link' ELSE 'user' END) = 'link')
+                         AND (s.expires_at IS NULL OR datetime(s.expires_at) > datetime('now'))
+                   ) as public_share_count
             FROM files f
             LEFT JOIN storage_sources ss ON f.storage_source_id = ss.id
             WHERE f.user_id = ? AND f.trashed = 0 AND f.type != 'folder'
-            ORDER BY f.modified_at DESC
-            LIMIT 20
-        `).all(userId);
+            ORDER BY datetime(recent_at) DESC, f.id DESC
+            LIMIT 50
+        `).all(userId, userId, userId).map(file => ({
+            ...file,
+            location: buildFileLocation(userId, file.parent_id),
+        }));
 
         res.json({ files });
     } catch (error) {
@@ -668,46 +1229,105 @@ router.get('/search', requireAuth, (req, res) => {
     try {
         const userId = req.user.userId;
         const query = req.query.q;
+        const type = String(req.query.type || 'all');
+        const starredOnly = req.query.starred === 'true';
+        const sharedOnly = req.query.shared === 'true';
+        const minSize = req.query.min_size !== undefined ? Number(req.query.min_size) : null;
+        const maxSize = req.query.max_size !== undefined ? Number(req.query.max_size) : null;
+        const modifiedAfter = req.query.modified_after ? String(req.query.modified_after) : null;
+        const modifiedBefore = req.query.modified_before ? String(req.query.modified_before) : null;
+        const sort = ['name', 'modified', 'size', 'type'].includes(String(req.query.sort)) ? String(req.query.sort) : 'relevance';
+        const direction = req.query.direction === 'asc' ? 'ASC' : 'DESC';
 
         if (!query || String(query).trim().length === 0) {
             return res.json({ files: [], query: '' });
         }
 
         const searchTerm = `%${String(query).trim()}%`;
+        const conditions = ['f.user_id = ?', 'f.trashed = 0', 'f.name LIKE ?'];
+        const params = [userId, searchTerm];
+
+        if (type !== 'all') {
+            conditions.push('f.type = ?');
+            params.push(type);
+        }
+
+        if (starredOnly) {
+            conditions.push('f.starred = 1');
+        }
+
+        if (sharedOnly) {
+            conditions.push(`EXISTS (
+                SELECT 1
+                FROM shares s
+                WHERE s.file_id = f.id
+                  AND s.shared_by = ?
+                  AND (s.expires_at IS NULL OR datetime(s.expires_at) > datetime('now'))
+            )`);
+            params.push(userId);
+        }
+
+        if (Number.isFinite(minSize) && minSize !== null) {
+            conditions.push('f.size >= ?');
+            params.push(minSize);
+        }
+
+        if (Number.isFinite(maxSize) && maxSize !== null) {
+            conditions.push('f.size <= ?');
+            params.push(maxSize);
+        }
+
+        if (modifiedAfter) {
+            conditions.push('datetime(f.modified_at) >= datetime(?)');
+            params.push(modifiedAfter);
+        }
+
+        if (modifiedBefore) {
+            conditions.push('datetime(f.modified_at) <= datetime(?)');
+            params.push(modifiedBefore);
+        }
+
+        const sortClauses = {
+            relevance: "CASE WHEN f.type = 'folder' THEN 0 ELSE 1 END ASC, f.modified_at DESC",
+            name: `f.name COLLATE NOCASE ${direction}`,
+            modified: `datetime(f.modified_at) ${direction}`,
+            size: `f.size ${direction}`,
+            type: `f.type COLLATE NOCASE ${direction}, f.name COLLATE NOCASE ASC`,
+        };
 
         const files = db.prepare(`
             SELECT f.id, f.name, f.type, f.size, f.mime_type, f.parent_id, f.starred,
-                   f.created_at, f.modified_at,
-                   COALESCE(ss.is_accessible, 1) as is_accessible
+                   f.version_number,
+                   f.created_at, f.modified_at, f.storage_source_id,
+                   f.encrypted_metadata, f.storage_id, f.e2ee_iv, f.is_chunked,
+                   f.chunk_count, f.vault_root_id, f.is_secure_vault,
+                   COALESCE(ss.is_accessible, 1) as is_accessible,
+                   (
+                       SELECT COUNT(*)
+                       FROM shares s
+                       WHERE s.file_id = f.id
+                         AND s.shared_by = ?
+                         AND (s.expires_at IS NULL OR datetime(s.expires_at) > datetime('now'))
+                   ) as shared_count,
+                   (
+                       SELECT COUNT(*)
+                       FROM shares s
+                       WHERE s.file_id = f.id
+                         AND s.shared_by = ?
+                         AND (COALESCE(s.share_type, CASE WHEN s.shared_with IS NULL THEN 'link' ELSE 'user' END) = 'link')
+                         AND (s.expires_at IS NULL OR datetime(s.expires_at) > datetime('now'))
+                   ) as public_share_count
             FROM files f
             LEFT JOIN storage_sources ss ON f.storage_source_id = ss.id
-            WHERE f.user_id = ? AND f.trashed = 0 AND f.name LIKE ?
-            ORDER BY 
-                CASE WHEN f.type = 'folder' THEN 0 ELSE 1 END,
-                f.modified_at DESC
+            WHERE ${conditions.join(' AND ')}
+            ORDER BY ${sortClauses[sort]}
             LIMIT 50
-        `).all(userId, searchTerm);
+        `).all(userId, userId, ...params);
 
-        // Build path breadcrumbs for each result so the user knows WHERE the file is
-        const results = files.map(file => {
-            const pathParts = [];
-            let parentId = file.parent_id;
-            while (parentId) {
-                const parent = db.prepare(
-                    'SELECT id, name, parent_id FROM files WHERE id = ? AND user_id = ?'
-                ).get(parentId, userId);
-                if (parent) {
-                    pathParts.unshift(parent.name);
-                    parentId = parent.parent_id;
-                } else {
-                    break;
-                }
-            }
-            return {
-                ...file,
-                location: pathParts.length > 0 ? pathParts.join(' / ') : 'Root'
-            };
-        });
+        const results = files.map(file => ({
+            ...file,
+            location: buildFileLocation(userId, file.parent_id),
+        }));
 
         res.json({ files: results, query: String(query).trim() });
     } catch (error) {
@@ -768,6 +1388,7 @@ router.post('/folder', requireAuth, (req, res) => {
         `).run(userId, name.trim(), parent_id || null);
 
         const folder = db.prepare('SELECT * FROM files WHERE id = ?').get(result.lastInsertRowid);
+        logFileActivity(userId, 'folder.created', folder, `Created folder "${folder.name}"`);
 
         res.status(201).json({ 
             message: 'Folder created successfully',
@@ -775,6 +1396,197 @@ router.post('/folder', requireAuth, (req, res) => {
         });
     } catch (error) {
         console.error('Create folder error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+/**
+ * POST /api/files/uploads/init
+ * Start a regular chunked upload session.
+ */
+router.post('/uploads/init', uploadLimiter, requireAuth, (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const parentId = normalizeParentId(req.body.parent_id);
+        const name = sanitizeArchiveSegment(req.body.name || 'upload');
+        const size = Number(req.body.size);
+        const mimeType = String(req.body.mime_type || 'application/octet-stream');
+        const relativePath = normalizeUploadRelativePath(req.body.relative_path || name, name);
+        const chunkCount = Number(req.body.chunk_count);
+
+        if (!name.trim()) {
+            return res.status(400).json({ error: 'File name is required' });
+        }
+        if (!Number.isFinite(size) || size < 0) {
+            return res.status(400).json({ error: 'Invalid file size' });
+        }
+        if (!Number.isInteger(chunkCount) || chunkCount < 0 || (size > 0 && chunkCount < 1)) {
+            return res.status(400).json({ error: 'Invalid chunk count' });
+        }
+
+        validateUploadParent(userId, parentId);
+        ensureUploadQuotaAvailable(userId, size);
+
+        const storageSourceId = getUserStorageId(userId);
+        const uploadId = uuidv4();
+        const tempPath = getRegularUploadTempPath(storageSourceId, userId, uploadId);
+        ensureDir(tempPath);
+
+        regularUploadSessions.set(uploadId, {
+            id: uploadId,
+            userId,
+            parentId,
+            storageSourceId,
+            name,
+            size,
+            mimeType,
+            relativePath,
+            chunkCount,
+            finalFilename: `${uuidv4()}${path.extname(name)}`,
+            tempPath,
+            createdAt: Date.now(),
+        });
+
+        return res.status(201).json({
+            upload: {
+                id: uploadId,
+                chunk_count: chunkCount,
+                chunk_size: MAX_REGULAR_CHUNK_UPLOAD_BYTES,
+            },
+        });
+    } catch (error) {
+        console.error('Init chunked upload error:', error);
+        res.status(error.statusCode || 500).json({ error: error.message || 'Server error' });
+    }
+});
+
+/**
+ * PUT /api/files/uploads/:uploadId/chunks/:index
+ * Store one regular file upload chunk.
+ */
+router.put(
+    '/uploads/:uploadId/chunks/:index',
+    requireAuth,
+    express.raw({ type: 'application/octet-stream', limit: `${MAX_REGULAR_CHUNK_UPLOAD_BYTES}b` }),
+    (req, res) => {
+        try {
+            const userId = req.user.userId;
+            const uploadId = String(req.params.uploadId);
+            const index = Number(req.params.index);
+            const session = regularUploadSessions.get(uploadId);
+
+            if (!session || session.userId !== userId) {
+                return res.status(404).json({ error: 'Upload session not found' });
+            }
+            if (!Number.isInteger(index) || index < 0 || index >= session.chunkCount) {
+                return res.status(400).json({ error: 'Chunk index is out of range' });
+            }
+            if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+                return res.status(400).json({ error: 'Chunk body is required' });
+            }
+
+            ensureDir(session.tempPath);
+            fs.writeFileSync(getRegularUploadChunkPath(session.tempPath, index), req.body);
+            return res.json({ message: 'Chunk stored' });
+        } catch (error) {
+            console.error('Store chunked upload chunk error:', error);
+            res.status(500).json({ error: 'Server error' });
+        }
+    },
+);
+
+/**
+ * POST /api/files/uploads/:uploadId/complete
+ * Assemble chunks, process through versioning/encryption, and create DB record.
+ */
+router.post('/uploads/:uploadId/complete', requireAuth, async (req, res) => {
+    const userId = req.user.userId;
+    const uploadId = String(req.params.uploadId);
+    const session = regularUploadSessions.get(uploadId);
+    let finalPath = null;
+    let assembledFile = null;
+
+    try {
+        if (!session || session.userId !== userId) {
+            return res.status(404).json({ error: 'Upload session not found' });
+        }
+
+        for (let index = 0; index < session.chunkCount; index += 1) {
+            if (!fs.existsSync(getRegularUploadChunkPath(session.tempPath, index))) {
+                return res.status(400).json({ error: `Missing uploaded chunk ${index + 1}` });
+            }
+        }
+
+        finalPath = path.join(getStorageBasePath(session.storageSourceId, userId), session.finalFilename);
+        ensureDir(path.dirname(finalPath));
+
+        const writeFd = fs.openSync(finalPath, 'w');
+        try {
+            for (let index = 0; index < session.chunkCount; index += 1) {
+                const chunk = fs.readFileSync(getRegularUploadChunkPath(session.tempPath, index));
+                fs.writeSync(writeFd, chunk);
+            }
+        } finally {
+            fs.closeSync(writeFd);
+        }
+
+        const actualSize = fs.statSync(finalPath).size;
+        if (actualSize !== session.size) {
+            throw new Error(`Upload size mismatch for ${session.name}`);
+        }
+
+        assembledFile = {
+            originalname: session.name,
+            filename: session.finalFilename,
+            path: finalPath,
+            mimetype: session.mimeType,
+            size: actualSize,
+            relativePath: session.relativePath,
+        };
+
+        const uploadedFiles = await queueUploadedFiles({
+            userId,
+            parentId: session.parentId,
+            files: [assembledFile],
+            storageSourceId: session.storageSourceId,
+            isAdmin: req.user.is_admin === 1,
+        });
+
+        removePathRecursive(session.tempPath);
+        regularUploadSessions.delete(uploadId);
+
+        return res.status(201).json({
+            message: 'File uploaded successfully',
+            file: uploadedFiles[0],
+        });
+    } catch (error) {
+        console.error('Complete chunked upload error:', error);
+        if (assembledFile && !assembledFile._cloudpiCommitted && finalPath && fs.existsSync(finalPath)) {
+            try { fs.unlinkSync(finalPath); } catch (_) { /* ignore */ }
+        }
+        res.status(error.statusCode || 500).json({ error: error.message || 'Server error' });
+    }
+});
+
+/**
+ * DELETE /api/files/uploads/:uploadId
+ * Abort a regular chunked upload session.
+ */
+router.delete('/uploads/:uploadId', requireAuth, (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const uploadId = String(req.params.uploadId);
+        const session = regularUploadSessions.get(uploadId);
+
+        if (!session || session.userId !== userId) {
+            return res.status(404).json({ error: 'Upload session not found' });
+        }
+
+        removePathRecursive(session.tempPath);
+        regularUploadSessions.delete(uploadId);
+        return res.json({ message: 'Upload session aborted' });
+    } catch (error) {
+        console.error('Abort chunked upload error:', error);
         res.status(500).json({ error: 'Server error' });
     }
 });
@@ -803,17 +1615,24 @@ router.post('/upload', uploadLimiter, requireAuth, upload.array('files', 10), as
             return res.status(400).json({ error: 'No files uploaded' });
         }
 
+        const relativePaths = normalizeRelativePathList(req.body.relative_paths, req.files);
+        req.files.forEach((file, index) => {
+            file.relativePath = relativePaths[index];
+        });
+
         // --- Storage Quota Check ---
         const userRow = db.prepare('SELECT storage_quota FROM users WHERE id = ?').get(userId);
         const quota = userRow?.storage_quota; // NULL = unlimited
         if (quota && quota > 0) {
-            const usedRow = db.prepare(
-                "SELECT COALESCE(SUM(size), 0) as used FROM files WHERE user_id = ? AND trashed = 0 AND type != 'folder'"
-            ).get(userId);
-            const currentUsed = usedRow.used || 0;
+            const currentUsed = getTotalUsedBytesForUser(db, userId);
             const uploadSize = req.files.reduce((sum, f) => sum + f.size, 0);
 
             if (currentUsed + uploadSize > quota) {
+                evaluateStorageQuotaNotification(userId, {
+                    usedBytes: currentUsed + uploadSize,
+                    quotaBytes: quota,
+                    forceBucket: 'quota_reached',
+                });
                 // Cleanup uploaded temp files
                 req.files.forEach(f => {
                     if (f.path && fs.existsSync(f.path)) {
@@ -872,7 +1691,7 @@ router.post('/upload', uploadLimiter, requireAuth, upload.array('files', 10), as
         // CLEANUP - delete uploaded files if processing failed
         if (req.files) {
             req.files.forEach(file => {
-                if (file.path && fs.existsSync(file.path)) {
+                if (!file._cloudpiCommitted && file.path && fs.existsSync(file.path)) {
                     try {
                         fs.unlinkSync(file.path);
                         console.log('Cleaned up:', file.filename);
@@ -883,13 +1702,207 @@ router.post('/upload', uploadLimiter, requireAuth, upload.array('files', 10), as
             });
         }
 
-        res.status(500).json({ error: 'Server error during upload' });
+        res.status(error.statusCode || 500).json({ error: error.message || 'Server error during upload' });
+    }
+});
+
+/**
+ * POST /api/files/bulk-download
+ * Streams selected files and folders as one ZIP archive.
+ */
+router.post('/bulk-download', requireAuth, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const fileIds = Array.isArray(req.body.fileIds)
+            ? [...new Set(req.body.fileIds.map(Number).filter((id) => Number.isInteger(id) && id > 0))]
+            : [];
+
+        if (fileIds.length === 0) {
+            return res.status(400).json({ error: 'No files selected' });
+        }
+
+        if (fileIds.length > 100) {
+            return res.status(400).json({ error: 'Select 100 items or fewer for one ZIP download' });
+        }
+
+        const placeholders = fileIds.map(() => '?').join(',');
+        const selectedItems = db.prepare(`
+            SELECT *
+            FROM files
+            WHERE user_id = ?
+              AND trashed = 0
+              AND id IN (${placeholders})
+            ORDER BY CASE WHEN type = 'folder' THEN 0 ELSE 1 END, name ASC
+        `).all(userId, ...fileIds);
+
+        if (selectedItems.length === 0) {
+            return res.status(404).json({ error: 'Selected files were not found' });
+        }
+
+        if (selectedItems.some(isVaultItem)) {
+            return res.status(400).json({ error: 'Encrypted vault items cannot be included in server-side ZIP downloads yet' });
+        }
+
+        const selectedFolderIds = new Set(selectedItems.filter((item) => item.type === 'folder').map((item) => item.id));
+        const topLevelItems = selectedItems.filter((item) => {
+            let parentId = item.parent_id;
+            while (parentId) {
+                if (selectedFolderIds.has(parentId)) return false;
+                const parent = db.prepare('SELECT id, parent_id FROM files WHERE id = ? AND user_id = ?').get(parentId, userId);
+                if (!parent) break;
+                parentId = parent.parent_id;
+            }
+            return true;
+        });
+
+        const uniqueArchivePath = uniqueArchivePathFactory();
+        const archiveEntries = [];
+        const missing = [];
+
+        function collectItem(item, archivePath) {
+            if (item.type === 'folder') {
+                const folderPath = uniqueArchivePath(archivePath);
+                archiveEntries.push({ type: 'directory', archivePath: `${folderPath}/` });
+
+                const children = db.prepare(`
+                    SELECT *
+                    FROM files
+                    WHERE parent_id = ?
+                      AND user_id = ?
+                      AND trashed = 0
+                    ORDER BY CASE WHEN type = 'folder' THEN 0 ELSE 1 END, name ASC
+                `).all(item.id, userId);
+
+                for (const child of children) {
+                    collectItem(child, `${folderPath}/${child.name}`);
+                }
+                return;
+            }
+
+            const diskPath = resolveFilePath(item);
+            if (!fs.existsSync(diskPath)) {
+                missing.push(item.name);
+                return;
+            }
+
+            archiveEntries.push({
+                type: 'file',
+                diskPath,
+                archivePath: uniqueArchivePath(archivePath),
+                encrypted: item.encrypted === 1,
+            });
+        }
+
+        for (const item of topLevelItems) {
+            collectItem(item, item.name);
+        }
+
+        if (archiveEntries.length === 0) {
+            return res.status(400).json({ error: 'No downloadable files were found in the selection' });
+        }
+
+        const zipName = topLevelItems.length === 1
+            ? `${sanitizeArchiveSegment(topLevelItems[0].name)}.zip`
+            : `cloudpi-selection-${new Date().toISOString().slice(0, 10)}.zip`;
+
+        res.set('Content-Type', 'application/zip');
+        res.set('Content-Disposition', `attachment; filename="${encodeURIComponent(zipName)}"`);
+        if (missing.length > 0) {
+            res.set('X-Skipped-Files', encodeURIComponent(missing.slice(0, 10).join(', ')));
+        }
+
+        const archive = archiver('zip', { zlib: { level: 5 } });
+        archive.on('error', (err) => {
+            console.error('Bulk ZIP error:', err);
+            if (!res.headersSent) res.status(500).json({ error: 'ZIP creation failed' });
+        });
+        archive.pipe(res);
+
+        for (const entry of archiveEntries) {
+            if (entry.type === 'directory') {
+                archive.append('', { name: entry.archivePath });
+                continue;
+            }
+
+            if (entry.encrypted) {
+                try {
+                    const { stream: decStream } = createDecryptStream(entry.diskPath);
+                    archive.append(decStream, { name: entry.archivePath });
+                } catch (decErr) {
+                    console.error(`Skipping encrypted file in bulk ZIP (decrypt failed): ${entry.archivePath}`, decErr.message);
+                }
+            } else {
+                archive.file(entry.diskPath, { name: entry.archivePath });
+            }
+        }
+
+        archive.finalize();
+    } catch (error) {
+        console.error('Bulk download error:', error);
+        if (!res.headersSent) res.status(500).json({ error: error.message || 'Server error during bulk download' });
     }
 });
 
 // ============================================
 // DYNAMIC ROUTES (with :id parameter)
 // ============================================
+
+/**
+ * GET /api/files/:id/versions
+ * List version history for a regular file.
+ */
+router.get('/:id/versions', requireAuth, (req, res) => {
+    try {
+        const fileId = Number(req.params.id);
+        const history = listFileVersions(db, req.user.userId, fileId);
+        if (!history) {
+            return res.status(404).json({ error: 'Versioned file not found' });
+        }
+        res.json(history);
+    } catch (error) {
+        console.error('List versions error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+/**
+ * POST /api/files/:id/versions/:versionId/restore
+ * Promote an old version back to the live file.
+ */
+router.post('/:id/versions/:versionId/restore', requireAuth, (req, res) => {
+    try {
+        const fileId = Number(req.params.id);
+        const versionId = Number(req.params.versionId);
+        const updated = restoreFileVersion(db, req.user.userId, fileId, versionId);
+        if (!updated) {
+            return res.status(404).json({ error: 'Version not found' });
+        }
+        pruneVersionsForFile(updated.id);
+        res.json({ message: 'Version restored successfully', file: updated });
+    } catch (error) {
+        console.error('Restore version error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+/**
+ * DELETE /api/files/:id/versions/:versionId
+ * Delete one old version and its physical blob.
+ */
+router.delete('/:id/versions/:versionId', requireAuth, (req, res) => {
+    try {
+        const fileId = Number(req.params.id);
+        const versionId = Number(req.params.versionId);
+        const deleted = deleteFileVersion(db, req.user.userId, fileId, versionId, deleteStoredVersionBlob);
+        if (!deleted) {
+            return res.status(404).json({ error: 'Version not found' });
+        }
+        res.json({ message: 'Version deleted successfully' });
+    } catch (error) {
+        console.error('Delete version error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
 
 /**
  * GET /api/files/:id/thumbnail
@@ -921,10 +1934,8 @@ router.get('/:id/thumbnail', async (req, res) => {
         const dbUser = db.prepare('SELECT token_version, is_disabled FROM users WHERE id = ?').get(userId);
         if (!dbUser) return res.status(401).json({ error: 'User not found' });
         if (dbUser.is_disabled) return res.status(403).json({ error: 'Account is disabled' });
-        if (decoded.tokenVersion !== undefined) {
-            if (decoded.tokenVersion !== (dbUser.token_version || 1)) {
-                return res.status(401).json({ error: 'Token invalidated' });
-            }
+        if (decoded.tokenVersion === undefined || decoded.tokenVersion !== (dbUser.token_version || 1)) {
+            return res.status(401).json({ error: 'Token expired or invalidated' });
         }
 
         const file = db.prepare(
@@ -969,7 +1980,7 @@ router.get('/:id/thumbnail', async (req, res) => {
                 res.set('Cache-Control', 'public, max-age=86400');
                 res.set('X-Thumbnail-Fallback', 'original');
                 res.set('Content-Type', file.mime_type || 'application/octet-stream');
-                return res.sendFile(filePath);
+                return sendFileSafely(res, filePath);
             }
 
             const thumbPath = path.join(thumbDir, `${file.id}-${size}.webp`);
@@ -984,7 +1995,7 @@ router.get('/:id/thumbnail', async (req, res) => {
 
             res.set('Cache-Control', 'public, max-age=86400');
             res.set('Content-Type', 'image/webp');
-            return res.sendFile(thumbPath);
+            return sendFileSafely(res, thumbPath, 'Thumbnail not found');
         }
 
         if (file.type === 'video') {
@@ -1033,13 +2044,13 @@ router.get('/:id/thumbnail', async (req, res) => {
 
             res.set('Cache-Control', 'public, max-age=86400');
             res.set('Content-Type', 'image/jpeg');
-            return res.sendFile(thumbPath);
+            return sendFileSafely(res, thumbPath, 'Thumbnail not found');
         }
 
         return res.status(400).json({ error: 'Thumbnails are only available for images and videos' });
     } catch (error) {
         if (error.name === 'JsonWebTokenError' || error.name === 'TokenExpiredError') {
-            return res.status(401).json({ error: 'Invalid token' });
+            return res.status(401).json({ error: error.name === 'TokenExpiredError' ? 'Token expired' : 'Invalid token' });
         }
         console.error('Thumbnail error:', error);
         return res.status(500).json({ error: 'Server error during thumbnail generation' });
@@ -1075,10 +2086,8 @@ router.get('/:id/preview', async (req, res) => {
         if (!dbUser) return res.status(401).json({ error: 'User not found' });
         if (dbUser.is_disabled) return res.status(403).json({ error: 'Account is disabled' });
         
-        if (decoded.tokenVersion !== undefined) {
-            if (decoded.tokenVersion !== (dbUser.token_version || 1)) {
-                return res.status(401).json({ error: 'Token invalidated' });
-            }
+        if (decoded.tokenVersion === undefined || decoded.tokenVersion !== (dbUser.token_version || 1)) {
+            return res.status(401).json({ error: 'Token expired or invalidated' });
         }
 
         const file = db.prepare(
@@ -1116,6 +2125,9 @@ router.get('/:id/preview', async (req, res) => {
             return res.status(404).json({ error: 'File not found on disk' });
         }
 
+        db.prepare('UPDATE files SET accessed_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?')
+            .run(file.id, userId);
+
         // When raw=1 is set, serve as application/octet-stream to bypass
         // download managers (IDM) that intercept PDF content types
         const contentType = req.query.raw === '1'
@@ -1140,11 +2152,11 @@ router.get('/:id/preview', async (req, res) => {
                 }
             }
         } else {
-            res.sendFile(filePath);
+            sendFileSafely(res, filePath);
         }
     } catch (error) {
         if (error.name === 'JsonWebTokenError' || error.name === 'TokenExpiredError') {
-            return res.status(401).json({ error: 'Invalid token' });
+            return res.status(401).json({ error: error.name === 'TokenExpiredError' ? 'Token expired' : 'Invalid token' });
         }
         console.error('Preview error:', error);
         res.status(500).json({ error: 'Server error during preview' });
@@ -1352,6 +2364,14 @@ router.put('/:id', requireAuth, (req, res) => {
         `).run(name.trim(), fileId);
 
         const updated = db.prepare('SELECT * FROM files WHERE id = ?').get(fileId);
+        logFileActivity(
+            userId,
+            file.type === 'folder' ? 'folder.renamed' : 'file.renamed',
+            updated,
+            `Renamed "${file.name}" to "${updated.name}"`,
+            buildFileLocation(userId, updated.parent_id),
+            { previousName: file.name }
+        );
 
         res.json({ message: 'Renamed successfully', file: updated });
     } catch (error) {
@@ -1443,6 +2463,16 @@ router.put('/:id/move', requireAuth, (req, res) => {
             db.prepare('UPDATE files SET name = ?, modified_at = CURRENT_TIMESTAMP WHERE id = ?')
                 .run(finalName, file.id);
         }
+
+        const moved = db.prepare('SELECT * FROM files WHERE id = ?').get(file.id);
+        logFileActivity(
+            userId,
+            file.type === 'folder' ? 'folder.moved' : 'file.moved',
+            moved,
+            `Moved "${moved.name}"`,
+            buildFileLocation(userId, moved.parent_id),
+            { previousParentId: file.parent_id }
+        );
 
         res.json({
             message: finalName === file.name
@@ -1552,6 +2582,15 @@ router.post('/:id/copy', requireAuth, (req, res) => {
         };
 
         const copiedItem = copyRecursive(source, destinationParentId);
+        evaluateStorageQuotaNotification(userId);
+        logFileActivity(
+            userId,
+            source.type === 'folder' ? 'folder.copied' : 'file.copied',
+            copiedItem,
+            `Copied "${source.name}"`,
+            buildFileLocation(userId, copiedItem.parent_id),
+            { sourceId: source.id }
+        );
 
         res.status(201).json({
             message: source.type === 'folder' ? 'Folder copied successfully' : 'File copied successfully',
@@ -1580,17 +2619,21 @@ router.put('/:id/restore', requireAuth, (req, res) => {
             return res.status(404).json({ error: 'File not found in trash' });
         }
 
+        const restoredName = getUniqueSiblingName(userId, file.parent_id, file.name, file.id);
+
         // Restore file
         db.prepare(`
-            UPDATE files SET trashed = 0, trashed_at = NULL WHERE id = ?
-        `).run(fileId);
+            UPDATE files SET trashed = 0, trashed_at = NULL, name = ?, modified_at = CURRENT_TIMESTAMP WHERE id = ?
+        `).run(restoredName, fileId);
 
         // Also restore children if it's a folder
         if (file.type === 'folder') {
             const restoreChildren = (parentId) => {
-                const children = db.prepare('SELECT id, type FROM files WHERE parent_id = ?').all(parentId);
+                const children = db.prepare('SELECT id, type, name, parent_id FROM files WHERE parent_id = ?').all(parentId);
                 for (const child of children) {
-                    db.prepare('UPDATE files SET trashed = 0, trashed_at = NULL WHERE id = ?').run(child.id);
+                    const childName = getUniqueSiblingName(userId, child.parent_id, child.name, child.id);
+                    db.prepare('UPDATE files SET trashed = 0, trashed_at = NULL, name = ?, modified_at = CURRENT_TIMESTAMP WHERE id = ?')
+                        .run(childName, child.id);
                     if (child.type === 'folder') {
                         restoreChildren(child.id);
                     }
@@ -1599,7 +2642,20 @@ router.put('/:id/restore', requireAuth, (req, res) => {
             restoreChildren(fileId);
         }
 
-        res.json({ message: 'Restored successfully' });
+        evaluateStorageQuotaNotification(userId);
+        const restored = db.prepare('SELECT * FROM files WHERE id = ?').get(fileId);
+        logFileActivity(
+            userId,
+            file.type === 'folder' ? 'folder.restored' : 'file.restored',
+            restored,
+            `Restored "${restoredName}" from Trash`,
+            buildFileLocation(userId, restored?.parent_id)
+        );
+        res.json({
+            message: restoredName === file.name
+                ? 'Restored successfully'
+                : `Restored and renamed to "${restoredName}" to avoid a name conflict`
+        });
     } catch (error) {
         console.error('Restore error:', error);
         res.status(500).json({ error: 'Server error' });
@@ -1642,6 +2698,15 @@ router.delete('/:id', requireAuth, (req, res) => {
             trashChildren(fileId);
         }
 
+        evaluateStorageQuotaNotification(userId);
+        logFileActivity(
+            userId,
+            file.type === 'folder' ? 'folder.trashed' : 'file.trashed',
+            file,
+            `Moved "${file.name}" to Trash`,
+            file.type === 'folder' ? 'Folder is in Trash' : 'File is in Trash',
+            { previousParentId: file.parent_id }
+        );
         res.json({ message: 'Moved to trash' });
     } catch (error) {
         console.error('Delete error:', error);
@@ -1667,19 +2732,23 @@ router.delete('/:id/permanent', requireAuth, (req, res) => {
         }
 
         // Delete physical file if it's not a folder
-        if (file.type !== 'folder' && file.path) {
-            deleteStoredItem(file);
+        if (file.type !== 'folder') {
+            deleteAllVersionsForFile(db, file.id, deleteStoredVersionBlob);
+            if (file.path) deleteStoredItem(file);
         }
 
         // If folder, delete all children first
         if (file.type === 'folder') {
             const deleteChildren = (parentId) => {
-                const children = db.prepare('SELECT id, type, path, storage_source_id, vault_root_id, is_secure_vault FROM files WHERE parent_id = ?').all(parentId);
+                const children = db.prepare('SELECT id, user_id, type, path, storage_source_id, vault_root_id, is_secure_vault FROM files WHERE parent_id = ?').all(parentId);
                 for (const child of children) {
                     if (child.type === 'folder') {
                         deleteChildren(child.id);
-                    } else if (child.path) {
-                        deleteStoredItem({ ...child, user_id: userId, storage_source_id: child.storage_source_id });
+                    } else {
+                        deleteAllVersionsForFile(db, child.id, deleteStoredVersionBlob);
+                        if (child.path) {
+                            deleteStoredItem({ ...child, user_id: userId, storage_source_id: child.storage_source_id });
+                        }
                     }
                     db.prepare('DELETE FROM files WHERE id = ?').run(child.id);
                 }
@@ -1690,6 +2759,14 @@ router.delete('/:id/permanent', requireAuth, (req, res) => {
         // Delete the file/folder record
         db.prepare('DELETE FROM files WHERE id = ?').run(fileId);
 
+        evaluateStorageQuotaNotification(userId);
+        logFileActivity(
+            userId,
+            file.type === 'folder' ? 'folder.deleted' : 'file.deleted',
+            file,
+            `Permanently deleted "${file.name}"`,
+            'Deleted permanently from Trash'
+        );
         res.json({ message: 'Permanently deleted' });
     } catch (error) {
         console.error('Permanent delete error:', error);
@@ -1708,8 +2785,10 @@ router.get('/storage-stats', requireAuth, (req, res) => {
         
         let totalSystemBytes = 0;
         let freeSystemBytes = 0;
+        let versionBytes = 0;
 
         for (const source of sources) {
+            versionBytes += getVersionBytesForStorageSource(db, source.id);
             let is_accessible = false;
             try {
                 is_accessible = fs.existsSync(source.path);
@@ -1727,7 +2806,8 @@ router.get('/storage-stats', requireAuth, (req, res) => {
                 } catch (e) {
                     // Fallback to database totals if statfs fails
                     // Get DB used bytes
-                    const dbUsed = db.prepare('SELECT COALESCE(SUM(size), 0) as used FROM files WHERE storage_source_id = ? AND type != \'folder\'').get(source.id).used;
+                    const liveUsed = db.prepare('SELECT COALESCE(SUM(size), 0) as used FROM files WHERE storage_source_id = ? AND type != \'folder\'').get(source.id).used;
+                    const dbUsed = (liveUsed || 0) + getVersionBytesForStorageSource(db, source.id);
                     totalSystemBytes += source.total_bytes || 0;
                     freeSystemBytes += Math.max(0, (source.total_bytes || 0) - dbUsed);
                 }
@@ -1746,10 +2826,12 @@ router.get('/storage-stats', requireAuth, (req, res) => {
         }
 
         const usedSystemBytes = totalSystemBytes - freeSystemBytes;
+        evaluateStorageQuotaNotification(req.user.userId);
         
         res.json({
             totalBytes: totalSystemBytes,
-            usedBytes: usedSystemBytes > 0 ? usedSystemBytes : 0
+            usedBytes: usedSystemBytes > 0 ? usedSystemBytes : 0,
+            versionBytes,
         });
 
     } catch (error) {
@@ -1789,16 +2871,34 @@ router.delete('/trash/empty', requireAuth, (req, res) => {
         let freedBytes = 0;
 
         for (const item of trashedItems) {
-            if (item.path) {
-                deleteStoredItem(item);
+            const versionBytes = item.type !== 'folder'
+                ? db.prepare('SELECT COALESCE(SUM(size), 0) as bytes FROM file_versions WHERE file_id = ?').get(item.id).bytes || 0
+                : 0;
+            if (item.type !== 'folder') {
+                deleteAllVersionsForFile(db, item.id, deleteStoredVersionBlob);
+                if (item.path) deleteStoredItem(item);
             }
             if (item.type !== 'folder') {
                 deletedFiles += 1;
-                freedBytes += Number(item.size) || 0;
+                freedBytes += (Number(item.size) || 0) + versionBytes;
             }
         }
 
         db.prepare('DELETE FROM files WHERE user_id = ? AND trashed = 1').run(userId);
+        evaluateStorageQuotaNotification(userId);
+        createActivityEvent({
+            userId,
+            actorId: userId,
+            type: 'trash.emptied',
+            title: 'Emptied Trash',
+            body: `${trashedItems.length} item${trashedItems.length === 1 ? '' : 's'} permanently deleted`,
+            link: '/trash',
+            metadata: {
+                deletedItems: trashedItems.length,
+                deletedFiles,
+                freedBytes,
+            },
+        });
 
         res.json({
             message: 'Trash emptied successfully',

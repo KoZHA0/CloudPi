@@ -1,7 +1,10 @@
 "use client"
 
 import { useState, useEffect, useRef } from "react"
+import { Link, useNavigate } from "react-router-dom"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { Button } from "@/components/ui/button"
+import { Badge } from "@/components/ui/badge"
 import {
     HardDrive,
     FileText,
@@ -16,9 +19,30 @@ import {
     Share2,
     Loader2,
     Thermometer,
+    CircleHelp,
+    FolderOpen,
+    AlertTriangle,
+    Bell,
+    CheckCheck,
+    Inbox,
+    Pencil,
+    Trash2,
+    UploadCloud,
 } from "lucide-react"
-import { getDashboardStats, getSystemHealth, type DashboardStats, type SystemHealth } from "@/lib/api"
+import {
+    getDashboardActivity,
+    getDashboardStats,
+    getNotifications,
+    getSystemHealth,
+    markAllNotificationsRead,
+    markNotificationRead,
+    type DashboardActivityItem,
+    type DashboardStats,
+    type NotificationItem,
+    type SystemHealth,
+} from "@/lib/api"
 import { StorageOverview } from "@/lib/storage-overview"
+import { notifyNotificationsChanged } from "@/components/notification-bell"
 
 function formatBytes(bytes: number): string {
     if (bytes === 0) return "0 B"
@@ -58,6 +82,41 @@ const fileTypeConfig: Record<string, { icon: typeof FileText; color: string; lab
     video: { icon: Video, color: "text-purple-400", label: "Videos" },
     audio: { icon: Music, color: "text-yellow-400", label: "Audio" },
     archive: { icon: Archive, color: "text-orange-400", label: "Archives" },
+    other: { icon: CircleHelp, color: "text-slate-400", label: "Other" },
+}
+
+function notificationCategory(type: string) {
+    if (type.startsWith("storage.")) return "Storage"
+    if (type.startsWith("share.")) return "Share"
+    return "System"
+}
+
+function notificationIconClass(type: string) {
+    if (type === "storage.quota_reached") return "bg-destructive/10 text-destructive"
+    if (type.startsWith("storage.")) return "bg-amber-500/10 text-amber-600 dark:text-amber-300"
+    if (type.startsWith("share.")) return "bg-primary/10 text-primary"
+    return "bg-secondary text-muted-foreground"
+}
+
+function NotificationIcon({ type }: { type: string }) {
+    if (type === "storage.quota_reached") return <AlertTriangle className="h-4 w-4" />
+    if (type.startsWith("storage.")) return <HardDrive className="h-4 w-4" />
+    return <Share2 className="h-4 w-4" />
+}
+
+function activityIconClass(type: string) {
+    if (type.includes("trashed") || type.includes("revoked")) return "bg-destructive/10 text-destructive"
+    if (type.startsWith("share.")) return "bg-primary/10 text-primary"
+    if (type.includes("updated")) return "bg-amber-500/10 text-amber-600 dark:text-amber-300"
+    return "bg-emerald-500/10 text-emerald-600 dark:text-emerald-300"
+}
+
+function ActivityIcon({ type }: { type: string }) {
+    if (type.includes("trashed")) return <Trash2 className="h-4 w-4" />
+    if (type.includes("updated")) return <Pencil className="h-4 w-4" />
+    if (type.startsWith("share.")) return <Share2 className="h-4 w-4" />
+    if (type.startsWith("folder.")) return <FolderOpen className="h-4 w-4" />
+    return <UploadCloud className="h-4 w-4" />
 }
 
 // Circular gauge component
@@ -104,16 +163,21 @@ function CircularGauge({ percentage, label, value, subtext, color, icon: Icon }:
 }
 
 export function DashboardContent() {
+    const navigate = useNavigate()
     const [stats, setStats] = useState<DashboardStats | null>(null)
     const [health, setHealth] = useState<SystemHealth | null>(null)
+    const [notifications, setNotifications] = useState<NotificationItem[]>([])
+    const [unreadCount, setUnreadCount] = useState(0)
+    const [activity, setActivity] = useState<DashboardActivityItem[]>([])
     const [isLoading, setIsLoading] = useState(true)
+    const [isMarkingNotifications, setIsMarkingNotifications] = useState(false)
     const healthInterval = useRef<ReturnType<typeof setInterval> | null>(null)
 
     useEffect(() => {
         loadData()
 
-        // Auto-refresh health every 5 seconds
-        healthInterval.current = setInterval(loadHealth, 5000)
+        // Keep the dashboard fresh without constantly poking the Pi.
+        healthInterval.current = setInterval(loadHealth, 60000)
         return () => {
             if (healthInterval.current) clearInterval(healthInterval.current)
         }
@@ -122,7 +186,7 @@ export function DashboardContent() {
     async function loadData() {
         setIsLoading(true)
         try {
-            await Promise.all([loadStats(), loadHealth()])
+            await Promise.all([loadStats(), loadHealth(), loadNotificationPreview(), loadActivity()])
         } catch {
             // silently fail
         } finally {
@@ -148,6 +212,57 @@ export function DashboardContent() {
         }
     }
 
+    async function loadNotificationPreview() {
+        try {
+            const data = await getNotifications({ limit: 5, status: "unread" })
+            setNotifications(data.notifications)
+            setUnreadCount(data.unreadCount)
+        } catch {
+            setNotifications([])
+            setUnreadCount(0)
+        }
+    }
+
+    async function loadActivity() {
+        try {
+            const data = await getDashboardActivity(8)
+            setActivity(data.activity)
+        } catch {
+            setActivity([])
+        }
+    }
+
+    async function openNotification(notification: NotificationItem) {
+        try {
+            if (!notification.read_at) {
+                const data = await markNotificationRead(notification.id)
+                setUnreadCount(data.unreadCount)
+                setNotifications((current) => current.filter((item) => item.id !== notification.id))
+                notifyNotificationsChanged()
+            }
+        } catch {
+            // Navigate even if the read-state update fails.
+        }
+
+        if (notification.link) navigate(notification.link)
+    }
+
+    async function handleMarkNotificationsRead() {
+        setIsMarkingNotifications(true)
+        try {
+            const data = await markAllNotificationsRead()
+            setUnreadCount(data.unreadCount)
+            setNotifications([])
+            notifyNotificationsChanged()
+        } finally {
+            setIsMarkingNotifications(false)
+        }
+    }
+
+    function openActivity(item: DashboardActivityItem) {
+        if (item.link) navigate(item.link)
+    }
+
     if (isLoading) {
         return (
             <div className="flex items-center justify-center h-64">
@@ -156,12 +271,23 @@ export function DashboardContent() {
         )
     }
 
-    const quickAccessTypes = Object.entries(fileTypeConfig).map(([type, config]) => ({
-        ...config,
-        type,
-        count: stats?.byType[type]?.count ?? 0,
-        size: stats?.byType[type]?.size ?? 0,
-    }))
+    const knownQuickTypes = Object.keys(fileTypeConfig)
+    const unknownTypeStats = Object.entries(stats?.byType ?? {}).reduce((total, [type, value]) => {
+        if (knownQuickTypes.includes(type)) return total
+        return {
+            count: total.count + (Number(value.count) || 0),
+            size: total.size + (Number(value.size) || 0),
+        }
+    }, { count: 0, size: 0 })
+    const quickAccessTypes = Object.entries(fileTypeConfig).map(([type, config]) => {
+        const current = stats?.byType[type] ?? { count: 0, size: 0 }
+        return {
+            ...config,
+            type,
+            count: (current.count ?? 0) + (type === "other" ? unknownTypeStats.count : 0),
+            size: (current.size ?? 0) + (type === "other" ? unknownTypeStats.size : 0),
+        }
+    })
 
     return (
         <div className="space-y-6">
@@ -214,8 +340,120 @@ export function DashboardContent() {
                 storageQuota={stats?.storageQuota ?? null}
                 trashStorage={stats?.trashStorage ?? 0}
                 trashFiles={stats?.trashFiles ?? 0}
+                versionStorage={stats?.versionStorage ?? 0}
+                typeBreakdown={stats?.byType}
                 onRefreshStats={loadStats}
             />
+
+            <div className="grid gap-6 lg:grid-cols-2">
+                <Card className="bg-card border-border">
+                    <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                        <div>
+                            <CardTitle className="flex items-center gap-2 text-card-foreground">
+                                <Bell className="h-5 w-5" />
+                                Notifications
+                            </CardTitle>
+                            <CardDescription>
+                                {unreadCount > 0 ? `${unreadCount} unread` : "You're all caught up"}
+                            </CardDescription>
+                        </div>
+                        <div className="flex flex-wrap gap-2">
+                            <Button
+                                variant="outline"
+                                size="sm"
+                                className="gap-2"
+                                disabled={unreadCount === 0 || isMarkingNotifications}
+                                onClick={handleMarkNotificationsRead}
+                            >
+                                {isMarkingNotifications ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCheck className="h-4 w-4" />}
+                                Mark read
+                            </Button>
+                            <Button variant="ghost" size="sm" asChild>
+                                <Link to="/notifications">View all</Link>
+                            </Button>
+                        </div>
+                    </CardHeader>
+                    <CardContent>
+                        {notifications.length > 0 ? (
+                            <div className="space-y-2">
+                                {notifications.map((notification) => (
+                                    <button
+                                        key={notification.id}
+                                        type="button"
+                                        className="flex w-full min-w-0 gap-3 rounded-lg p-3 text-left transition-colors hover:bg-secondary"
+                                        onClick={() => openNotification(notification)}
+                                    >
+                                        <span className={`mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full ${notificationIconClass(notification.type)}`}>
+                                            <NotificationIcon type={notification.type} />
+                                        </span>
+                                        <span className="min-w-0 flex-1">
+                                            <span className="flex min-w-0 items-center gap-2">
+                                                <span className="truncate text-sm font-semibold text-card-foreground">{notification.title}</span>
+                                                <span className="h-2 w-2 shrink-0 rounded-full bg-primary" />
+                                            </span>
+                                            <span className="mt-1 line-clamp-2 text-xs text-muted-foreground">{notification.body}</span>
+                                            <span className="mt-2 flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
+                                                <Badge variant="outline" className="h-5 px-1.5 text-[10px]">{notificationCategory(notification.type)}</Badge>
+                                                {formatDate(notification.created_at)}
+                                            </span>
+                                        </span>
+                                    </button>
+                                ))}
+                            </div>
+                        ) : (
+                            <div className="flex flex-col items-center justify-center rounded-lg border border-dashed border-border p-8 text-center">
+                                <Inbox className="mb-3 h-10 w-10 text-muted-foreground" />
+                                <p className="font-medium text-card-foreground">No unread notifications</p>
+                                <p className="mt-1 max-w-sm text-sm text-muted-foreground">
+                                    New shares and storage notices will show up here.
+                                </p>
+                            </div>
+                        )}
+                    </CardContent>
+                </Card>
+
+                <Card className="bg-card border-border">
+                    <CardHeader>
+                        <CardTitle className="flex items-center gap-2 text-card-foreground">
+                            <Clock className="h-5 w-5" />
+                            Activity Feed
+                        </CardTitle>
+                        <CardDescription>Recent file, trash, and share activity</CardDescription>
+                    </CardHeader>
+                    <CardContent>
+                        {activity.length > 0 ? (
+                            <div className="space-y-2">
+                                {activity.map((item) => (
+                                    <button
+                                        key={item.id}
+                                        type="button"
+                                        className="flex w-full min-w-0 gap-3 rounded-lg p-3 text-left transition-colors hover:bg-secondary disabled:cursor-default disabled:hover:bg-transparent"
+                                        disabled={!item.link}
+                                        onClick={() => openActivity(item)}
+                                    >
+                                        <span className={`mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full ${activityIconClass(item.type)}`}>
+                                            <ActivityIcon type={item.type} />
+                                        </span>
+                                        <span className="min-w-0 flex-1">
+                                            <span className="block truncate text-sm font-semibold text-card-foreground">{item.title}</span>
+                                            <span className="mt-1 line-clamp-2 text-xs text-muted-foreground">{item.body}</span>
+                                            <span className="mt-2 block text-[11px] text-muted-foreground">{formatDate(item.created_at)}</span>
+                                        </span>
+                                    </button>
+                                ))}
+                            </div>
+                        ) : (
+                            <div className="flex flex-col items-center justify-center rounded-lg border border-dashed border-border p-8 text-center">
+                                <Clock className="mb-3 h-10 w-10 text-muted-foreground" />
+                                <p className="font-medium text-card-foreground">No activity yet</p>
+                                <p className="mt-1 max-w-sm text-sm text-muted-foreground">
+                                    Uploads, shares, updates, and trash actions will appear here.
+                                </p>
+                            </div>
+                        )}
+                    </CardContent>
+                </Card>
+            </div>
 
             <div className="grid gap-6 lg:grid-cols-3">
                 {/* System Health */}
@@ -242,7 +480,7 @@ export function DashboardContent() {
                         </div>
                     </CardHeader>
                     <CardContent>
-                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-6">
+                        <div className={`grid gap-6 ${health?.cpu.temperature != null ? "grid-cols-2 sm:grid-cols-4" : "grid-cols-1 sm:grid-cols-3"}`}>
                             <CircularGauge
                                 percentage={health?.cpu.usage ?? 0}
                                 label="CPU"
@@ -267,14 +505,16 @@ export function DashboardContent() {
                                 color="#10b981"
                                 icon={HardDrive}
                             />
-                            <CircularGauge
-                                percentage={health?.cpu.temperature != null ? Math.min(100, Math.round((health.cpu.temperature / 100) * 100)) : 0}
-                                label="Temp"
-                                value={health?.cpu.temperature != null ? `${health.cpu.temperature}°C` : 'N/A'}
-                                subtext="CPU temperature"
-                                color="#f97316"
-                                icon={Thermometer}
-                            />
+                            {health?.cpu.temperature != null && (
+                                <CircularGauge
+                                    percentage={Math.min(100, Math.round((health.cpu.temperature / 100) * 100))}
+                                    label="Temp"
+                                    value={`${health.cpu.temperature}°C`}
+                                    subtext="CPU temperature"
+                                    color="#f97316"
+                                    icon={Thermometer}
+                                />
+                            )}
                         </div>
                     </CardContent>
                 </Card>
@@ -287,9 +527,11 @@ export function DashboardContent() {
                     </CardHeader>
                     <CardContent className="space-y-3">
                         {quickAccessTypes.map((item) => (
-                            <div
+                            <button
+                                type="button"
                                 key={item.type}
-                                className="flex items-center justify-between rounded-lg bg-secondary p-3 transition-colors hover:bg-secondary/80 cursor-pointer"
+                                className="flex w-full items-center justify-between rounded-lg bg-secondary p-3 text-left transition-colors hover:bg-secondary/80"
+                                onClick={() => navigate(`/files?type=${item.type}`)}
                             >
                                 <div className="flex items-center gap-3">
                                     <div className={`rounded-lg bg-background p-2 ${item.color}`}>
@@ -303,49 +545,11 @@ export function DashboardContent() {
                                         <p className="text-xs text-muted-foreground">{formatBytes(item.size)}</p>
                                     )}
                                 </div>
-                            </div>
+                            </button>
                         ))}
                     </CardContent>
                 </Card>
             </div>
-
-            {/* Recent Files */}
-            {stats && stats.recentFiles.length > 0 && (
-                <Card className="bg-card border-border">
-                    <CardHeader>
-                        <CardTitle className="text-card-foreground">Recent Files</CardTitle>
-                        <CardDescription>Recently uploaded files</CardDescription>
-                    </CardHeader>
-                    <CardContent>
-                        <div className="space-y-3">
-                            {stats.recentFiles.map((file) => {
-                                const config = fileTypeConfig[file.type]
-                                const Icon = config?.icon ?? FileText
-                                const color = config?.color ?? "text-gray-400"
-                                return (
-                                    <div
-                                        key={file.id}
-                                        className="flex items-center justify-between rounded-lg p-2.5 transition-colors hover:bg-secondary cursor-pointer"
-                                    >
-                                        <div className="flex items-center gap-3">
-                                            <div className={`rounded-lg bg-secondary p-2 ${color}`}>
-                                                <Icon className="h-5 w-5" />
-                                            </div>
-                                            <div>
-                                                <p className="text-sm font-medium text-card-foreground">{file.name}</p>
-                                                <p className="text-xs text-muted-foreground">
-                                                    {formatBytes(file.size)}
-                                                </p>
-                                            </div>
-                                        </div>
-                                        <span className="text-xs text-muted-foreground">{formatDate(file.created_at)}</span>
-                                    </div>
-                                )
-                            })}
-                        </div>
-                    </CardContent>
-                </Card>
-            )}
         </div>
     )
 }

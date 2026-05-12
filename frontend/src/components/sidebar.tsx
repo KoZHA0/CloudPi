@@ -1,5 +1,5 @@
 import { Link, useLocation, useNavigate } from "react-router-dom"
-import { createContext, useContext, useState, useEffect, type ReactNode } from "react"
+import { createContext, useContext, useState, useEffect, useRef, type ReactNode } from "react"
 import {
     LayoutDashboard,
     FolderOpen,
@@ -32,7 +32,10 @@ import {
 import { Button } from "@/components/ui/button"
 import { Progress } from "@/components/ui/progress"
 import { useAuth } from "@/contexts/auth-context"
-import { getStorageStats, getAvatarUrl } from "@/lib/api"
+import { getStorageStats, getAvatarUrl, type StorageStats } from "@/lib/api"
+import { NotificationBell } from "@/components/notification-bell"
+import { OPEN_FILE_UPLOAD_PICKER_EVENT, REFRESH_FILES_EVENT } from "@/lib/upload-events"
+import { useUpload } from "@/contexts/upload-context"
 
 function formatBytes(bytes: number, decimals = 1) {
     if (bytes === 0) return '0 Bytes';
@@ -105,7 +108,7 @@ export function SidebarProvider({ children }: { children: ReactNode }) {
 const mainNavItems = [
     { name: "Dashboard", href: "/", icon: LayoutDashboard },
     { name: "Files", href: "/files", icon: FolderOpen },
-    { name: "Shared", href: "/shared", icon: Share2 },
+    { name: "Shares", href: "/shares", icon: Share2 },
     { name: "Starred", href: "/starred", icon: Star },
     { name: "Recent", href: "/recent", icon: Clock },
     { name: "Trash", href: "/trash", icon: Trash2 },
@@ -113,6 +116,7 @@ const mainNavItems = [
 
 const accountNavItems = [
     { name: "Profile", href: "/profile", icon: User },
+    { name: "Notifications", href: "/notifications", icon: Bell },
     { name: "Settings", href: "/settings", icon: Settings },
 ]
 
@@ -122,8 +126,14 @@ export function Sidebar() {
     const { isOpen, close } = useSidebar()
     const { user, isAuthenticated, logout } = useAuth()
     
-    const [storageStats, setStorageStats] = useState<{ totalBytes: number, usedBytes: number } | null>(null)
+    const [storageStats, setStorageStats] = useState<StorageStats | null>(null)
     const [sidebarSearch, setSidebarSearch] = useState("")
+    const accountLinks = [
+        accountNavItems[0],
+        ...(user?.is_admin === 1 ? [{ name: "Admin", href: "/admin", icon: Shield }] : []),
+        accountNavItems[1],
+        accountNavItems[2],
+    ]
 
     // Fetch storage stats when authenticated
     useEffect(() => {
@@ -215,7 +225,7 @@ export function Sidebar() {
                     })}
 
                     <div className="mb-2 mt-6 px-3 text-xs font-medium uppercase tracking-wider text-muted-foreground">Account</div>
-                    {accountNavItems.map((item) => {
+                    {accountLinks.map((item) => {
                         const isActive = location.pathname === item.href
                         return (
                             <Link
@@ -233,22 +243,6 @@ export function Sidebar() {
                             </Link>
                         )
                     })}
-                    
-                    {/* Admin link - only for admin users */}
-                    {user?.is_admin === 1 && (
-                        <Link
-                            to="/admin"
-                            className={cn(
-                                "flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors",
-                                location.pathname === "/admin"
-                                    ? "bg-sidebar-accent text-sidebar-primary"
-                                    : "text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-foreground",
-                            )}
-                        >
-                            <Shield className="h-5 w-5" />
-                            Admin
-                        </Link>
-                    )}
                 </nav>
 
                 {/* Storage Progress */}
@@ -263,6 +257,11 @@ export function Sidebar() {
                             <p className="mt-2 text-xs text-muted-foreground">
                                 {formatBytes(storageStats.usedBytes)} of {formatBytes(storageStats.totalBytes)} used
                             </p>
+                            {(storageStats.versionBytes ?? 0) > 0 && (
+                                <p className="mt-1 text-xs text-muted-foreground">
+                                    {formatBytes(storageStats.versionBytes ?? 0)} in versions
+                                </p>
+                            )}
                         </>
                     ) : (
                         <>
@@ -307,6 +306,14 @@ export function Sidebar() {
                                 <DropdownMenuItem asChild>
                                     <Link to="/profile">Profile</Link>
                                 </DropdownMenuItem>
+                                {user?.is_admin === 1 && (
+                                    <DropdownMenuItem asChild>
+                                        <Link to="/admin">Admin</Link>
+                                    </DropdownMenuItem>
+                                )}
+                                <DropdownMenuItem asChild>
+                                    <Link to="/notifications">Notifications</Link>
+                                </DropdownMenuItem>
                                 <DropdownMenuItem asChild>
                                     <Link to="/settings">Settings</Link>
                                 </DropdownMenuItem>
@@ -327,6 +334,9 @@ export function Sidebar() {
 export function TopBar() {
     const { toggle } = useSidebar()
     const location = useLocation()
+    const navigate = useNavigate()
+    const { addUpload } = useUpload()
+    const topbarFileInputRef = useRef<HTMLInputElement>(null)
 
     // Get page title based on current path
     const getPageTitle = () => {
@@ -335,6 +345,29 @@ export function TopBar() {
         const allNavItems = [...mainNavItems, ...accountNavItems]
         const currentItem = allNavItems.find(item => item.href === location.pathname)
         return currentItem?.name || "Dashboard"
+    }
+
+    const handleUploadClick = () => {
+        if (location.pathname.startsWith("/files")) {
+            window.dispatchEvent(new Event(OPEN_FILE_UPLOAD_PICKER_EVENT))
+            return
+        }
+
+        topbarFileInputRef.current?.click()
+    }
+
+    const handleTopbarUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
+        const fileList = event.target.files
+        if (!fileList || fileList.length === 0) return
+
+        addUpload(Array.from(fileList), null, () => {
+            window.dispatchEvent(new Event(REFRESH_FILES_EVENT))
+        })
+        navigate("/files")
+
+        if (topbarFileInputRef.current) {
+            topbarFileInputRef.current.value = ""
+        }
     }
 
     return (
@@ -353,11 +386,15 @@ export function TopBar() {
                 <h1 className="text-lg sm:text-xl font-semibold text-foreground">{getPageTitle()}</h1>
             </div>
             <div className="flex items-center gap-2 sm:gap-4">
-                <Button variant="ghost" size="icon" className="relative">
-                    <Bell className="h-5 w-5" />
-                    <span className="absolute right-1 top-1 h-2 w-2 rounded-full bg-primary" />
-                </Button>
-                <Button className="gap-2" size="sm">
+                <NotificationBell />
+                <input
+                    ref={topbarFileInputRef}
+                    type="file"
+                    multiple
+                    className="hidden"
+                    onChange={handleTopbarUpload}
+                />
+                <Button className="gap-2" size="sm" onClick={handleUploadClick}>
                     <Cloud className="h-4 w-4" />
                     <span className="hidden sm:inline">Upload</span>
                 </Button>

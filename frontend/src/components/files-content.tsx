@@ -105,6 +105,7 @@ import {
     ZoomIn,
     ZoomOut,
     Keyboard,
+    HardDrive,
 } from "lucide-react"
 import { cn, formatApiDate, formatApiDateTime, parseApiDate } from "@/lib/utils"
 import {
@@ -136,6 +137,7 @@ import {
     createShareLink,
     getShareUsers,
     getSharedFolderFiles,
+    getSharedFilePreviewUrl,
     downloadSharedFile,
     downloadIncomingShare,
     getIncomingSharePreviewUrl,
@@ -348,11 +350,13 @@ export function FilesContent() {
     const [previewFile, setPreviewFile] = useState<FileItem | null>(null)
     const [previewTextContent, setPreviewTextContent] = useState<string | null>(null)
     const [pdfBlobUrl, setPdfBlobUrl] = useState<string | null>(null)
+    const [previewPdfError, setPreviewPdfError] = useState<string | null>(null)
     const [imageZoom, setImageZoom] = useState(1)
     const [imageRotation, setImageRotation] = useState(0)
     const [imagePan, setImagePan] = useState({ x: 0, y: 0 })
     const [isImagePanning, setIsImagePanning] = useState(false)
     const imagePanStartRef = useRef({ pointerX: 0, pointerY: 0, panX: 0, panY: 0 })
+    const previewRequestAbortRef = useRef<AbortController | null>(null)
     const [previewTextWrap, setPreviewTextWrap] = useState(true)
     const [previewTextCopied, setPreviewTextCopied] = useState(false)
 
@@ -724,7 +728,44 @@ export function FilesContent() {
         return false
     }
 
+    function appendPreviewParam(url: string, key: string, value: string) {
+        return `${url}${url.includes("?") ? "&" : "?"}${encodeURIComponent(key)}=${encodeURIComponent(value)}`
+    }
+
+    async function readPreviewError(response: Response, fallback: string) {
+        try {
+            const data = await response.clone().json()
+            if (data?.error) return String(data.error)
+        } catch {
+            // Preview endpoints normally return a file stream, not JSON.
+        }
+        return `${fallback} (${response.status})`
+    }
+
+    function cancelPreviewRequest() {
+        previewRequestAbortRef.current?.abort()
+        previewRequestAbortRef.current = null
+    }
+
+    function getStorageSourceLabel(file: FileItem) {
+        const sourceId = file.storage_source_id || "internal"
+        if (file.storage_source_label) return file.storage_source_label
+        return sourceId === "internal" ? "Internal Storage" : "External Drive"
+    }
+
+    function getStorageSourceDescription(file: FileItem) {
+        const sourceId = file.storage_source_id || "internal"
+        const sourceType = (file.storage_source_type || (sourceId === "internal" ? "internal" : "external")).toLowerCase()
+        const ownerPrefix = isShareShortcut(file) ? "Owner's " : ""
+        const kind = sourceType === "internal" ? "internal storage" : "external drive"
+        const status = isFileAccessible(file) ? "online" : "offline"
+        return `${ownerPrefix}${kind} - ${status}`
+    }
+
     function getPreviewUrlForFile(file: FileItem) {
+        if (!isShareShortcut(file) && browsingShortcut?.share_id && shortcutFiles.some((item) => item.id === file.id)) {
+            return getSharedFilePreviewUrl(browsingShortcut.share_id, file.id)
+        }
         return isShareShortcut(file) ? getShareShortcutPreviewUrl(file) : getPreviewUrl(file.id)
     }
 
@@ -2128,6 +2169,7 @@ export function FilesContent() {
 
     // Preview
     function openPreview(file: FileItem) {
+        cancelPreviewRequest()
         const shortcut = isShareShortcut(file)
         if (!shortcut && isSecureItem(file)) {
             clearOverlays()
@@ -2136,44 +2178,74 @@ export function FilesContent() {
         }
         setPreviewFile(file)
         setPreviewTextContent(null)
+        if (pdfBlobUrl?.startsWith('blob:')) URL.revokeObjectURL(pdfBlobUrl)
         setPdfBlobUrl(null)
+        setPreviewPdfError(null)
         setPreviewTextCopied(false)
         resetImagePreviewState()
         const previewUrl = getPreviewUrlForFile(file)
-        // For PDFs, fetch as blob to bypass IDM interception
-        // raw=1 tells backend to serve as octet-stream so IDM ignores it
+        // For PDFs, fetch as a blob so browser extensions do not intercept the inline stream.
         if (isPdfPreviewFile(file)) {
-            if (shortcut) {
-                setPdfBlobUrl(previewUrl)
-            } else {
-                fetch(previewUrl + '&raw=1')
-                .then(r => {
-                    if (!r.ok) throw new Error('Failed to load PDF')
-                    return r.blob()
+            const controller = new AbortController()
+            previewRequestAbortRef.current = controller
+            fetch(appendPreviewParam(previewUrl, "raw", "1"), {
+                signal: controller.signal,
+                headers: { "Accept": "application/pdf,*/*" },
+            })
+                .then(async (response) => {
+                    if (!response.ok) {
+                        throw new Error(await readPreviewError(response, "Failed to load PDF"))
+                    }
+                    const blob = await response.blob()
+                    if (blob.size === 0) throw new Error("PDF preview returned an empty file")
+                    return blob
                 })
-                .then(blob => {
+                .then((blob) => {
+                    if (controller.signal.aborted) return
+                    if (previewRequestAbortRef.current === controller) previewRequestAbortRef.current = null
                     // Re-create blob with correct PDF type so browser's PDF viewer renders it
                     const pdfBlob = new Blob([blob], { type: 'application/pdf' })
                     const url = URL.createObjectURL(pdfBlob)
                     setPdfBlobUrl(url)
                 })
-                .catch(() => setPdfBlobUrl('error'))
-            }
+                .catch((err) => {
+                    if (controller.signal.aborted) return
+                    if (previewRequestAbortRef.current === controller) previewRequestAbortRef.current = null
+                    setPreviewPdfError(err instanceof Error ? err.message : "Failed to load PDF")
+                    setPdfBlobUrl('error')
+                })
         }
         // For non-PDF documents (text, code, etc.), fetch as text
         if (isTextPreviewFile(file)) {
-            fetch(previewUrl)
-                .then(r => r.text())
-                .then(text => setPreviewTextContent(text))
-                .catch(() => setPreviewTextContent('Failed to load file content'))
+            const controller = new AbortController()
+            previewRequestAbortRef.current = controller
+            fetch(previewUrl, { signal: controller.signal })
+                .then(async (response) => {
+                    if (!response.ok) {
+                        throw new Error(await readPreviewError(response, "Failed to load file content"))
+                    }
+                    return response.text()
+                })
+                .then((text) => {
+                    if (controller.signal.aborted) return
+                    if (previewRequestAbortRef.current === controller) previewRequestAbortRef.current = null
+                    setPreviewTextContent(text)
+                })
+                .catch((err) => {
+                    if (controller.signal.aborted) return
+                    if (previewRequestAbortRef.current === controller) previewRequestAbortRef.current = null
+                    setPreviewTextContent(err instanceof Error ? err.message : 'Failed to load file content')
+                })
         }
     }
 
     function closePreview() {
+        cancelPreviewRequest()
         if (pdfBlobUrl?.startsWith('blob:')) URL.revokeObjectURL(pdfBlobUrl)
         setPreviewFile(null)
         setPreviewTextContent(null)
         setPdfBlobUrl(null)
+        setPreviewPdfError(null)
         setPreviewTextCopied(false)
         resetImagePreviewState()
     }
@@ -2515,7 +2587,7 @@ export function FilesContent() {
                                 <Card
                                     key={file.id}
                                     className="cursor-pointer transition-colors hover:bg-secondary"
-                                    onClick={() => file.type === "folder" && navigateShortcutFolder(file.id)}
+                                    onClick={() => file.type === "folder" ? navigateShortcutFolder(file.id) : openPreview(file)}
                                 >
                                     <CardContent className="flex items-center gap-3 p-4">
                                         <div className="rounded-lg bg-secondary p-2.5">
@@ -4440,7 +4512,7 @@ export function FilesContent() {
                                         <FileIcon className="h-16 w-16 text-red-400" />
                                         <p className="text-card-foreground font-medium text-center">{getDisplayName(previewFile)}</p>
                                         <p className="text-muted-foreground text-sm text-center">
-                                            Could not load PDF preview
+                                            {previewPdfError || "Could not load PDF preview"}
                                         </p>
                                     </div>
                                 )}
@@ -4965,6 +5037,18 @@ export function FilesContent() {
                                         <p className="text-sm text-card-foreground">{formatFileSize(detailFile.size)}</p>
                                         {detailFile.size > 0 && (
                                             <p className="text-xs text-muted-foreground mt-0.5">{detailFile.size.toLocaleString()} bytes</p>
+                                        )}
+                                    </div>
+                                </div>
+
+                                <div className="flex items-start gap-3 p-3 rounded-lg bg-secondary">
+                                    <HardDrive className="h-4 w-4 text-muted-foreground mt-0.5 shrink-0" />
+                                    <div className="min-w-0">
+                                        <p className="text-xs text-muted-foreground">Stored on</p>
+                                        <p className="text-sm text-card-foreground break-words">{getStorageSourceLabel(detailFile)}</p>
+                                        <p className="text-xs text-muted-foreground mt-0.5 capitalize">{getStorageSourceDescription(detailFile)}</p>
+                                        {detailFile.storage_source_id && detailFile.storage_source_id !== "internal" && (
+                                            <p className="text-xs text-muted-foreground/80 mt-0.5 break-all font-mono">{detailFile.storage_source_id}</p>
                                         )}
                                     </div>
                                 </div>

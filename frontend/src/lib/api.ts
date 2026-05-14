@@ -7,6 +7,14 @@
 // Use relative path - Vite proxy forwards /api to the backend
 const API_BASE = '/api';
 
+function apiUrlWithToken(endpoint: string): string {
+    const token = getToken();
+    const params = new URLSearchParams();
+    if (token) params.set('token', token);
+    const query = params.toString();
+    return query ? `${API_BASE}${endpoint}?${query}` : `${API_BASE}${endpoint}`;
+}
+
 export function getToken(): string | null {
     return localStorage.getItem('cloudpi_token');
 }
@@ -372,6 +380,8 @@ export interface FileItem {
     trashed_at?: string;
     is_accessible?: boolean | number;  // from JOIN with storage_sources
     storage_source_id?: string;
+    storage_source_label?: string | null;
+    storage_source_type?: string | null;
     encrypted_metadata?: string | null;
     storage_id?: string | null;
     e2ee_iv?: string | null;
@@ -604,14 +614,13 @@ export function getDownloadUrl(fileId: number): string {
 
 // Preview image
 export function getPreviewUrl(fileId: number): string {
-    const token = getToken();
-    return `${API_BASE}/files/${fileId}/preview?token=${token}`;
+    return apiUrlWithToken(`/files/${fileId}/preview`);
 }
 
 // Rich media thumbnail (image/video)
 export function getThumbnailUrl(fileId: number, size: number = 256): string {
-    const token = getToken();
-    return `${API_BASE}/files/${fileId}/thumbnail?token=${token}&size=${size}`;
+    const url = apiUrlWithToken(`/files/${fileId}/thumbnail`);
+    return `${url}${url.includes('?') ? '&' : '?'}size=${encodeURIComponent(String(size))}`;
 }
 
 export async function downloadFile(fileId: number, fileName: string): Promise<void> {
@@ -1119,8 +1128,7 @@ export async function downloadSharedFile(shareId: number, fileId: number, fileNa
 
 // Get preview URL for a file inside a shared folder
 export function getSharedFilePreviewUrl(shareId: number, fileId: number): string {
-    const token = getToken();
-    return `${API_BASE}/shares/shared-folder/${shareId}/preview/${fileId}?token=${token}`;
+    return apiUrlWithToken(`/shares/shared-folder/${shareId}/preview/${fileId}`);
 }
 
 // ============= DASHBOARD =============
@@ -1242,8 +1250,7 @@ export async function downloadIncomingShare(shareId: number, fileName: string): 
 }
 
 export function getIncomingSharePreviewUrl(shareId: number): string {
-    const token = getToken();
-    return `${API_BASE}/shares/${shareId}/preview?token=${token}`;
+    return apiUrlWithToken(`/shares/${shareId}/preview`);
 }
 
 // ============= NOTIFICATIONS =============

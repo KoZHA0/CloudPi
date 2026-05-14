@@ -2524,16 +2524,16 @@ export function FilesContent() {
     if (browsingShortcut) {
         return (
             <div className="space-y-6">
-                <div className="flex items-center gap-3">
+                <div className="flex min-w-0 items-center gap-3">
                     <Button variant="ghost" size="icon" onClick={closeShortcutBrowser}>
                         <ArrowLeft className="h-5 w-5" />
                     </Button>
                     <div className="min-w-0">
-                        <h1 className="flex items-center gap-2 truncate text-2xl font-bold text-foreground">
+                        <h1 className="flex min-w-0 items-center gap-2 truncate text-xl font-bold text-foreground sm:text-2xl">
                             <Folder className="h-6 w-6 shrink-0 text-blue-400" />
-                            {getDisplayName(browsingShortcut)}
+                            <span className="truncate">{getDisplayName(browsingShortcut)}</span>
                         </h1>
-                        <p className="text-sm text-muted-foreground">
+                        <p className="truncate text-sm text-muted-foreground">
                             Shared by {browsingShortcut.shared_by_name || "another user"}
                         </p>
                     </div>
@@ -2585,7 +2585,7 @@ export function FilesContent() {
                                     className="cursor-pointer transition-colors hover:bg-secondary"
                                     onClick={() => file.type === "folder" ? navigateShortcutFolder(file.id) : openPreview(file)}
                                 >
-                                    <CardContent className="flex items-center gap-3 p-4">
+                                    <CardContent className="flex flex-col gap-3 p-4 min-[420px]:flex-row min-[420px]:items-center">
                                         <div className="rounded-lg bg-secondary p-2.5">
                                             <Icon className={cn("h-5 w-5", getFileColor(file.type))} />
                                         </div>
@@ -2596,7 +2596,7 @@ export function FilesContent() {
                                         <Button
                                             variant="outline"
                                             size="sm"
-                                            className="gap-2"
+                                            className="w-full gap-2 min-[420px]:w-auto"
                                             disabled={browsingShortcut.share_allow_download === 0}
                                             onClick={(event) => {
                                                 event.stopPropagation()
@@ -2618,7 +2618,7 @@ export function FilesContent() {
 
     return (
         <div
-            className="space-y-6 relative"
+            className="relative min-w-0 space-y-6"
             onDragEnter={handleDragEnter}
             onDragLeave={handleDragLeave}
             onDragOver={handleDragOver}
@@ -2854,7 +2854,7 @@ export function FilesContent() {
             {/* Drive Status Notification Toast */}
             {notification && (
                 <div className={cn(
-                    "fixed bottom-6 right-6 z-50 flex items-center gap-3 px-5 py-3 rounded-xl shadow-lg border transition-all animate-in slide-in-from-bottom-4 duration-300",
+                    "fixed bottom-3 left-3 right-3 z-50 flex items-center gap-3 rounded-xl border px-4 py-3 shadow-lg transition-all animate-in slide-in-from-bottom-4 duration-300 sm:bottom-6 sm:left-auto sm:right-6 sm:max-w-sm sm:px-5",
                     notification.type === "disconnect"
                         ? "bg-yellow-500/10 border-yellow-500/30 text-yellow-500"
                         : "bg-green-500/10 border-green-500/30 text-green-500"
@@ -3299,7 +3299,7 @@ export function FilesContent() {
 
             {/* Files Grid */}
             {(!isInsideVault || isActiveVaultUnlocked) && view === "grid" && filteredFiles.length > 0 && (
-                <div className="grid gap-3 grid-cols-1 xs:grid-cols-2 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
+                <div className="grid grid-cols-1 gap-3 min-[420px]:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
                     {filteredFiles.map((file) => {
                         const Icon = getFileIcon(file.type)
                         const isShortcut = isShareShortcut(file)
@@ -3702,7 +3702,7 @@ export function FilesContent() {
                                             onDragLeave={(event) => handleFolderDragLeave(event, file)}
                                             onDrop={(event) => handleFolderDrop(event, file)}
                                             className={cn(
-                                                "flex sm:grid sm:grid-cols-12 gap-2 sm:gap-4 items-center px-4 sm:px-6 py-3 border-b border-border last:border-0 hover:bg-secondary cursor-pointer",
+                                                "flex cursor-pointer flex-col items-stretch gap-3 border-b border-border px-4 py-3 last:border-0 hover:bg-secondary sm:grid sm:grid-cols-12 sm:items-center sm:gap-4 sm:px-6",
                                                 draggable && "cursor-grab active:cursor-grabbing",
                                                 selectedFiles.includes(file.id) && "bg-primary/10",
                                                 highlightedFileId === file.id && "bg-amber-400/10 ring-1 ring-inset ring-amber-400/60",
@@ -3713,7 +3713,7 @@ export function FilesContent() {
                                             title={!accessible ? "Drive disconnected — file temporarily unavailable" : undefined}
                                         >
                                     <div
-                                        className="flex-1 sm:col-span-7 md:col-span-6 flex items-center gap-3 min-w-0"
+                                        className="flex min-w-0 flex-1 items-center gap-3 sm:col-span-7 md:col-span-6"
                                     >
                                         {isSelecting && (
                                             <Checkbox
@@ -3790,7 +3790,7 @@ export function FilesContent() {
                                     <div className="hidden md:block md:col-span-3 text-sm text-muted-foreground">
                                         {formatDate(file.modified_at)}
                                     </div>
-                                    <div className="sm:col-span-1 flex justify-end flex-shrink-0">
+                                    <div className="flex w-full flex-shrink-0 justify-end sm:col-span-1 sm:w-auto">
                                         <DropdownMenu>
                                             <DropdownMenuTrigger asChild>
                                                 <Button

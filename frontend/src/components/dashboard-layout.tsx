@@ -24,9 +24,9 @@ export function DashboardLayout() {
         <SidebarProvider>
             <div className="flex min-h-screen bg-background">
                 <Sidebar />
-                <div className="flex-1 lg:ml-64">
+                <div className="min-w-0 flex-1 lg:ml-64">
                     <TopBar />
-                    <main className="p-4 sm:p-6">
+                    <main className="min-w-0 overflow-x-hidden p-4 sm:p-6">
                         <Outlet />
                     </main>
                 </div>

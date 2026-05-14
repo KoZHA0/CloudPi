@@ -728,10 +728,6 @@ export function FilesContent() {
         return false
     }
 
-    function appendPreviewParam(url: string, key: string, value: string) {
-        return `${url}${url.includes("?") ? "&" : "?"}${encodeURIComponent(key)}=${encodeURIComponent(value)}`
-    }
-
     async function readPreviewError(response: Response, fallback: string) {
         try {
             const data = await response.clone().json()
@@ -2188,7 +2184,7 @@ export function FilesContent() {
         if (isPdfPreviewFile(file)) {
             const controller = new AbortController()
             previewRequestAbortRef.current = controller
-            fetch(appendPreviewParam(previewUrl, "raw", "1"), {
+            fetch(previewUrl, {
                 signal: controller.signal,
                 headers: { "Accept": "application/pdf,*/*" },
             })

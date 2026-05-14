@@ -109,12 +109,24 @@ ssh pi@cloudpi.local
 
 Docker runs CloudPi without installing Node.js directly on the Pi host.
 
+This guide expects **Raspberry Pi OS Lite 64-bit**. If Docker packages show
+`no installation candidate`, first confirm the Pi is really using the 64-bit
+`arm64` OS and that Docker's apt repository was added successfully.
+
 ```bash
 # Refresh package metadata.
 sudo apt update
 
 # Install tools needed to add Docker's package repository.
 sudo apt install -y ca-certificates curl
+
+# Confirm the Pi is running the 64-bit OS expected by this guide.
+# This should print: arm64
+dpkg --print-architecture
+
+# Confirm the OS codename apt will use for the Docker repository.
+# On current Raspberry Pi OS this is usually: bookworm
+. /etc/os-release && echo "$VERSION_CODENAME"
 
 # Create the directory where apt stores trusted repository keys.
 sudo install -m 0755 -d /etc/apt/keyrings
@@ -125,11 +137,24 @@ sudo curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyring
 # Make the Docker signing key readable by apt.
 sudo chmod a+r /etc/apt/keyrings/docker.asc
 
-# Add Docker's official repository for your Raspberry Pi OS version.
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+# Remove any old Docker apt source before writing the clean source file.
+sudo rm -f /etc/apt/sources.list.d/docker.list /etc/apt/sources.list.d/docker.sources
+
+# Add Docker's official Debian repository for Raspberry Pi OS 64-bit.
+sudo tee /etc/apt/sources.list.d/docker.sources > /dev/null <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/debian
+Suites: $(. /etc/os-release && echo "$VERSION_CODENAME")
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
 
 # Refresh package metadata again, now including Docker packages.
 sudo apt update
+
+# Confirm apt can see Docker packages before installing them.
+apt-cache policy docker-ce
 
 # Install Docker Engine, Docker CLI, containerd, buildx, and Compose plugin.
 sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
@@ -147,6 +172,15 @@ Reconnect:
 # Reconnect to the Pi after Docker setup.
 ssh pi@cloudpi.local
 ```
+
+If `apt-cache policy docker-ce` shows `Candidate: (none)`, do not run the
+install command yet:
+
+- If `dpkg --print-architecture` printed anything other than `arm64`, re-flash
+  with **Raspberry Pi OS Lite 64-bit** and repeat this section.
+- If it printed `arm64`, read the output from `sudo apt update`; Docker source
+  errors there usually point to the wrong codename or a failed signing key
+  download.
 
 Verify Docker:
 

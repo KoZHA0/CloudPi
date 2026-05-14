@@ -34,6 +34,7 @@ const rateLimit = require('express-rate-limit'); // kept for reference but uploa
 const fastq = require('fastq');
 const archiver = require('archiver');
 const { spawn } = require('child_process');
+const eventBus = require('../utils/event-bus');
 const { computeFileHash, verifyFileHash, encryptFile, decryptToStream, createDecryptStream, isEncryptionEnabled } = require('../utils/crypto-utils');
 const { JWT_SECRET } = require('../utils/auth-config');
 const { ensureProtectedInternalStorageAvailable } = require('../utils/protected-storage');
@@ -114,6 +115,51 @@ function getStorageBasePath(storageSourceId, userId) {
 function resolveFilePath(file) {
     const basePath = getStorageBasePath(file.storage_source_id, file.user_id);
     return path.join(basePath, file.path);
+}
+
+function getFileStorageStatus(file) {
+    const storageSourceId = file?.storage_source_id || 'internal';
+    if (!storageSourceId || storageSourceId === 'internal') {
+        return { accessible: true, label: 'Internal Storage' };
+    }
+
+    const source = db.prepare('SELECT id, label, path, is_accessible FROM storage_sources WHERE id = ?')
+        .get(storageSourceId);
+    if (!source) {
+        return { accessible: false, label: 'Unknown storage drive' };
+    }
+
+    let accessible = false;
+    try {
+        const { isDriveActuallyPresent } = require('./events');
+        accessible = isDriveActuallyPresent(source.path, storageSourceId);
+    } catch {
+        accessible = false;
+    }
+
+    if (!!source.is_accessible !== accessible) {
+        db.prepare('UPDATE storage_sources SET is_accessible = ? WHERE id = ?')
+            .run(accessible ? 1 : 0, storageSourceId);
+        eventBus.emit('drive_status_change', {
+            source_id: storageSourceId,
+            label: source.label,
+            status: accessible ? 'online' : 'offline',
+            timestamp: Date.now(),
+        });
+    }
+
+    return { accessible, label: source.label };
+}
+
+function assertFileStorageAvailable(file, res, action = 'modify') {
+    const status = getFileStorageStatus(file);
+    if (status.accessible) return true;
+
+    res.status(503).json({
+        error: `Storage drive "${status.label}" is disconnected. Reconnect it before you ${action} this item.`,
+        drive_disconnected: true,
+    });
+    return false;
 }
 
 function ensureDir(dirPath) {
@@ -1854,6 +1900,13 @@ router.post('/bulk-download', requireAuth, async (req, res) => {
 router.get('/:id/versions', requireAuth, (req, res) => {
     try {
         const fileId = Number(req.params.id);
+        const file = db.prepare('SELECT * FROM files WHERE id = ? AND user_id = ? AND trashed = 0')
+            .get(fileId, req.user.userId);
+        if (!file) {
+            return res.status(404).json({ error: 'Versioned file not found' });
+        }
+        if (!assertFileStorageAvailable(file, res, 'view version history for')) return;
+
         const history = listFileVersions(db, req.user.userId, fileId);
         if (!history) {
             return res.status(404).json({ error: 'Versioned file not found' });
@@ -1873,6 +1926,13 @@ router.post('/:id/versions/:versionId/restore', requireAuth, (req, res) => {
     try {
         const fileId = Number(req.params.id);
         const versionId = Number(req.params.versionId);
+        const file = db.prepare('SELECT * FROM files WHERE id = ? AND user_id = ? AND trashed = 0')
+            .get(fileId, req.user.userId);
+        if (!file) {
+            return res.status(404).json({ error: 'Version not found' });
+        }
+        if (!assertFileStorageAvailable(file, res, 'restore a version of')) return;
+
         const updated = restoreFileVersion(db, req.user.userId, fileId, versionId);
         if (!updated) {
             return res.status(404).json({ error: 'Version not found' });
@@ -1893,6 +1953,13 @@ router.delete('/:id/versions/:versionId', requireAuth, (req, res) => {
     try {
         const fileId = Number(req.params.id);
         const versionId = Number(req.params.versionId);
+        const file = db.prepare('SELECT * FROM files WHERE id = ? AND user_id = ? AND trashed = 0')
+            .get(fileId, req.user.userId);
+        if (!file) {
+            return res.status(404).json({ error: 'Version not found' });
+        }
+        if (!assertFileStorageAvailable(file, res, 'delete a version of')) return;
+
         const deleted = deleteFileVersion(db, req.user.userId, fileId, versionId, deleteStoredVersionBlob);
         if (!deleted) {
             return res.status(404).json({ error: 'Version not found' });
@@ -2339,6 +2406,8 @@ router.put('/:id', requireAuth, (req, res) => {
             return res.status(400).json({ error: 'Encrypted vault files must be downloaded through the vault client' });
         }
 
+        if (!assertFileStorageAvailable(file, res, 'rename')) return;
+
         // Check for duplicate name in same folder
         let dupQuery = `
             SELECT id FROM files 
@@ -2397,6 +2466,8 @@ router.put('/:id/star', requireAuth, (req, res) => {
             return res.status(404).json({ error: 'File not found' });
         }
 
+        if (!assertFileStorageAvailable(file, res, 'star')) return;
+
         const newStarred = file.starred ? 0 : 1;
         db.prepare('UPDATE files SET starred = ? WHERE id = ?').run(newStarred, fileId);
 
@@ -2428,6 +2499,8 @@ router.put('/:id/move', requireAuth, (req, res) => {
             return res.status(404).json({ error: 'File not found' });
         }
 
+        if (!assertFileStorageAvailable(file, res, 'move')) return;
+
         if (destinationParentId && Number(destinationParentId) === Number(file.id)) {
             return res.status(400).json({ error: 'Cannot move an item into itself' });
         }
@@ -2439,7 +2512,7 @@ router.put('/:id/move', requireAuth, (req, res) => {
         // Validate destination folder
         if (destinationParentId) {
             const destFolder = db.prepare(
-                "SELECT id, is_secure_vault, vault_root_id FROM files WHERE id = ? AND user_id = ? AND type = 'folder' AND trashed = 0"
+                "SELECT id, storage_source_id, is_secure_vault, vault_root_id FROM files WHERE id = ? AND user_id = ? AND type = 'folder' AND trashed = 0"
             ).get(destinationParentId, userId);
             if (!destFolder) {
                 return res.status(400).json({ error: 'Destination folder not found' });
@@ -2447,6 +2520,7 @@ router.put('/:id/move', requireAuth, (req, res) => {
             if (destFolder.is_secure_vault === 1 || destFolder.vault_root_id !== null) {
                 return res.status(400).json({ error: 'Use the secure vault flow to manage encrypted vault contents' });
             }
+            if (!assertFileStorageAvailable(destFolder, res, 'move items into')) return;
 
             // Prevent moving folder into itself or its children
             if (file.type === 'folder' && isFolderDescendant(userId, file.id, destinationParentId)) {
@@ -2507,13 +2581,15 @@ router.post('/:id/copy', requireAuth, (req, res) => {
             return res.status(400).json({ error: 'Copying encrypted vault items is not supported yet' });
         }
 
+        if (!assertFileStorageAvailable(source, res, 'copy')) return;
+
         if (destinationParentId && Number(destinationParentId) === Number(source.id)) {
             return res.status(400).json({ error: 'Cannot copy an item into itself' });
         }
 
         if (destinationParentId) {
             const destFolder = db.prepare(
-                "SELECT id, is_secure_vault, vault_root_id FROM files WHERE id = ? AND user_id = ? AND type = 'folder' AND trashed = 0"
+                "SELECT id, storage_source_id, is_secure_vault, vault_root_id FROM files WHERE id = ? AND user_id = ? AND type = 'folder' AND trashed = 0"
             ).get(destinationParentId, userId);
             if (!destFolder) {
                 return res.status(400).json({ error: 'Destination folder not found' });
@@ -2521,6 +2597,7 @@ router.post('/:id/copy', requireAuth, (req, res) => {
             if (destFolder.is_secure_vault === 1 || destFolder.vault_root_id !== null) {
                 return res.status(400).json({ error: 'Use the secure vault flow to manage encrypted vault contents' });
             }
+            if (!assertFileStorageAvailable(destFolder, res, 'copy items into')) return;
 
             if (source.type === 'folder' && isFolderDescendant(userId, source.id, destinationParentId)) {
                 return res.status(400).json({ error: 'Cannot copy a folder into itself or one of its subfolders' });
@@ -2619,6 +2696,8 @@ router.put('/:id/restore', requireAuth, (req, res) => {
             return res.status(404).json({ error: 'File not found in trash' });
         }
 
+        if (!assertFileStorageAvailable(file, res, 'restore')) return;
+
         const restoredName = getUniqueSiblingName(userId, file.parent_id, file.name, file.id);
 
         // Restore file
@@ -2679,6 +2758,8 @@ router.delete('/:id', requireAuth, (req, res) => {
             return res.status(404).json({ error: 'File not found' });
         }
 
+        if (!assertFileStorageAvailable(file, res, 'delete')) return;
+
         // Move to trash (soft delete)
         db.prepare(`
             UPDATE files SET trashed = 1, trashed_at = CURRENT_TIMESTAMP WHERE id = ?
@@ -2730,6 +2811,8 @@ router.delete('/:id/permanent', requireAuth, (req, res) => {
         if (!file) {
             return res.status(404).json({ error: 'File not found' });
         }
+
+        if (!assertFileStorageAvailable(file, res, 'permanently delete')) return;
 
         // Delete physical file if it's not a folder
         if (file.type !== 'folder') {
@@ -2791,7 +2874,12 @@ router.get('/storage-stats', requireAuth, (req, res) => {
             versionBytes += getVersionBytesForStorageSource(db, source.id);
             let is_accessible = false;
             try {
-                is_accessible = fs.existsSync(source.path);
+                if (source.type === 'external') {
+                    const { isDriveActuallyPresent } = require('./events');
+                    is_accessible = isDriveActuallyPresent(source.path, source.id);
+                } else {
+                    is_accessible = fs.existsSync(source.path);
+                }
             } catch (e) {
                 is_accessible = false;
             }

@@ -29,7 +29,7 @@ import {
     Star,
     Video,
 } from "lucide-react"
-import { cn } from "@/lib/utils"
+import { cn, formatApiDate } from "@/lib/utils"
 import { useDriveStatus } from "@/contexts/drive-status-context"
 import { downloadFile, searchFiles, type SearchResult } from "@/lib/api"
 
@@ -72,8 +72,7 @@ function formatFileSize(bytes: number): string {
 }
 
 function formatDate(dateString?: string): string {
-    if (!dateString) return "-"
-    return new Date(dateString).toLocaleDateString()
+    return formatApiDate(dateString)
 }
 
 function bytesToMegabytes(value: string | null) {

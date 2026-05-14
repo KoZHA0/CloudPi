@@ -10,7 +10,7 @@ import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Bell, Palette, HardDrive, Trash2, Server, Loader2, Shield, Save, CheckCircle2, Mail, Send, Lock } from "lucide-react"
-import { getDashboardStats, getSystemHealth, getRateLimitSettings, updateSettings, testSmtpSettings, getEncryptionStats, getNotificationPreferences, updateNotificationPreferences, type DashboardStats, type RateLimitSettings, type SystemHealth, type EncryptionStats, type NotificationPreferences } from "@/lib/api"
+import { getDashboardStats, getSystemHealth, getRateLimitSettings, updateSettings, testSmtpSettings, getEncryptionStats, getNotificationPreferences, updateNotificationPreferences, getStorageStats, type DashboardStats, type RateLimitSettings, type SystemHealth, type EncryptionStats, type NotificationPreferences, type StorageStats } from "@/lib/api"
 import { useAuth } from "@/contexts/auth-context"
 import { useTheme } from "@/contexts/theme-context"
 
@@ -42,6 +42,7 @@ export function SettingsContent() {
 
     const [stats, setStats] = useState<DashboardStats | null>(null)
     const [health, setHealth] = useState<SystemHealth | null>(null)
+    const [storageStats, setStorageStats] = useState<StorageStats | null>(null)
     const [isLoading, setIsLoading] = useState(true)
 
     // Rate limit settings (admin only)
@@ -87,14 +88,16 @@ export function SettingsContent() {
 
     async function loadData() {
         try {
-            const [statsData, healthData, notificationPrefsData] = await Promise.all([
+            const [statsData, healthData, notificationPrefsData, storageStatsData] = await Promise.all([
                 getDashboardStats(),
                 getSystemHealth(),
                 getNotificationPreferences(),
+                getStorageStats().catch(() => null),
             ])
 
             setStats(statsData)
             setHealth(healthData)
+            setStorageStats(storageStatsData)
             setNotificationPreferences(notificationPrefsData.preferences)
 
             // Set rate limit settings if admin
@@ -221,10 +224,11 @@ export function SettingsContent() {
         )
     }
 
-    // Calculate storage percentage (assuming 64GB total for now, or use disk total if available)
-    const totalDiskSpace = health?.disk.total || 64 * 1024 * 1024 * 1024 // Fallback to 64GB
-    const usedStorage = stats?.totalStorage || 0
-    const storagePercent = Math.min(100, Math.round((usedStorage / totalDiskSpace) * 100))
+    const totalDiskSpace = storageStats?.totalBytes ?? health?.disk.total ?? 0
+    const usedStorage = storageStats?.usedBytes ?? stats?.totalStorage ?? 0
+    const storagePercent = totalDiskSpace > 0
+        ? Math.min(100, Math.round((usedStorage / totalDiskSpace) * 100))
+        : 0
 
     return (
         <div className="min-w-0 max-w-4xl space-y-6">
@@ -284,7 +288,9 @@ export function SettingsContent() {
                                 <div className="flex items-center justify-between mb-2">
                                     <span className="font-medium text-secondary-foreground">Storage Used</span>
                                     <span className="text-sm text-muted-foreground">
-                                        {formatBytes(usedStorage)} / {formatBytes(totalDiskSpace)}
+                                        {totalDiskSpace > 0
+                                            ? `${formatBytes(usedStorage)} / ${formatBytes(totalDiskSpace)}`
+                                            : `${formatBytes(usedStorage)} / Unknown`}
                                     </span>
                                 </div>
                                 <div className="w-full bg-background rounded-full h-2">

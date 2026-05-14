@@ -6,7 +6,7 @@ import { AlertTriangle, Bell, CheckCheck, HardDrive, Inbox, Loader2, Share2 } fr
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
-import { cn } from "@/lib/utils"
+import { cn, formatApiDateTime } from "@/lib/utils"
 import {
     getNotifications,
     getUnreadNotificationCount,
@@ -18,7 +18,7 @@ import {
 const NOTIFICATIONS_UPDATED_EVENT = "cloudpi-notifications-updated"
 
 function formatNotificationDate(value: string): string {
-    return new Date(value).toLocaleString([], {
+    return formatApiDateTime(value, {
         month: "short",
         day: "numeric",
         hour: "2-digit",

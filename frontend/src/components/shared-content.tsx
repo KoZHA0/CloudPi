@@ -153,13 +153,17 @@ function isExpiringSoon(share: ShareItem) {
 }
 
 function permissionLabel(permission: SharePermission | string) {
-    const labels: Record<string, string> = {
+    const labels: Record<SharePermission, string> = {
         view: "View only",
-        comment: "Can comment",
         edit: "Can edit/download",
         upload: "Upload only",
     }
-    return labels[permission] || permission
+    return labels[effectivePermission(permission)]
+}
+
+function effectivePermission(permission: SharePermission | string): SharePermission {
+    if (permission === "edit" || permission === "upload") return permission
+    return "view"
 }
 
 export function SharedContent() {
@@ -251,7 +255,7 @@ export function SharedContent() {
         return source
             .filter((share) => share.file_name.toLowerCase().includes(searchQuery.toLowerCase()))
             .filter((share) => shareTypeFilter === "all" || share.share_type === shareTypeFilter)
-            .filter((share) => permissionFilter === "all" || share.permission === permissionFilter)
+            .filter((share) => permissionFilter === "all" || effectivePermission(share.permission) === permissionFilter)
             .filter((share) => statusFilter === "all" || (statusFilter === "expired" ? isExpired(share) : !isExpired(share)))
             .filter((share) => fileTypeFilter === "all" || share.file_type === fileTypeFilter)
             .sort((a, b) => {
@@ -663,7 +667,7 @@ export function SharedContent() {
                             ) : (
                                 <>
                                     <Select
-                                        value={share.permission}
+                                        value={effectivePermission(share.permission)}
                                         onValueChange={(value) => handlePermissionChange(share, value as SharePermission)}
                                         disabled={busy}
                                     >
@@ -672,7 +676,6 @@ export function SharedContent() {
                                         </SelectTrigger>
                                         <SelectContent>
                                             <SelectItem value="view">View only</SelectItem>
-                                            <SelectItem value="comment">Can comment</SelectItem>
                                             <SelectItem value="edit">Can edit/download</SelectItem>
                                             {share.file_type === "folder" && <SelectItem value="upload">Upload only</SelectItem>}
                                         </SelectContent>
@@ -860,7 +863,6 @@ export function SharedContent() {
                     <SelectContent>
                         <SelectItem value="all">Any permission</SelectItem>
                         <SelectItem value="view">View only</SelectItem>
-                        <SelectItem value="comment">Can comment</SelectItem>
                         <SelectItem value="edit">Can edit</SelectItem>
                         <SelectItem value="upload">Upload only</SelectItem>
                     </SelectContent>
@@ -903,7 +905,6 @@ export function SharedContent() {
                         <SelectTrigger size="sm" className="w-[150px]"><SelectValue /></SelectTrigger>
                         <SelectContent>
                             <SelectItem value="view">View only</SelectItem>
-                            <SelectItem value="comment">Can comment</SelectItem>
                             <SelectItem value="edit">Can edit</SelectItem>
                             <SelectItem value="upload">Upload only</SelectItem>
                         </SelectContent>

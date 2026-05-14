@@ -920,7 +920,7 @@ export interface ShareUser {
     email?: string | null;
 }
 
-export type SharePermission = 'view' | 'comment' | 'edit' | 'upload';
+export type SharePermission = 'view' | 'edit' | 'upload';
 
 export interface ShareOptions {
     expiresAt?: string | null;

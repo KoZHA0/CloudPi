@@ -238,6 +238,16 @@ function sendFileSafely(res, filePath, notFoundMessage = 'File not found on disk
     });
 }
 
+function getPreviewContentType(file) {
+    const mimeType = String(file?.mime_type || '').trim();
+    if (mimeType) return mimeType;
+
+    const name = String(file?.name || '').toLowerCase();
+    if (name.endsWith('.pdf')) return 'application/pdf';
+
+    return 'application/octet-stream';
+}
+
 function deleteStoredItem(file) {
     if (!file || !file.path) return;
     const filePath = resolveFilePath(file);
@@ -2205,13 +2215,7 @@ router.get('/:id/preview', async (req, res) => {
         db.prepare('UPDATE files SET accessed_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?')
             .run(file.id, userId);
 
-        // When raw=1 is set, serve as application/octet-stream to bypass
-        // download managers (IDM) that intercept PDF content types
-        const contentType = req.query.raw === '1'
-            ? 'application/octet-stream'
-            : (file.mime_type || 'application/octet-stream');
-
-        res.set('Content-Type', contentType);
+        res.set('Content-Type', getPreviewContentType(file));
         res.set('Content-Disposition', `inline; filename="${encodeURIComponent(file.name)}"`);
         res.set('Cache-Control', 'public, max-age=86400');
 

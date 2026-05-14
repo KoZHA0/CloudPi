@@ -19,6 +19,7 @@ const jwt = require('jsonwebtoken');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const os = require('os');
 const db = require('../database/db');
 const eventBus = require('../utils/event-bus');
 const { JWT_SECRET } = require('../utils/auth-config');
@@ -28,6 +29,11 @@ const {
 } = require('../utils/storage-status');
 
 const router = express.Router();
+
+const EXTERNAL_DRIVE_MONITOR_INTERVAL_MS = Math.max(
+    5000,
+    Number(process.env.CLOUDPI_EXTERNAL_DRIVE_MONITOR_INTERVAL_MS) || 10000
+);
 
 // ============================================
 // SSE ENDPOINT — Real-time push to frontend
@@ -78,6 +84,7 @@ router.get('/', (req, res) => {
 
     // Send initial connection event with current drive statuses
     syncInternalStorageState({ emitOnChange: false });
+    syncExternalDriveStates({ emitOnChange: true });
 
     const sources = db.prepare(
         'SELECT id, label, is_accessible FROM storage_sources'
@@ -336,6 +343,175 @@ function isDriveActuallyPresent(drivePath, expectedDriveId) {
     }
 }
 
+function getConfiguredExternalDriveRoots() {
+    const roots = new Set();
+    if (process.env.CLOUDPI_EXTERNAL_DRIVES_PATH) {
+        roots.add(process.env.CLOUDPI_EXTERNAL_DRIVES_PATH);
+    }
+
+    const registeredPaths = db.prepare(
+        "SELECT path FROM storage_sources WHERE type = 'external' AND path IS NOT NULL"
+    ).all();
+
+    for (const source of registeredPaths) {
+        if (source.path) roots.add(path.dirname(source.path));
+    }
+
+    if (process.platform === 'linux') {
+        try {
+            const username = os.userInfo().username;
+            roots.add(`/run/media/${username}`);
+            roots.add(`/media/${username}`);
+        } catch {
+            // Keep the static fallbacks below.
+        }
+        roots.add('/media/pi');
+        roots.add('/media');
+    }
+
+    return Array.from(roots)
+        .filter(Boolean)
+        .map(root => path.resolve(root))
+        .filter((root, index, all) => all.indexOf(root) === index && fs.existsSync(root));
+}
+
+function readDriveIdentity(drivePath) {
+    try {
+        const idFilePath = path.join(drivePath, '.cloudpi-id');
+        if (!fs.existsSync(idFilePath)) return null;
+
+        const content = fs.readFileSync(idFilePath, 'utf8');
+        const idMatch = content.match(/drive_id=(.+)/);
+        if (!idMatch) return null;
+
+        const driveId = idMatch[1].trim();
+        const hmacMatch = content.match(/hmac=(.+)/);
+        return {
+            driveId,
+            hasHmac: Boolean(hmacMatch),
+            hmacValid: hmacMatch ? verifyDriveHmac(driveId, hmacMatch[1].trim()) : false,
+        };
+    } catch {
+        return null;
+    }
+}
+
+function findMountedRegisteredDrive(expectedDriveId) {
+    for (const root of getConfiguredExternalDriveRoots()) {
+        let entries = [];
+        try {
+            entries = fs.readdirSync(root, { withFileTypes: true });
+        } catch {
+            continue;
+        }
+
+        for (const entry of entries) {
+            if (!entry.isDirectory()) continue;
+
+            const candidatePath = path.join(root, entry.name);
+            if (!isDriveActuallyPresent(candidatePath, expectedDriveId)) continue;
+
+            const identity = readDriveIdentity(candidatePath);
+            if (!identity || identity.driveId !== expectedDriveId) continue;
+
+            return {
+                path: candidatePath,
+                hmacValid: identity.hmacValid,
+                hasHmac: identity.hasHmac,
+            };
+        }
+    }
+
+    return null;
+}
+
+function setExternalDriveState(source, accessible, nextPath = null, options = {}) {
+    const { emitOnChange = true } = options;
+    const previousAccessible = source.is_accessible ? 1 : 0;
+    const nextAccessible = accessible ? 1 : 0;
+    const pathChanged = Boolean(accessible && nextPath && source.path !== nextPath);
+
+    if (previousAccessible === nextAccessible && !pathChanged) {
+        return false;
+    }
+
+    if (pathChanged) {
+        db.prepare('UPDATE storage_sources SET is_accessible = ?, path = ? WHERE id = ?')
+            .run(nextAccessible, nextPath, source.id);
+    } else {
+        db.prepare('UPDATE storage_sources SET is_accessible = ? WHERE id = ?')
+            .run(nextAccessible, source.id);
+    }
+
+    if (pathChanged) {
+        console.log(`🔄 [DRIVE] "${source.label}" mount path updated: ${source.path} → ${nextPath}`);
+    }
+
+    if (emitOnChange && previousAccessible !== nextAccessible) {
+        eventBus.emit('drive_status_change', {
+            source_id: source.id,
+            label: source.label,
+            status: accessible ? 'online' : 'offline',
+            timestamp: Date.now(),
+        });
+    }
+
+    return true;
+}
+
+function syncExternalDriveStates(options = {}) {
+    const { emitOnChange = true } = options;
+    const sources = db.prepare(
+        "SELECT id, label, path, is_active, is_accessible FROM storage_sources WHERE type = 'external'"
+    ).all();
+
+    for (const source of sources) {
+        if (!source.is_active) {
+            setExternalDriveState(source, false, null, { emitOnChange });
+            continue;
+        }
+
+        if (source.path && isDriveActuallyPresent(source.path, source.id)) {
+            setExternalDriveState(source, true, source.path, { emitOnChange });
+            continue;
+        }
+
+        const mounted = findMountedRegisteredDrive(source.id);
+        if (mounted) {
+            if (mounted.hasHmac && mounted.hmacValid) {
+                setExternalDriveState(source, true, mounted.path, { emitOnChange });
+                continue;
+            }
+
+            // Legacy/unsigned or tampered identity files should still be visible
+            // to admin scan, but are not automatically moved to a new path.
+            if (source.is_accessible) {
+                setExternalDriveState(source, false, null, { emitOnChange });
+            }
+            continue;
+        }
+
+        setExternalDriveState(source, false, null, { emitOnChange });
+    }
+}
+
+let externalDriveMonitorStarted = false;
+
+function startExternalDriveMonitor(intervalMs = EXTERNAL_DRIVE_MONITOR_INTERVAL_MS) {
+    if (externalDriveMonitorStarted) return;
+    externalDriveMonitorStarted = true;
+
+    const timer = setInterval(() => {
+        try {
+            syncExternalDriveStates({ emitOnChange: true });
+        } catch (error) {
+            console.error('External drive monitor error:', error);
+        }
+    }, intervalMs);
+
+    if (typeof timer.unref === 'function') timer.unref();
+}
+
 
 // ============================================
 // STARTUP RECONCILIATION
@@ -350,32 +526,17 @@ function isDriveActuallyPresent(drivePath, expectedDriveId) {
  */
 function reconcileDriveStates() {
     syncInternalStorageState({ emitOnChange: false });
-
-    const sources = db.prepare(
-        "SELECT id, label, path, is_active FROM storage_sources WHERE type = 'external'"
-    ).all();
-
-    for (const source of sources) {
-        // Identity-aware check: verify .cloudpi-id matches, not just path exists
-        const accessible = isDriveActuallyPresent(source.path, source.id);
-
-        const currentState = db.prepare('SELECT is_accessible FROM storage_sources WHERE id = ?').get(source.id);
-        const wasAccessible = currentState?.is_accessible === 1;
-
-        if (accessible !== wasAccessible) {
-            db.prepare('UPDATE storage_sources SET is_accessible = ? WHERE id = ?')
-                .run(accessible ? 1 : 0, source.id);
-            console.log(`🔄 [STARTUP] Drive "${source.label}" reconciled: ${wasAccessible ? 'online→offline' : 'offline→online'}`);
-        }
-    }
+    syncExternalDriveStates({ emitOnChange: false });
 }
 
 // Export for use by admin.js storage listing cross-check
 module.exports = router;
 module.exports.isDriveActuallyPresent = isDriveActuallyPresent;
+module.exports.syncExternalDriveStates = syncExternalDriveStates;
 module.exports.syncInternalStorageState = syncInternalStorageState;
 
 // Run reconciliation on module load
 reconcileDriveStates();
 startInternalStorageMonitor();
+startExternalDriveMonitor();
 

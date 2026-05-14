@@ -228,7 +228,7 @@ export function TrashContent() {
                     </p>
                 </div>
                 {files.length > 0 && (
-                    <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                    <div className="flex w-full min-w-0 flex-col gap-2 lg:w-auto sm:flex-row sm:items-center">
                         <div className="flex flex-wrap gap-2">
                             <Badge variant="secondary">{files.length} total</Badge>
                             <Badge variant="outline">{folderCount} folder{folderCount === 1 ? "" : "s"}</Badge>
@@ -262,14 +262,14 @@ export function TrashContent() {
                         />
                     </div>
                     {selectedItems.length > 0 && (
-                        <div className="flex w-full flex-wrap gap-2 rounded-lg border border-border bg-secondary/60 p-2 md:w-auto">
-                            <span className="flex items-center px-2 text-sm text-secondary-foreground">
+                        <div className="grid w-full grid-cols-2 gap-2 rounded-lg border border-border bg-secondary/60 p-2 min-[420px]:flex min-[420px]:flex-wrap md:w-auto">
+                            <span className="col-span-2 flex items-center px-2 text-sm text-secondary-foreground min-[420px]:col-span-1">
                                 {selectedItems.length} selected
                             </span>
                             <Button
                                 variant="ghost"
                                 size="sm"
-                                className="flex-1 gap-2 sm:flex-none"
+                                className="gap-2"
                                 disabled={isProcessing}
                                 onClick={() => restoreItems(selectedItems)}
                             >
@@ -279,14 +279,14 @@ export function TrashContent() {
                             <Button
                                 variant="ghost"
                                 size="sm"
-                                className="flex-1 gap-2 text-destructive sm:flex-none"
+                                className="gap-2 text-destructive"
                                 disabled={isProcessing}
                                 onClick={() => setConfirmAction({ type: "selected-delete" })}
                             >
                                 <Trash2 className="h-4 w-4" />
                                 Delete
                             </Button>
-                            <Button variant="ghost" size="sm" className="flex-1 sm:flex-none" onClick={() => setSelectedIds([])}>
+                            <Button variant="ghost" size="sm" onClick={() => setSelectedIds([])}>
                                 Clear
                             </Button>
                         </div>
@@ -375,7 +375,7 @@ export function TrashContent() {
                                         }
                                     }}
                                     className={cn(
-                                        "flex cursor-pointer select-none items-center gap-2 border-b border-border px-4 py-3 outline-none last:border-0 hover:bg-secondary focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-inset sm:grid sm:grid-cols-12 sm:gap-4 sm:px-6",
+                                        "flex cursor-pointer select-none flex-col items-stretch gap-3 border-b border-border px-4 py-3 outline-none last:border-0 hover:bg-secondary focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-inset sm:grid sm:grid-cols-12 sm:items-center sm:gap-4 sm:px-6",
                                         selected && "bg-primary/10 hover:bg-primary/15"
                                     )}
                                 >
@@ -415,11 +415,11 @@ export function TrashContent() {
                                     <div className="hidden text-sm text-muted-foreground sm:col-span-2 sm:block">
                                         {formatDate(file.trashed_at)}
                                     </div>
-                                    <div className="flex flex-shrink-0 justify-end gap-1 sm:col-span-2">
+                                    <div className="flex w-full flex-shrink-0 justify-end gap-1 sm:col-span-2 sm:w-auto">
                                         <Button
                                             variant="ghost"
                                             size="sm"
-                                            className="gap-2"
+                                            className="flex-1 gap-2 sm:flex-none"
                                             onClick={(event) => {
                                                 event.stopPropagation()
                                                 restoreItems([file])

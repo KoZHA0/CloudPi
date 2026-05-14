@@ -135,7 +135,7 @@ function CircularGauge({ percentage, label, value, subtext, color, icon: Icon }:
     const gaugeColor = percentage > 85 ? '#ef4444' : percentage > 60 ? '#f59e0b' : color
 
     return (
-        <div className="flex flex-col items-center gap-3">
+        <div className="flex min-w-0 flex-col items-center gap-3">
             <div className="relative h-24 w-24">
                 <svg className="h-24 w-24 -rotate-90" viewBox="0 0 100 100">
                     <circle cx="50" cy="50" r="40" fill="none" stroke="currentColor" strokeWidth="8" className="text-secondary" />
@@ -153,12 +153,12 @@ function CircularGauge({ percentage, label, value, subtext, color, icon: Icon }:
                 </div>
             </div>
             <div className="text-center">
-                <div className="flex items-center justify-center gap-1.5 text-sm font-medium text-card-foreground">
+                <div className="flex min-w-0 items-center justify-center gap-1.5 text-sm font-medium text-card-foreground">
                     <Icon className="h-3.5 w-3.5" style={{ color: gaugeColor }} />
-                    {label}
+                    <span className="truncate">{label}</span>
                 </div>
-                <p className="text-xs text-muted-foreground mt-0.5">{value}</p>
-                <p className="text-xs text-muted-foreground">{subtext}</p>
+                <p className="mt-0.5 max-w-28 truncate text-xs text-muted-foreground">{value}</p>
+                <p className="max-w-28 truncate text-xs text-muted-foreground">{subtext}</p>
             </div>
         </div>
     )
@@ -294,10 +294,10 @@ export function DashboardContent() {
     return (
         <div className="space-y-6">
             {/* Stats Grid */}
-            <div className="grid gap-4 grid-cols-2 lg:grid-cols-4">
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
                 <Card className="bg-card border-border">
-                    <CardHeader className="flex flex-row items-center justify-between pb-2">
-                        <CardTitle className="text-sm font-medium text-muted-foreground">Total Files</CardTitle>
+                    <CardHeader className="flex flex-row items-center justify-between gap-3 pb-2">
+                        <CardTitle className="min-w-0 text-sm font-medium text-muted-foreground">Total Files</CardTitle>
                         <FileText className="h-4 w-4 text-muted-foreground" />
                     </CardHeader>
                     <CardContent>
@@ -306,8 +306,8 @@ export function DashboardContent() {
                     </CardContent>
                 </Card>
                 <Card className="bg-card border-border">
-                    <CardHeader className="flex flex-row items-center justify-between pb-2">
-                        <CardTitle className="text-sm font-medium text-muted-foreground">Storage Used</CardTitle>
+                    <CardHeader className="flex flex-row items-center justify-between gap-3 pb-2">
+                        <CardTitle className="min-w-0 text-sm font-medium text-muted-foreground">Storage Used</CardTitle>
                         <HardDrive className="h-4 w-4 text-muted-foreground" />
                     </CardHeader>
                     <CardContent>
@@ -316,8 +316,8 @@ export function DashboardContent() {
                     </CardContent>
                 </Card>
                 <Card className="bg-card border-border">
-                    <CardHeader className="flex flex-row items-center justify-between pb-2">
-                        <CardTitle className="text-sm font-medium text-muted-foreground">Shared by Me</CardTitle>
+                    <CardHeader className="flex flex-row items-center justify-between gap-3 pb-2">
+                        <CardTitle className="min-w-0 text-sm font-medium text-muted-foreground">Shared by Me</CardTitle>
                         <Share2 className="h-4 w-4 text-muted-foreground" />
                     </CardHeader>
                     <CardContent>
@@ -326,8 +326,8 @@ export function DashboardContent() {
                     </CardContent>
                 </Card>
                 <Card className="bg-card border-border">
-                    <CardHeader className="flex flex-row items-center justify-between pb-2">
-                        <CardTitle className="text-sm font-medium text-muted-foreground">Shared with Me</CardTitle>
+                    <CardHeader className="flex flex-row items-center justify-between gap-3 pb-2">
+                        <CardTitle className="min-w-0 text-sm font-medium text-muted-foreground">Shared with Me</CardTitle>
                         <Share2 className="h-4 w-4 text-muted-foreground" />
                     </CardHeader>
                     <CardContent>
@@ -461,17 +461,17 @@ export function DashboardContent() {
                 {/* System Health */}
                 <Card className="lg:col-span-2 bg-card border-border">
                     <CardHeader>
-                        <div className="flex items-center justify-between">
-                            <div>
+                        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                            <div className="min-w-0">
                                 <CardTitle className="text-card-foreground flex items-center gap-2">
                                     <Server className="h-5 w-5" />
                                     System Health
                                 </CardTitle>
-                                <CardDescription>
+                                <CardDescription className="break-words">
                                     {health?.hostname ?? '—'} · {health?.platform ?? '—'} · Uptime: {health ? formatUptime(health.uptime) : '—'}
                                 </CardDescription>
                             </div>
-                            <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                            <div className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
                                 <Clock className="h-3 w-3" />
                                 Live
                                 <span className="relative flex h-2 w-2">
@@ -482,7 +482,7 @@ export function DashboardContent() {
                         </div>
                     </CardHeader>
                     <CardContent>
-                        <div className={`grid gap-6 ${health?.cpu.temperature != null ? "grid-cols-2 sm:grid-cols-4" : "grid-cols-1 sm:grid-cols-3"}`}>
+                        <div className={`grid gap-6 ${health?.cpu.temperature != null ? "grid-cols-1 min-[420px]:grid-cols-2 sm:grid-cols-4" : "grid-cols-1 min-[420px]:grid-cols-3"}`}>
                             <CircularGauge
                                 percentage={health?.cpu.usage ?? 0}
                                 label="CPU"
@@ -532,16 +532,16 @@ export function DashboardContent() {
                             <button
                                 type="button"
                                 key={item.type}
-                                className="flex w-full items-center justify-between rounded-lg bg-secondary p-3 text-left transition-colors hover:bg-secondary/80"
+                                className="flex w-full min-w-0 items-center justify-between gap-3 rounded-lg bg-secondary p-3 text-left transition-colors hover:bg-secondary/80"
                                 onClick={() => navigate(`/files?type=${item.type}`)}
                             >
-                                <div className="flex items-center gap-3">
+                                <div className="flex min-w-0 items-center gap-3">
                                     <div className={`rounded-lg bg-background p-2 ${item.color}`}>
                                         <item.icon className="h-5 w-5" />
                                     </div>
-                                    <span className="font-medium text-secondary-foreground">{item.label}</span>
+                                    <span className="truncate font-medium text-secondary-foreground">{item.label}</span>
                                 </div>
-                                <div className="text-right">
+                                <div className="shrink-0 text-right">
                                     <span className="text-sm font-medium text-secondary-foreground">{item.count}</span>
                                     {item.size > 0 && (
                                         <p className="text-xs text-muted-foreground">{formatBytes(item.size)}</p>

@@ -89,10 +89,10 @@ export function StorageOverview({
     return (
         <Card className="border-border bg-card/80 backdrop-blur-sm shadow-sm">
             <CardHeader className="pb-2">
-                <div className="flex items-center justify-between">
-                    <CardTitle className="text-lg font-semibold flex items-center gap-2 text-card-foreground">
+                <div className="flex min-w-0 items-start justify-between gap-3">
+                    <CardTitle className="flex min-w-0 items-center gap-2 text-lg font-semibold text-card-foreground">
                         <HardDrive className="h-5 w-5 text-primary" />
-                        Storage Usage
+                        <span className="truncate">Storage Usage</span>
                     </CardTitle>
                 </div>
                 <CardDescription>
@@ -101,7 +101,7 @@ export function StorageOverview({
             </CardHeader>
             <CardContent className="space-y-4">
                 <div className="space-y-2 mt-2">
-                    <div className="flex justify-between text-sm">
+                    <div className="flex flex-col gap-1 text-sm min-[420px]:flex-row min-[420px]:items-center min-[420px]:justify-between">
                         <span className="font-medium text-foreground">{formatBytes(totalStorage)} Used</span>
                         {!isUnlimited && (
                             <span className="text-muted-foreground font-medium">{usagePercentage.toFixed(1)}%</span>
@@ -141,14 +141,14 @@ export function StorageOverview({
                 )}
 
                 {versionStorage > 0 && (
-                    <div className="flex items-center justify-between rounded-lg border border-border bg-secondary/60 p-4">
-                        <div className="flex items-center gap-3">
+                    <div className="flex min-w-0 items-center justify-between rounded-lg border border-border bg-secondary/60 p-4">
+                        <div className="flex min-w-0 items-center gap-3">
                             <div className="rounded-full bg-primary/10 p-2">
                                 <History className="h-5 w-5 text-primary" />
                             </div>
-                            <div>
+                            <div className="min-w-0">
                                 <p className="text-sm font-semibold text-card-foreground">Version History</p>
-                                <p className="text-xs text-muted-foreground">
+                                <p className="break-words text-xs text-muted-foreground">
                                     {formatBytes(versionStorage)} stored in archived versions
                                 </p>
                             </div>
@@ -158,22 +158,22 @@ export function StorageOverview({
 
                 {trashStorage > 0 && (
                     <div className="mt-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4 rounded-lg border border-amber-500/20 bg-amber-500/10 p-4">
-                        <div className="flex items-center gap-3">
+                        <div className="flex min-w-0 items-center gap-3">
                             <div className="rounded-full bg-amber-500/20 p-2">
                                 <Trash2 className="h-5 w-5 text-amber-600" />
                             </div>
-                            <div>
+                            <div className="min-w-0">
                                 <p className="text-sm font-semibold text-amber-600 dark:text-amber-500">Trash Bin</p>
-                                <p className="text-xs text-amber-600/80 dark:text-amber-500/80">
+                                <p className="break-words text-xs text-amber-600/80 dark:text-amber-500/80">
                                     {trashFiles} files taking up {formatBytes(trashStorage)}
                                 </p>
                             </div>
                         </div>
-                        <div className="flex items-center gap-2">
+                        <div className="grid w-full grid-cols-1 gap-2 min-[420px]:grid-cols-2 sm:w-auto">
                             <Button
                                 variant="outline"
                                 size="sm"
-                                className="shrink-0 border-amber-500/30 text-amber-700 dark:text-amber-400 hover:bg-amber-500/20"
+                                className="w-full shrink-0 border-amber-500/30 text-amber-700 hover:bg-amber-500/20 dark:text-amber-400 sm:w-auto"
                                 onClick={() => navigate('/trash')}
                             >
                                 Review Trash
@@ -181,7 +181,7 @@ export function StorageOverview({
                             <Button
                                 variant="destructive"
                                 size="sm"
-                                className="shrink-0"
+                                className="w-full shrink-0 sm:w-auto"
                                 onClick={handleEmptyTrash}
                                 disabled={isEmptying}
                             >

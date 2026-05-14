@@ -371,8 +371,8 @@ export function TopBar() {
     }
 
     return (
-        <header className="sticky top-0 z-30 flex h-16 items-center justify-between border-b border-border bg-background/95 px-4 sm:px-6 backdrop-blur supports-[backdrop-filter]:bg-background/60">
-            <div className="flex items-center gap-3">
+        <header className="sticky top-0 z-30 flex h-16 items-center justify-between gap-3 border-b border-border bg-background/95 px-4 backdrop-blur supports-[backdrop-filter]:bg-background/60 sm:px-6">
+            <div className="flex min-w-0 items-center gap-3">
                 {/* Hamburger menu for mobile */}
                 <Button
                     variant="ghost"
@@ -383,9 +383,9 @@ export function TopBar() {
                 >
                     <Menu className="h-5 w-5" />
                 </Button>
-                <h1 className="text-lg sm:text-xl font-semibold text-foreground">{getPageTitle()}</h1>
+                <h1 className="truncate text-lg font-semibold text-foreground sm:text-xl">{getPageTitle()}</h1>
             </div>
-            <div className="flex items-center gap-2 sm:gap-4">
+            <div className="flex shrink-0 items-center gap-2 sm:gap-4">
                 <NotificationBell />
                 <input
                     ref={topbarFileInputRef}

@@ -907,7 +907,15 @@ export function AdminContent() {
                                                 <p className="break-all text-xs text-muted-foreground">{src.path}</p>
                                                 {src.created_at && (
                                                     <p className="text-xs text-muted-foreground">
-                                                        Registered {formatApiDateTime(src.created_at)}
+                                                        Registered {formatApiDateTime(src.created_at, {
+                                                            year: "numeric",
+                                                            month: "short",
+                                                            day: "numeric",
+                                                            hour: "numeric",
+                                                            minute: "2-digit",
+                                                            second: "2-digit",
+                                                            hour12: true,
+                                                        })}
                                                     </p>
                                                 )}
                                             </div>

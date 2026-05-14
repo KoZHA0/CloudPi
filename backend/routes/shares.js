@@ -1054,10 +1054,15 @@ router.get('/shared-folder/:shareId/files', requireAuth, (req, res) => {
         }
 
         const files = db.prepare(`
-            SELECT id, name, type, size, mime_type, parent_id, created_at, modified_at
-            FROM files
-            WHERE parent_id = ? AND user_id = ? AND trashed = 0
-            ORDER BY CASE WHEN type = 'folder' THEN 0 ELSE 1 END, name ASC
+            SELECT f.id, f.name, f.type, f.size, f.mime_type, f.parent_id,
+                   f.created_at, f.modified_at, f.storage_source_id,
+                   ss.label as storage_source_label,
+                   ss.type as storage_source_type,
+                   COALESCE(ss.is_accessible, 1) as is_accessible
+            FROM files f
+            LEFT JOIN storage_sources ss ON f.storage_source_id = ss.id
+            WHERE f.parent_id = ? AND f.user_id = ? AND f.trashed = 0
+            ORDER BY CASE WHEN f.type = 'folder' THEN 0 ELSE 1 END, f.name ASC
         `).all(parentId, share.owner_id);
 
         const breadcrumbs = [];

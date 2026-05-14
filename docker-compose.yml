@@ -31,6 +31,8 @@ services:
       - PORT=3001
       - NODE_ENV=production
       - CLOUDPI_DB_PATH=/data/cloudpi.db
+      - TZ=${TZ:-Asia/Baghdad}
+      - CLOUDPI_TIME_ZONE=${CLOUDPI_TIME_ZONE:-Asia/Baghdad}
       # Host path where USB drives are auto-mounted (default: /media/pi)
       - CLOUDPI_EXTERNAL_DRIVES_PATH=/media/pi
     volumes:

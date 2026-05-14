@@ -43,6 +43,29 @@ function formatQuota(bytes) {
     const gb = mb / 1024;
     return `${Number.isInteger(gb) ? gb : gb.toFixed(1)} GB`;
 }
+
+function getConfiguredTimeZone() {
+    const candidate = process.env.CLOUDPI_TIME_ZONE || process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+    try {
+        new Intl.DateTimeFormat('en-US', { timeZone: candidate }).format(new Date());
+        return candidate;
+    } catch {
+        return 'UTC';
+    }
+}
+
+function formatDriveRegistrationTimestamp(date = new Date()) {
+    return new Intl.DateTimeFormat('en-US', {
+        timeZone: getConfiguredTimeZone(),
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: 'numeric',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: true,
+    }).format(date);
+}
 const { JWT_SECRET, SALT_ROUNDS } = require('../utils/auth-config');
 const { sendEmail } = require('../utils/mailer');
 const { isInternalStorageAccessible, syncInternalStorageState } = require('../utils/storage-status');
@@ -980,7 +1003,14 @@ router.post('/storage', requireAdmin, (req, res) => {
 
         // Write the .cloudpi-id file with HMAC signature for tamper detection
         const hmac = computeDriveHmac(driveId);
-        let idContent = `drive_id=${driveId}\nregistered=${new Date().toISOString()}\nlabel=${label}\n`;
+        const registeredAt = new Date();
+        const timeZone = getConfiguredTimeZone();
+        let idContent =
+            `drive_id=${driveId}\n` +
+            `registered=${formatDriveRegistrationTimestamp(registeredAt)}\n` +
+            `registered_utc=${registeredAt.toISOString()}\n` +
+            `time_zone=${timeZone}\n` +
+            `label=${label}\n`;
         if (hmac) {
             idContent += `hmac=${hmac}\n`;
         }

@@ -36,7 +36,7 @@ import {
     Trash2,
     Video,
 } from "lucide-react"
-import { cn } from "@/lib/utils"
+import { cn, formatApiDateTime, parseApiDate } from "@/lib/utils"
 import {
     emptyTrash,
     getTrash,
@@ -80,8 +80,7 @@ function formatFileSize(bytes: number): string {
 }
 
 function formatDate(dateString?: string): string {
-    if (!dateString) return "-"
-    return new Date(dateString).toLocaleString([], {
+    return formatApiDateTime(dateString, {
         year: "numeric",
         month: "short",
         day: "numeric",
@@ -94,9 +93,9 @@ const DAY_MS = 24 * 60 * 60 * 1000
 
 function getDaysUntilAutoDelete(dateString: string | undefined, retentionDays: number): number {
     if (!dateString) return retentionDays
-    const deletedAt = new Date(dateString).getTime()
-    if (!Number.isFinite(deletedAt)) return retentionDays
-    return Math.max(0, Math.ceil((deletedAt + retentionDays * DAY_MS - Date.now()) / DAY_MS))
+    const deletedAt = parseApiDate(dateString)
+    if (!deletedAt) return retentionDays
+    return Math.max(0, Math.ceil((deletedAt.getTime() + retentionDays * DAY_MS - Date.now()) / DAY_MS))
 }
 
 function formatAutoDeleteLabel(daysLeft: number): string {

@@ -1411,6 +1411,8 @@ export interface RegisteredSource {
     path: string;
     type: string;
     is_active: number;
+    is_accessible?: number | boolean;
+    created_at?: string;
     status: 'online' | 'detected' | 'offline';
 }
 

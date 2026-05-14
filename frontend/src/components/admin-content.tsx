@@ -57,6 +57,7 @@ import {
 } from "@/components/ui/select"
 import { Checkbox } from "@/components/ui/checkbox"
 import { useAuth } from "@/contexts/auth-context"
+import { formatApiDateTime, parseApiDate } from "@/lib/utils"
 import { 
     getUsers, 
     createUser, 
@@ -536,7 +537,7 @@ export function AdminContent() {
                                                     </Badge>
                                                 )}
                                                 {/* Locked badge */}
-                                                {user.locked_until && new Date(user.locked_until) > new Date() && (
+                                                {user.locked_until && (parseApiDate(user.locked_until)?.getTime() || 0) > Date.now() && (
                                                     <Badge variant="outline" className="border-amber-500/50 text-amber-400 text-xs">
                                                         <Lock className="h-3 w-3 mr-1" />
                                                         Locked
@@ -652,7 +653,7 @@ export function AdminContent() {
                                             </Button>
                                         )}
                                         {/* Unlock locked account */}
-                                        {user.locked_until && new Date(user.locked_until) > new Date() && (
+                                        {user.locked_until && (parseApiDate(user.locked_until)?.getTime() || 0) > Date.now() && (
                                             <Button
                                                 variant="ghost"
                                                 size="icon"
@@ -904,6 +905,11 @@ export function AdminContent() {
                                                     <p className="break-words text-sm font-medium">{src.label}</p>
                                                 )}
                                                 <p className="break-all text-xs text-muted-foreground">{src.path}</p>
+                                                {src.created_at && (
+                                                    <p className="text-xs text-muted-foreground">
+                                                        Registered {formatApiDateTime(src.created_at)}
+                                                    </p>
+                                                )}
                                             </div>
                                         </div>
                                         <div className="flex flex-wrap items-center gap-2 sm:justify-end">

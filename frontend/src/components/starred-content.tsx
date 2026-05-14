@@ -46,7 +46,7 @@ import {
     Trash2,
     Video,
 } from "lucide-react"
-import { cn } from "@/lib/utils"
+import { cn, formatApiDate } from "@/lib/utils"
 import { useDriveStatus } from "@/contexts/drive-status-context"
 import {
     deleteFile,
@@ -91,8 +91,7 @@ function formatFileSize(bytes: number): string {
 }
 
 function formatDate(dateString?: string): string {
-    if (!dateString) return "-"
-    return new Date(dateString).toLocaleDateString()
+    return formatApiDate(dateString)
 }
 
 export function StarredContent() {

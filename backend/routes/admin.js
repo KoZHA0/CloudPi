@@ -33,6 +33,7 @@ const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const db = require('../database/db');
+const eventBus = require('../utils/event-bus');
 const { createNotification } = require('../utils/notifications');
 
 function formatQuota(bytes) {
@@ -51,6 +52,27 @@ const {
 } = require('../utils/file-versioning');
 
 const router = express.Router();
+
+function setStorageAccessibility(source, isAccessible) {
+    const nextValue = isAccessible ? 1 : 0;
+    const previousValue = source.is_accessible ? 1 : 0;
+
+    if (previousValue === nextValue) {
+        return false;
+    }
+
+    db.prepare('UPDATE storage_sources SET is_accessible = ? WHERE id = ?')
+        .run(nextValue, source.id);
+
+    eventBus.emit('drive_status_change', {
+        source_id: source.id,
+        label: source.label,
+        status: isAccessible ? 'online' : 'offline',
+        timestamp: Date.now(),
+    });
+
+    return true;
+}
 
 function getMountSourceForPath(targetPath) {
     try {
@@ -830,19 +852,24 @@ router.get('/storage', requireAdmin, (req, res) => {
             let is_accessible = !!source.is_accessible;
             if (source.type === 'internal') {
                 is_accessible = isInternalStorageAccessible();
+            } else if (!source.is_active) {
+                if (is_accessible) {
+                    setStorageAccessibility(source, false);
+                }
+                is_accessible = false;
             } else {
                 try {
                     // Identity-aware: check .cloudpi-id matches, not just path exists
                     const fsAccessible = isDriveActuallyPresent(source.path, source.id);
-                    // If DB says accessible but filesystem disagrees, update DB
-                    if (is_accessible && !fsAccessible) {
-                        db.prepare('UPDATE storage_sources SET is_accessible = 0 WHERE id = ?').run(source.id);
-                        is_accessible = false;
-                    } else if (!is_accessible && fsAccessible) {
-                        // Drive appeared without udev event (edge case) — don't auto-reactivate
-                        // Admin must manually verify via reactivate endpoint
+                    // Keep DB/SSE state aligned with the verified mount state.
+                    if (is_accessible !== fsAccessible) {
+                        setStorageAccessibility(source, fsAccessible);
+                        is_accessible = fsAccessible;
                     }
                 } catch (e) {
+                    if (is_accessible) {
+                        setStorageAccessibility(source, false);
+                    }
                     is_accessible = false;
                 }
             }
@@ -923,9 +950,17 @@ router.post('/storage', requireAdmin, (req, res) => {
                     const existing = db.prepare('SELECT * FROM storage_sources WHERE id = ?').get(driveId);
                     if (existing) {
                         // Re-activate it
-                        db.prepare('UPDATE storage_sources SET is_active = 1, path = ?, label = ? WHERE id = ?')
+                        db.prepare('UPDATE storage_sources SET is_active = 1, is_accessible = 1, path = ?, label = ? WHERE id = ?')
                             .run(drivePath, label, driveId);
                         console.log(`💾 Re-activated storage: ${label} (${driveId})`);
+                        if (!existing.is_accessible) {
+                            eventBus.emit('drive_status_change', {
+                                source_id: driveId,
+                                label,
+                                status: 'online',
+                                timestamp: Date.now(),
+                            });
+                        }
                         const source = db.prepare('SELECT * FROM storage_sources WHERE id = ?').get(driveId);
                         return res.json({
                             message: 'Storage source re-activated!',
@@ -1133,7 +1168,7 @@ router.get('/drives', requireAdmin, async (req, res) => {
 
         // Get all registered storage sources from DB
         const registeredSources = db.prepare(
-            "SELECT id, label, path, type, is_active FROM storage_sources WHERE type = 'external'"
+            "SELECT id, label, path, type, is_active, is_accessible, created_at FROM storage_sources WHERE type = 'external'"
         ).all();
 
         // If no external drives path configured (e.g., Windows dev)
@@ -1247,12 +1282,47 @@ router.get('/drives', requireAdmin, async (req, res) => {
             });
         }
 
-        // Dirty unplug detection: check registered sources that aren't in the detected drives
         const { isDriveActuallyPresent } = require('./events');
+
+        // If a known drive is mounted at a new path (e.g. sda1 -> sdb1 after
+        // replug), reconcile the DB path/accessibility from the verified mount.
+        for (const drive of drives) {
+            if (!drive.isRegistered || !drive.registeredId) continue;
+
+            const src = registeredSources.find(s => s.id === drive.registeredId);
+            if (!src || !src.is_active) continue;
+
+            const isAccessible = isDriveActuallyPresent(drive.path, src.id);
+            if (!isAccessible) continue;
+
+            const pathChanged = src.path !== drive.path;
+            if (pathChanged || !src.is_accessible) {
+                db.prepare('UPDATE storage_sources SET path = ?, is_accessible = 1 WHERE id = ?')
+                    .run(drive.path, src.id);
+
+                if (!src.is_accessible) {
+                    eventBus.emit('drive_status_change', {
+                        source_id: src.id,
+                        label: src.label,
+                        status: 'online',
+                        timestamp: Date.now(),
+                    });
+                }
+
+                src.path = drive.path;
+                src.is_accessible = 1;
+            }
+        }
+
+        // Dirty unplug detection: check registered sources that aren't in the detected drives
         const enrichedSources = registeredSources.map(src => {
             const isPresent = drives.some(d => d.registeredId === src.id);
             // Identity-aware: verify .cloudpi-id matches, not just path exists
-            const isAccessible = src.path ? isDriveActuallyPresent(src.path, src.id) : false;
+            const isAccessible = src.is_active && src.path ? isDriveActuallyPresent(src.path, src.id) : false;
+            if (!!src.is_accessible !== isAccessible) {
+                setStorageAccessibility(src, isAccessible);
+                src.is_accessible = isAccessible ? 1 : 0;
+            }
             return {
                 ...src,
                 status: isAccessible ? 'online' : (isPresent ? 'detected' : 'offline'),
@@ -1324,21 +1394,31 @@ router.post('/storage/:id/reactivate', requireAdmin, (req, res) => {
             return res.status(404).json({ error: 'Storage source not found in registry' });
         }
 
-        if (source.is_active) {
-            return res.status(400).json({ error: 'Storage source is already active' });
+        if (source.is_active && source.is_accessible) {
+            return res.status(400).json({ error: 'Storage source is already active and online' });
         }
 
-        // Verify the drive path is accessible
+        // Verify the drive path belongs to this registered source
         const targetPath = drivePath || source.path;
-        if (!fs.existsSync(targetPath)) {
-            return res.status(400).json({ error: `Drive path not accessible: ${targetPath}` });
+        const { isDriveActuallyPresent } = require('./events');
+        if (!isDriveActuallyPresent(targetPath, sourceId)) {
+            return res.status(400).json({ error: `Registered drive not found at: ${targetPath}` });
         }
 
         // Reactivate
-        db.prepare('UPDATE storage_sources SET is_active = 1, path = ? WHERE id = ?')
+        db.prepare('UPDATE storage_sources SET is_active = 1, is_accessible = 1, path = ? WHERE id = ?')
             .run(targetPath, sourceId);
 
         console.log(`✅ [AUDIT] Drive reactivated by admin (user_id=${currentUserId}): ${source.label} (${sourceId}) at ${targetPath}`);
+
+        if (!source.is_accessible) {
+            eventBus.emit('drive_status_change', {
+                source_id: source.id,
+                label: source.label,
+                status: 'online',
+                timestamp: Date.now(),
+            });
+        }
 
         const updated = db.prepare('SELECT * FROM storage_sources WHERE id = ?').get(sourceId);
         res.json({ message: `Drive "${source.label}" reactivated successfully`, source: updated });

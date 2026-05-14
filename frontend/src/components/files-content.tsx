@@ -106,7 +106,7 @@ import {
     ZoomOut,
     Keyboard,
 } from "lucide-react"
-import { cn } from "@/lib/utils"
+import { cn, formatApiDate, formatApiDateTime, parseApiDate } from "@/lib/utils"
 import {
     getFiles,
     createFolder,
@@ -266,15 +266,16 @@ function formatFileSize(bytes: number): string {
 }
 
 function formatDate(dateString: string): string {
-    const date = new Date(dateString)
+    const date = parseApiDate(dateString)
+    if (!date) return "-"
     const now = new Date()
-    const diffMs = now.getTime() - date.getTime()
+    const diffMs = Math.max(0, now.getTime() - date.getTime())
     const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24))
 
     if (diffDays === 0) return "Today"
     if (diffDays === 1) return "Yesterday"
     if (diffDays < 7) return `${diffDays} days ago`
-    return date.toLocaleDateString()
+    return formatApiDate(dateString)
 }
 
 export function FilesContent() {
@@ -454,6 +455,14 @@ export function FilesContent() {
     }, [currentFolderId])
 
     useEffect(() => {
+        if (!notification) return
+        if (notification.type === "connect") {
+            setStorageWarning(null)
+        }
+        loadFiles()
+    }, [notification])
+
+    useEffect(() => {
         if (view !== "columns" || isLoading || loadedFolderId !== currentFolderId) return
         loadColumnsForPath()
     }, [view, isLoading, currentFolderId, loadedFolderId, files, breadcrumbs])
@@ -621,7 +630,7 @@ export function FilesContent() {
                 cmp = getDisplayName(a).localeCompare(getDisplayName(b))
                 break
             case "modified":
-                cmp = new Date(a.modified_at).getTime() - new Date(b.modified_at).getTime()
+                cmp = (parseApiDate(a.modified_at)?.getTime() || 0) - (parseApiDate(b.modified_at)?.getTime() || 0)
                 break
             case "size":
                 cmp = a.size - b.size
@@ -695,7 +704,24 @@ export function FilesContent() {
     }
 
     function canShowVersions(file: FileItem | null | undefined) {
-        return Boolean(file && file.type !== "folder" && !isSecureItem(file) && !isShareShortcut(file))
+        return Boolean(file && file.type !== "folder" && !isSecureItem(file) && !isShareShortcut(file) && isFileAccessible(file))
+    }
+
+    function getUnavailableActionMessage(file: FileItem, action: string) {
+        return `Reconnect the drive for "${getDisplayName(file)}" before you ${action}.`
+    }
+
+    function ensureFileAvailable(file: FileItem, action: string) {
+        if (isFileAccessible(file)) return true
+        setError(getUnavailableActionMessage(file, action))
+        return false
+    }
+
+    function ensureFilesAvailable(items: FileItem[], action: string) {
+        const unavailable = items.find((file) => !isFileAccessible(file))
+        if (!unavailable) return true
+        setError(getUnavailableActionMessage(unavailable, action))
+        return false
     }
 
     function getPreviewUrlForFile(file: FileItem) {
@@ -1488,6 +1514,7 @@ export function FilesContent() {
                 await downloadVaultFile(file)
                 return
             }
+            if (!ensureFileAvailable(file, "download it")) return
             const displayName = getDisplayName(file)
             const fileName = file.type === 'folder' ? `${displayName}.zip` : displayName
             await downloadFile(file.id, fileName)
@@ -1505,6 +1532,7 @@ export function FilesContent() {
             setError("Encrypted vault items cannot be duplicated yet")
             return
         }
+        if (!ensureFileAvailable(file, "duplicate it")) return
         try {
             await copyFile(file.id, file.parent_id ?? null)
             await loadFiles()
@@ -1523,6 +1551,7 @@ export function FilesContent() {
             setError("Encrypted vault items cannot be shared yet")
             return
         }
+        if (!ensureFileAvailable(file, "share it")) return
         setShareFile(file)
         setShareFiles([file])
         setShowShareDialog(true)
@@ -1550,6 +1579,7 @@ export function FilesContent() {
             setError("Encrypted vault items cannot be shared yet")
             return
         }
+        if (!ensureFilesAvailable(targets, "share it")) return
 
         setShareFile(targets[0])
         setShareFiles(targets)
@@ -1583,6 +1613,7 @@ export function FilesContent() {
     async function handleShareWithSelected() {
         const targets = shareFiles.length > 0 ? shareFiles : (shareFile ? [shareFile] : [])
         if (targets.length === 0 || selectedShareUsers.length === 0) return
+        if (!ensureFilesAvailable(targets, "share it")) return
         setIsSharing(true)
         setShareStatus(null)
 
@@ -1665,7 +1696,9 @@ export function FilesContent() {
 
     function openVersionHistory(file: FileItem) {
         if (!canShowVersions(file)) {
-            setError("Version history is only available for regular files")
+            setError(isFileAccessible(file)
+                ? "Version history is only available for regular files"
+                : getUnavailableActionMessage(file, "view version history"))
             return
         }
 
@@ -1678,6 +1711,7 @@ export function FilesContent() {
 
     async function handleVersionAction() {
         if (!versionFile || !versionAction) return
+        if (!ensureFileAvailable(versionFile, "change its version history")) return
 
         setVersionActionBusy(true)
         setVersionError(null)
@@ -1710,6 +1744,7 @@ export function FilesContent() {
             setError("Shared shortcuts cannot be renamed here")
             return
         }
+        if (!ensureFileAvailable(file, "rename it")) return
         setSelectedItem(file)
         setRenameValue(getDisplayName(file))
         setShowRenameDialog(true)
@@ -1717,6 +1752,7 @@ export function FilesContent() {
 
     async function handleRename() {
         if (!selectedItem || !renameValue.trim()) return
+        if (!ensureFileAvailable(selectedItem, "rename it")) return
         try {
             if (isSecureItem(selectedItem) && !selectedItem.is_secure_vault) {
                 if (!activeVaultId) {
@@ -1761,6 +1797,7 @@ export function FilesContent() {
             setError(`${mode === "move" ? "Moving" : "Copying"} encrypted vault items is not supported yet`)
             return
         }
+        if (!ensureFileAvailable(file, mode === "move" ? "move it" : "copy it")) return
         setLocationTarget(file)
         setLocationTargets([file])
         setLocationMode(mode)
@@ -1777,6 +1814,7 @@ export function FilesContent() {
             setError(`${mode === "move" ? "Moving" : "Copying"} encrypted vault items is not supported yet`)
             return
         }
+        if (!ensureFilesAvailable(targets, mode === "move" ? "move it" : "copy it")) return
 
         setLocationTarget(null)
         setLocationTargets(targets)
@@ -1795,6 +1833,7 @@ export function FilesContent() {
     async function applyLocationAction() {
         const targets = locationTargets.length > 0 ? locationTargets : (locationTarget ? [locationTarget] : [])
         if (targets.length === 0 || isApplyingLocation) return
+        if (!ensureFilesAvailable(targets, locationMode === "move" ? "move it" : "copy it")) return
 
         setIsApplyingLocation(true)
         try {
@@ -1825,6 +1864,7 @@ export function FilesContent() {
             setError("Shared shortcuts cannot be starred")
             return
         }
+        if (!ensureFileAvailable(file, file.starred ? "unstar it" : "star it")) return
         try {
             await toggleStar(file.id)
             loadFiles()
@@ -1839,12 +1879,14 @@ export function FilesContent() {
             handleRemoveShortcut(file)
             return
         }
+        if (!ensureFileAvailable(file, "delete it")) return
         setSelectedItem(file)
         setShowDeleteDialog(true)
     }
 
     async function handleDelete() {
         if (!selectedItem) return
+        if (!ensureFileAvailable(selectedItem, "delete it")) return
         try {
             await deleteFile(selectedItem.id)
             setShowDeleteDialog(false)
@@ -1869,8 +1911,10 @@ export function FilesContent() {
     // Bulk delete
     async function handleBulkDelete() {
         try {
-            for (const id of selectedFiles) {
-                await deleteFile(id)
+            const selected = getSelectedRegularItems()
+            if (!ensureFilesAvailable(selected, "delete it")) return
+            for (const file of selected) {
+                await deleteFile(file.id)
             }
             setSelectedFiles([])
             setLastSelectedFileId(null)
@@ -1883,6 +1927,7 @@ export function FilesContent() {
     async function handleBulkStar() {
         try {
             const selected = files.filter((file) => selectedFiles.includes(file.id) && !isShareShortcut(file))
+            if (!ensureFilesAvailable(selected, "star it")) return
             for (const file of selected) {
                 if (file.starred !== 1) {
                     await toggleStar(file.id)
@@ -1897,6 +1942,7 @@ export function FilesContent() {
     async function handleBulkDownload() {
         const selected = getSelectedRegularItems()
         if (selected.length === 0) return
+        if (!ensureFilesAvailable(selected, "download it")) return
         if (selected.some((file) => isSecureItem(file))) {
             setError("Encrypted vault items cannot be included in server-side ZIP downloads yet")
             return
@@ -2149,6 +2195,7 @@ export function FilesContent() {
         const isShortcut = isShareShortcut(file)
         const accessible = isFileAccessible(file)
         const previewAllowed = !isSecureItem(file) && file.type !== "folder"
+        const unavailableTitle = !accessible ? "Drive disconnected" : undefined
 
         return (
             <>
@@ -2181,14 +2228,18 @@ export function FilesContent() {
                     </>
                 ) : file.type === "folder" ? (
                     <>
-                        <ContextMenuItem onClick={() => handleFileClick(file)}>
+                        <ContextMenuItem
+                            onClick={() => accessible && handleFileClick(file)}
+                            disabled={!accessible}
+                            title={unavailableTitle}
+                        >
                             <FolderOpen className="h-4 w-4 mr-2" />
                             Open
                         </ContextMenuItem>
                         <ContextMenuItem
                             onClick={() => accessible && handleDownload(file)}
                             disabled={!accessible}
-                            title={!accessible ? "Drive disconnected" : undefined}
+                            title={unavailableTitle}
                         >
                             <Download className="h-4 w-4 mr-2" />
                             Download as ZIP
@@ -2199,7 +2250,7 @@ export function FilesContent() {
                         <ContextMenuItem
                             onClick={() => accessible && openPreview(file)}
                             disabled={!accessible || !previewAllowed}
-                            title={!accessible ? "Drive disconnected" : undefined}
+                            title={unavailableTitle}
                         >
                             <Eye className="h-4 w-4 mr-2" />
                             {previewAllowed ? "Preview" : "Preview unavailable"}
@@ -2207,12 +2258,16 @@ export function FilesContent() {
                         <ContextMenuItem
                             onClick={() => accessible && handleDownload(file)}
                             disabled={!accessible}
-                            title={!accessible ? "Drive disconnected" : undefined}
+                            title={unavailableTitle}
                         >
                             <Download className="h-4 w-4 mr-2" />
                             Download
                         </ContextMenuItem>
-                        <ContextMenuItem onClick={() => openVersionHistory(file)}>
+                        <ContextMenuItem
+                            onClick={() => accessible && openVersionHistory(file)}
+                            disabled={!accessible || !canShowVersions(file)}
+                            title={unavailableTitle}
+                        >
                             <History className="h-4 w-4 mr-2" />
                             Version history
                         </ContextMenuItem>
@@ -2221,27 +2276,27 @@ export function FilesContent() {
                 {!isShortcut && (
                     <>
                         <ContextMenuSeparator />
-                        <ContextMenuItem onClick={() => openRenameDialog(file)}>
+                        <ContextMenuItem onClick={() => accessible && openRenameDialog(file)} disabled={!accessible} title={unavailableTitle}>
                             <Pencil className="h-4 w-4 mr-2" />
                             Rename
                         </ContextMenuItem>
-                        <ContextMenuItem onClick={() => openLocationDialog(file, "move")}>
+                        <ContextMenuItem onClick={() => accessible && openLocationDialog(file, "move")} disabled={!accessible} title={unavailableTitle}>
                             <Scissors className="h-4 w-4 mr-2" />
                             Move
                         </ContextMenuItem>
-                        <ContextMenuItem onClick={() => openLocationDialog(file, "copy")}>
+                        <ContextMenuItem onClick={() => accessible && openLocationDialog(file, "copy")} disabled={!accessible} title={unavailableTitle}>
                             <Copy className="h-4 w-4 mr-2" />
                             Copy
                         </ContextMenuItem>
-                        <ContextMenuItem onClick={() => handleDuplicate(file)}>
+                        <ContextMenuItem onClick={() => accessible && handleDuplicate(file)} disabled={!accessible} title={unavailableTitle}>
                             <Copy className="h-4 w-4 mr-2" />
                             Duplicate
                         </ContextMenuItem>
-                        <ContextMenuItem onClick={() => handleToggleStar(file)}>
+                        <ContextMenuItem onClick={() => accessible && handleToggleStar(file)} disabled={!accessible} title={unavailableTitle}>
                             <Star className="h-4 w-4 mr-2" />
                             {file.starred ? "Unstar" : "Star"}
                         </ContextMenuItem>
-                        <ContextMenuItem onClick={() => handleShare(file)}>
+                        <ContextMenuItem onClick={() => accessible && handleShare(file)} disabled={!accessible} title={unavailableTitle}>
                             <Link2 className="h-4 w-4 mr-2" />
                             Share
                         </ContextMenuItem>
@@ -2250,7 +2305,7 @@ export function FilesContent() {
                             Details
                         </ContextMenuItem>
                         <ContextMenuSeparator />
-                        <ContextMenuItem className="text-destructive" onClick={() => openDeleteDialog(file)}>
+                        <ContextMenuItem className="text-destructive" onClick={() => accessible && openDeleteDialog(file)} disabled={!accessible} title={unavailableTitle}>
                             <Trash2 className="h-4 w-4 mr-2" />
                             Delete
                         </ContextMenuItem>
@@ -2383,6 +2438,12 @@ export function FilesContent() {
     const previewPreviousFile = previewFile ? getPreviewSibling(-1) : null
     const previewNextFile = previewFile ? getPreviewSibling(1) : null
     const previewTextLines = previewTextContent?.split(/\r?\n/) || []
+    const selectedRegularItems = getSelectedRegularItems()
+    const selectedHasUnavailable = selectedRegularItems.some((file) => !isFileAccessible(file))
+    const selectedActionDisabled = selectedRegularItems.length === 0 || selectedHasUnavailable
+    const selectedUnavailableTitle = selectedHasUnavailable ? "One or more selected items are on a disconnected drive" : undefined
+    const detailFileAccessible = detailFile ? isFileAccessible(detailFile) : true
+    const detailUnavailableTitle = !detailFileAccessible ? "Drive disconnected" : undefined
 
     if (isLoading) {
         return (
@@ -2862,6 +2923,8 @@ export function FilesContent() {
                                         size="sm"
                                         className="gap-2 justify-center"
                                         onClick={handleBulkDownload}
+                                        disabled={selectedActionDisabled}
+                                        title={selectedUnavailableTitle}
                                     >
                                         <Download className="h-4 w-4" />
                                         <span className="hidden sm:inline">ZIP</span>
@@ -2871,6 +2934,8 @@ export function FilesContent() {
                                         size="sm"
                                         className="gap-2 justify-center"
                                         onClick={handleBulkStar}
+                                        disabled={selectedActionDisabled}
+                                        title={selectedUnavailableTitle}
                                     >
                                         <Star className="h-4 w-4" />
                                         <span className="hidden sm:inline">Star</span>
@@ -2880,6 +2945,8 @@ export function FilesContent() {
                                         size="sm"
                                         className="gap-2 justify-center"
                                         onClick={() => openBulkLocationDialog("move")}
+                                        disabled={selectedActionDisabled}
+                                        title={selectedUnavailableTitle}
                                     >
                                         <Scissors className="h-4 w-4" />
                                         <span className="hidden sm:inline">Move</span>
@@ -2889,6 +2956,8 @@ export function FilesContent() {
                                         size="sm"
                                         className="gap-2 justify-center"
                                         onClick={() => openBulkLocationDialog("copy")}
+                                        disabled={selectedActionDisabled}
+                                        title={selectedUnavailableTitle}
                                     >
                                         <Copy className="h-4 w-4" />
                                         <span className="hidden sm:inline">Copy</span>
@@ -2898,6 +2967,8 @@ export function FilesContent() {
                                         size="sm"
                                         className="gap-2 justify-center"
                                         onClick={handleBulkShare}
+                                        disabled={selectedActionDisabled}
+                                        title={selectedUnavailableTitle}
                                     >
                                         <Link2 className="h-4 w-4" />
                                         <span className="hidden sm:inline">Share</span>
@@ -2907,6 +2978,8 @@ export function FilesContent() {
                                         size="sm"
                                         className="gap-2 justify-center text-destructive"
                                         onClick={handleBulkDelete}
+                                        disabled={selectedActionDisabled}
+                                        title={selectedUnavailableTitle}
                                     >
                                         <Trash2 className="h-4 w-4" />
                                         <span className="hidden sm:inline">Delete</span>
@@ -3694,7 +3767,11 @@ export function FilesContent() {
                                                     </>
                                                 ) : file.type === "folder" ? (
                                                     <>
-                                                        <DropdownMenuItem onClick={() => handleFileClick(file)}>
+                                                        <DropdownMenuItem
+                                                            onClick={() => accessible && handleFileClick(file)}
+                                                            disabled={!accessible}
+                                                            title={!accessible ? "Drive disconnected" : undefined}
+                                                        >
                                                             <FolderOpen className="h-4 w-4 mr-2" />
                                                             Open
                                                         </DropdownMenuItem>
@@ -3725,7 +3802,11 @@ export function FilesContent() {
                                                             <Download className="h-4 w-4 mr-2" />
                                                             Download
                                                         </DropdownMenuItem>
-                                                        <DropdownMenuItem onClick={() => openVersionHistory(file)}>
+                                                        <DropdownMenuItem
+                                                            onClick={() => accessible && openVersionHistory(file)}
+                                                            disabled={!accessible || !canShowVersions(file)}
+                                                            title={!accessible ? "Drive disconnected" : undefined}
+                                                        >
                                                             <History className="h-4 w-4 mr-2" />
                                                             Version history
                                                         </DropdownMenuItem>
@@ -3733,27 +3814,27 @@ export function FilesContent() {
                                                 )}
                                                 {!isShortcut && (
                                                     <>
-                                                        <DropdownMenuItem onClick={() => openRenameDialog(file)}>
+                                                        <DropdownMenuItem onClick={() => accessible && openRenameDialog(file)} disabled={!accessible} title={!accessible ? "Drive disconnected" : undefined}>
                                                             <Pencil className="h-4 w-4 mr-2" />
                                                             Rename
                                                         </DropdownMenuItem>
-                                                        <DropdownMenuItem onClick={() => openLocationDialog(file, "move")}>
+                                                        <DropdownMenuItem onClick={() => accessible && openLocationDialog(file, "move")} disabled={!accessible} title={!accessible ? "Drive disconnected" : undefined}>
                                                             <Scissors className="h-4 w-4 mr-2" />
                                                             Move
                                                         </DropdownMenuItem>
-                                                        <DropdownMenuItem onClick={() => openLocationDialog(file, "copy")}>
+                                                        <DropdownMenuItem onClick={() => accessible && openLocationDialog(file, "copy")} disabled={!accessible} title={!accessible ? "Drive disconnected" : undefined}>
                                                             <Copy className="h-4 w-4 mr-2" />
                                                             Copy
                                                         </DropdownMenuItem>
-                                                        <DropdownMenuItem onClick={() => handleDuplicate(file)}>
+                                                        <DropdownMenuItem onClick={() => accessible && handleDuplicate(file)} disabled={!accessible} title={!accessible ? "Drive disconnected" : undefined}>
                                                             <Copy className="h-4 w-4 mr-2" />
                                                             Duplicate
                                                         </DropdownMenuItem>
-                                                        <DropdownMenuItem onClick={() => handleToggleStar(file)}>
+                                                        <DropdownMenuItem onClick={() => accessible && handleToggleStar(file)} disabled={!accessible} title={!accessible ? "Drive disconnected" : undefined}>
                                                             <Star className="h-4 w-4 mr-2" />
                                                             {file.starred ? "Unstar" : "Star"}
                                                         </DropdownMenuItem>
-                                                        <DropdownMenuItem onClick={() => handleShare(file)}>
+                                                        <DropdownMenuItem onClick={() => accessible && handleShare(file)} disabled={!accessible} title={!accessible ? "Drive disconnected" : undefined}>
                                                             <Link2 className="h-4 w-4 mr-2" />
                                                             Share
                                                         </DropdownMenuItem>
@@ -3764,7 +3845,9 @@ export function FilesContent() {
                                                         <DropdownMenuSeparator />
                                                         <DropdownMenuItem
                                                             className="text-destructive"
-                                                            onClick={() => openDeleteDialog(file)}
+                                                            onClick={() => accessible && openDeleteDialog(file)}
+                                                            disabled={!accessible}
+                                                            title={!accessible ? "Drive disconnected" : undefined}
                                                         >
                                                             <Trash2 className="h-4 w-4 mr-2" />
                                                             Delete
@@ -4664,7 +4747,7 @@ export function FilesContent() {
                                     <div className="mt-3 grid grid-cols-2 gap-3 text-xs">
                                         <div>
                                             <p className="text-muted-foreground">Modified</p>
-                                            <p className="text-card-foreground">{new Date(versionFile.modified_at).toLocaleString()}</p>
+                                            <p className="text-card-foreground">{formatApiDateTime(versionFile.modified_at)}</p>
                                         </div>
                                         <div>
                                             <p className="text-muted-foreground">History storage</p>
@@ -4713,7 +4796,7 @@ export function FilesContent() {
                                                 <div className="flex items-start justify-between gap-3">
                                                     <div className="min-w-0">
                                                         <p className="text-sm font-semibold text-card-foreground">Version {version.version_number}</p>
-                                                        <p className="text-xs text-muted-foreground">{new Date(version.archived_at).toLocaleString()}</p>
+                                                        <p className="text-xs text-muted-foreground">{formatApiDateTime(version.archived_at)}</p>
                                                     </div>
                                                     <Badge variant="outline" className="shrink-0">
                                                         {formatFileSize(version.size)}
@@ -4901,7 +4984,7 @@ export function FilesContent() {
                                     <div>
                                         <p className="text-xs text-muted-foreground">Created</p>
                                         <p className="text-sm text-card-foreground">
-                                            {detailFile.created_at ? new Date(detailFile.created_at).toLocaleString() : "—"}
+                                            {formatApiDateTime(detailFile.created_at)}
                                         </p>
                                     </div>
                                 </div>
@@ -4911,7 +4994,7 @@ export function FilesContent() {
                                     <div>
                                         <p className="text-xs text-muted-foreground">Modified</p>
                                         <p className="text-sm text-card-foreground">
-                                            {detailFile.modified_at ? new Date(detailFile.modified_at).toLocaleString() : "—"}
+                                            {formatApiDateTime(detailFile.modified_at)}
                                         </p>
                                     </div>
                                 </div>
@@ -4963,28 +5046,35 @@ export function FilesContent() {
                                     ) : (
                                         <>
                                             {detailFile.type !== "folder" && (
-                                                <Button variant="outline" size="sm" className="gap-2" onClick={() => { handleDownload(detailFile); }}>
+                                                <Button
+                                                    variant="outline"
+                                                    size="sm"
+                                                    className="gap-2"
+                                                    disabled={!detailFileAccessible}
+                                                    title={detailUnavailableTitle}
+                                                    onClick={() => { handleDownload(detailFile); }}
+                                                >
                                                     <Download className="h-3.5 w-3.5" />
                                                     Download
                                                 </Button>
                                             )}
-                                            <Button variant="outline" size="sm" className="gap-2" onClick={() => { setDetailFile(null); openRenameDialog(detailFile); }}>
+                                            <Button variant="outline" size="sm" className="gap-2" disabled={!detailFileAccessible} title={detailUnavailableTitle} onClick={() => { setDetailFile(null); openRenameDialog(detailFile); }}>
                                                 <Pencil className="h-3.5 w-3.5" />
                                                 Rename
                                             </Button>
-                                            <Button variant="outline" size="sm" className="gap-2" onClick={() => { setDetailFile(null); openLocationDialog(detailFile, "move"); }}>
+                                            <Button variant="outline" size="sm" className="gap-2" disabled={!detailFileAccessible} title={detailUnavailableTitle} onClick={() => { setDetailFile(null); openLocationDialog(detailFile, "move"); }}>
                                                 <Scissors className="h-3.5 w-3.5" />
                                                 Move
                                             </Button>
-                                            <Button variant="outline" size="sm" className="gap-2" onClick={() => { setDetailFile(null); openLocationDialog(detailFile, "copy"); }}>
+                                            <Button variant="outline" size="sm" className="gap-2" disabled={!detailFileAccessible} title={detailUnavailableTitle} onClick={() => { setDetailFile(null); openLocationDialog(detailFile, "copy"); }}>
                                                 <Copy className="h-3.5 w-3.5" />
                                                 Copy
                                             </Button>
-                                            <Button variant="outline" size="sm" className="gap-2" onClick={() => { setDetailFile(null); handleDuplicate(detailFile); }}>
+                                            <Button variant="outline" size="sm" className="gap-2" disabled={!detailFileAccessible} title={detailUnavailableTitle} onClick={() => { setDetailFile(null); handleDuplicate(detailFile); }}>
                                                 <Copy className="h-3.5 w-3.5" />
                                                 Duplicate
                                             </Button>
-                                            <Button variant="outline" size="sm" className="gap-2" onClick={() => { setDetailFile(null); handleShare(detailFile); }}>
+                                            <Button variant="outline" size="sm" className="gap-2" disabled={!detailFileAccessible} title={detailUnavailableTitle} onClick={() => { setDetailFile(null); handleShare(detailFile); }}>
                                                 <Link2 className="h-3.5 w-3.5" />
                                                 Share
                                             </Button>
@@ -4994,7 +5084,7 @@ export function FilesContent() {
                                                     Versions
                                                 </Button>
                                             )}
-                                            <Button variant="outline" size="sm" className="gap-2 text-destructive" onClick={() => { setDetailFile(null); openDeleteDialog(detailFile); }}>
+                                            <Button variant="outline" size="sm" className="gap-2 text-destructive" disabled={!detailFileAccessible} title={detailUnavailableTitle} onClick={() => { setDetailFile(null); openDeleteDialog(detailFile); }}>
                                                 <Trash2 className="h-3.5 w-3.5" />
                                                 Delete
                                             </Button>

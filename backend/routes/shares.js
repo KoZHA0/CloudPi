@@ -18,6 +18,7 @@ const { ensureProtectedInternalStorageAvailable } = require('../utils/protected-
 const { decryptToStream, createDecryptStream } = require('../utils/crypto-utils');
 const { createNotification } = require('../utils/notifications');
 const { createActivityEvent } = require('../utils/activity');
+const eventBus = require('../utils/event-bus');
 
 const router = express.Router();
 
@@ -68,6 +69,51 @@ function resolveSharedFilePath(file) {
     }
     ensureProtectedInternalStorageAvailable();
     return path.join(STORAGE_DIR, String(file.user_id), file.path);
+}
+
+function getSharedFileStorageStatus(file) {
+    const storageSourceId = file?.storage_source_id || 'internal';
+    if (!storageSourceId || storageSourceId === 'internal') {
+        return { accessible: true, label: 'Internal Storage' };
+    }
+
+    const source = db.prepare('SELECT id, label, path, is_accessible FROM storage_sources WHERE id = ?')
+        .get(storageSourceId);
+    if (!source) {
+        return { accessible: false, label: 'Unknown storage drive' };
+    }
+
+    let accessible = false;
+    try {
+        const { isDriveActuallyPresent } = require('./events');
+        accessible = isDriveActuallyPresent(source.path, storageSourceId);
+    } catch {
+        accessible = false;
+    }
+
+    if (!!source.is_accessible !== accessible) {
+        db.prepare('UPDATE storage_sources SET is_accessible = ? WHERE id = ?')
+            .run(accessible ? 1 : 0, storageSourceId);
+        eventBus.emit('drive_status_change', {
+            source_id: storageSourceId,
+            label: source.label,
+            status: accessible ? 'online' : 'offline',
+            timestamp: Date.now(),
+        });
+    }
+
+    return { accessible, label: source.label };
+}
+
+function assertSharedFileStorageAvailable(file, res, action = 'access') {
+    const status = getSharedFileStorageStatus(file);
+    if (status.accessible) return true;
+
+    res.status(503).json({
+        error: `Storage drive "${status.label}" is disconnected. Reconnect it before you ${action} this item.`,
+        drive_disconnected: true,
+    });
+    return false;
 }
 
 function isVaultItem(file) {
@@ -308,6 +354,10 @@ async function sendFolderZip(folder, res) {
 async function sendStoredFile(file, res, inline = false) {
     if (isVaultItem(file)) {
         res.status(400).json({ error: 'Encrypted vault items cannot be accessed through shares' });
+        return false;
+    }
+
+    if (!assertSharedFileStorageAvailable(file, res, inline ? 'preview' : 'download')) {
         return false;
     }
 
@@ -751,6 +801,7 @@ router.post('/', requireAuth, (req, res) => {
         const file = getOwnedFile(Number(fileId), userId);
         if (!file) return res.status(404).json({ error: 'File not found' });
         if (isVaultItem(file)) return res.status(400).json({ error: 'Encrypted vault items cannot be shared yet' });
+        if (!assertSharedFileStorageAvailable(file, res, 'share')) return;
 
         const normalizedPermission = normalizePermission(permission);
         const expiresAt = normalizeExpiresAt(req.body.expiresAt ?? req.body.expires_at);
@@ -992,6 +1043,7 @@ router.get('/shared-folder/:shareId/files', requireAuth, (req, res) => {
         }
         if (!assertActiveShare(share, res)) return;
         if (share.permission === 'upload') return res.status(403).json({ error: 'This share does not allow browsing' });
+        if (!assertSharedFileStorageAvailable(fileFromShare(share), res, 'browse')) return;
 
         const parentId = req.query.parent_id || share.file_id;
         if (String(parentId) !== String(share.file_id)) {

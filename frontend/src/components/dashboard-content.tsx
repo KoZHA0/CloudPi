@@ -41,6 +41,7 @@ import {
     type NotificationItem,
     type SystemHealth,
 } from "@/lib/api"
+import { formatApiDate, parseApiDate } from "@/lib/utils"
 import { StorageOverview } from "@/lib/storage-overview"
 import { notifyNotificationsChanged } from "@/components/notification-bell"
 
@@ -62,9 +63,10 @@ function formatUptime(seconds: number): string {
 }
 
 function formatDate(dateString: string): string {
-    const date = new Date(dateString.endsWith('Z') ? dateString : dateString + 'Z')
+    const date = parseApiDate(dateString)
+    if (!date) return "-"
     const now = new Date()
-    const diffMs = now.getTime() - date.getTime()
+    const diffMs = Math.max(0, now.getTime() - date.getTime())
     const diffMins = Math.floor(diffMs / 60000)
     const diffHours = Math.floor(diffMs / 3600000)
     const diffDays = Math.floor(diffMs / 86400000)
@@ -73,7 +75,7 @@ function formatDate(dateString: string): string {
     if (diffMins < 60) return `${diffMins}m ago`
     if (diffHours < 24) return `${diffHours}h ago`
     if (diffDays < 7) return `${diffDays}d ago`
-    return date.toLocaleDateString()
+    return formatApiDate(dateString)
 }
 
 const fileTypeConfig: Record<string, { icon: typeof FileText; color: string; label: string }> = {

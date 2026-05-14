@@ -6,7 +6,7 @@ import { AlertTriangle, Bell, CheckCheck, HardDrive, Inbox, Loader2, Share2, Tra
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import { cn } from "@/lib/utils"
+import { cn, formatApiDateTime } from "@/lib/utils"
 import {
     clearReadNotifications,
     getNotifications,
@@ -19,7 +19,7 @@ import { notifyNotificationsChanged } from "@/components/notification-bell"
 const PAGE_SIZE = 25
 
 function formatDate(value: string): string {
-    return new Date(value).toLocaleString([], {
+    return formatApiDateTime(value, {
         year: "numeric",
         month: "short",
         day: "numeric",

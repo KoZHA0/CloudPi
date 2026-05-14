@@ -67,7 +67,7 @@ import {
     RefreshCw,
     X,
 } from "lucide-react"
-import { cn } from "@/lib/utils"
+import { cn, formatApiDate, formatApiDateTime, parseApiDate } from "@/lib/utils"
 import {
     getMyShares,
     getSharedWithMe,
@@ -128,22 +128,15 @@ function formatFileSize(bytes: number): string {
 }
 
 function parseDate(dateString?: string | null) {
-    if (!dateString) return null
-    const normalized = dateString.includes("T") ? dateString : `${dateString.replace(" ", "T")}Z`
-    const date = new Date(normalized)
-    return Number.isNaN(date.getTime()) ? null : date
+    return parseApiDate(dateString)
 }
 
 function formatDate(dateString?: string | null): string {
-    const date = parseDate(dateString)
-    if (!date) return "-"
-    return date.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })
+    return formatApiDate(dateString, { month: "short", day: "numeric", year: "numeric" })
 }
 
 function formatDateTime(dateString?: string | null): string {
-    const date = parseDate(dateString)
-    if (!date) return "-"
-    return date.toLocaleString()
+    return formatApiDateTime(dateString)
 }
 
 function isExpired(share: ShareItem) {

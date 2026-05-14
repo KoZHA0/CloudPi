@@ -61,7 +61,7 @@ import {
     Video,
     type LucideIcon,
 } from "lucide-react"
-import { cn } from "@/lib/utils"
+import { cn, formatApiDate, formatApiDateTime, parseApiDate } from "@/lib/utils"
 import { useDriveStatus } from "@/contexts/drive-status-context"
 import {
     deleteFile,
@@ -146,24 +146,9 @@ function formatFileSize(bytes: number): string {
     return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`
 }
 
-function normalizeTimestamp(value?: string | null) {
-    if (!value) return null
-    const trimmed = value.trim()
-    if (!trimmed) return null
-    if (/[zZ]|[+-]\d{2}:?\d{2}$/.test(trimmed)) return trimmed
-    return `${trimmed.replace(" ", "T")}Z`
-}
-
-function parseTimestamp(value?: string | null) {
-    const normalized = normalizeTimestamp(value)
-    if (!normalized) return null
-    const date = new Date(normalized)
-    return Number.isFinite(date.getTime()) ? date : null
-}
-
 function formatRelativeTime(dateString?: string | null): string {
     if (!dateString) return "-"
-    const date = parseTimestamp(dateString)
+    const date = parseApiDate(dateString)
     if (!date) return "-"
     const now = new Date()
     const diffMs = Math.max(0, now.getTime() - date.getTime())
@@ -175,7 +160,7 @@ function formatRelativeTime(dateString?: string | null): string {
     if (diffMins < 60) return `${diffMins}m ago`
     if (diffHours < 24) return `${diffHours}h ago`
     if (diffDays < 7) return `${diffDays}d ago`
-    return date.toLocaleDateString()
+    return formatApiDate(dateString)
 }
 
 function recentActionLabel(action?: FileItem["recent_action"]) {
@@ -196,7 +181,7 @@ function getRecentTimestampValue(file: FileItem) {
 }
 
 function getRecentTimestamp(file: FileItem) {
-    const date = parseTimestamp(getRecentTimestampValue(file))
+    const date = parseApiDate(getRecentTimestampValue(file))
     return date ? date.getTime() : 0
 }
 
@@ -205,9 +190,10 @@ function getRecentActionText(file: FileItem) {
 }
 
 function getRecentActionTitle(file: FileItem) {
-    const date = parseTimestamp(getRecentTimestampValue(file))
+    const dateString = getRecentTimestampValue(file)
+    const date = parseApiDate(dateString)
     if (!date) return recentActionLabel(file.recent_action)
-    return `${recentActionLabel(file.recent_action)} ${date.toLocaleString()}`
+    return `${recentActionLabel(file.recent_action)} ${formatApiDateTime(dateString)}`
 }
 
 function dedupeRecentFiles(items: FileItem[]) {

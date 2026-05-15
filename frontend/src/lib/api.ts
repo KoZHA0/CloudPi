@@ -352,14 +352,6 @@ export async function toggleUserRole(
     });
 }
 
-export async function unlockUser(
-    userId: number
-): Promise<{ message: string }> {
-    return apiRequest<{ message: string }>(`/admin/users/${userId}/unlock`, {
-        method: 'PUT',
-    });
-}
-
 // ============================================
 // FILES API
 // ============================================

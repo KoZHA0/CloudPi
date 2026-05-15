@@ -23,7 +23,6 @@ import {
     AlertTriangle,
     CircleDot,
     Ban,
-    Lock,
     Unlock,
     ShieldCheck,
     ShieldOff,
@@ -57,7 +56,7 @@ import {
 } from "@/components/ui/select"
 import { Checkbox } from "@/components/ui/checkbox"
 import { useAuth } from "@/contexts/auth-context"
-import { formatApiDateTime, parseApiDate } from "@/lib/utils"
+import { formatApiDateTime } from "@/lib/utils"
 import { 
     getUsers, 
     createUser, 
@@ -72,7 +71,6 @@ import {
     setUserQuota,
     disableUser,
     toggleUserRole,
-    unlockUser,
     type User,
     type StorageSource,
     type DetectedDrive,
@@ -536,13 +534,6 @@ export function AdminContent() {
                                                         Disabled
                                                     </Badge>
                                                 )}
-                                                {/* Locked badge */}
-                                                {user.locked_until && (parseApiDate(user.locked_until)?.getTime() || 0) > Date.now() && (
-                                                    <Badge variant="outline" className="border-amber-500/50 text-amber-400 text-xs">
-                                                        <Lock className="h-3 w-3 mr-1" />
-                                                        Locked
-                                                    </Badge>
-                                                )}
                                             </div>
                                         </div>
                                     </div>
@@ -650,25 +641,6 @@ export function AdminContent() {
                                                 title={user.is_disabled ? 'Enable Account' : 'Disable Account'}
                                             >
                                                 {user.is_disabled ? <Unlock className="h-4 w-4" /> : <Ban className="h-4 w-4" />}
-                                            </Button>
-                                        )}
-                                        {/* Unlock locked account */}
-                                        {user.locked_until && (parseApiDate(user.locked_until)?.getTime() || 0) > Date.now() && (
-                                            <Button
-                                                variant="ghost"
-                                                size="icon"
-                                                className="text-amber-500 hover:text-amber-400"
-                                                onClick={async () => {
-                                                    try {
-                                                        await unlockUser(user.id)
-                                                        loadUsers()
-                                                    } catch (err) {
-                                                        setError(err instanceof Error ? err.message : 'Failed to unlock')
-                                                    }
-                                                }}
-                                                title="Unlock Account"
-                                            >
-                                                <Unlock className="h-4 w-4" />
                                             </Button>
                                         )}
                                         {canResetPassword(user) && (

@@ -621,30 +621,6 @@ router.put('/users/:id/role', requireAdmin, (req, res) => {
 });
 
 /**
- * PUT /api/admin/users/:id/unlock
- * Unlock a locked account (Admin only)
- */
-router.put('/users/:id/unlock', requireAdmin, (req, res) => {
-    try {
-        const userId = parseInt(req.params.id);
-
-        const user = db.prepare('SELECT id, username, locked_until FROM users WHERE id = ?').get(userId);
-        if (!user) {
-            return res.status(404).json({ error: 'User not found' });
-        }
-
-        db.prepare('UPDATE users SET failed_login_attempts = 0, locked_until = NULL WHERE id = ?').run(userId);
-
-        console.log(`🔓 Account ${user.username} unlocked by admin`);
-
-        res.json({ message: `Account ${user.username} unlocked successfully` });
-    } catch (error) {
-        console.error('Unlock user error:', error);
-        res.status(500).json({ error: 'Server error' });
-    }
-});
-
-/**
  * GET /api/admin/settings
  * Returns all configurable settings (admin only)
  */
@@ -690,13 +666,15 @@ router.put('/settings', requireAdmin, (req, res) => {
         }
 
         // Allowed setting keys (whitelist to prevent injection)
+        const allowedBooleanKeys = [
+            'rate_limit_api_enabled',
+            'rate_limit_upload_enabled',
+            'encryption_enabled',
+        ];
         const allowedNumericKeys = [
             'rate_limit_api_max', 'rate_limit_api_window',
-            'rate_limit_auth_max', 'rate_limit_auth_window',
             'rate_limit_upload_max', 'rate_limit_upload_window',
             'password_min_length',
-            'account_lockout_attempts', 'account_lockout_duration',
-            'encryption_enabled',
             'trash_retention_days',
         ];
         
@@ -704,24 +682,40 @@ router.put('/settings', requireAdmin, (req, res) => {
             'smtp_host', 'smtp_port', 'smtp_user', 'smtp_pass', 'smtp_from_email'
         ];
 
+        const numericBounds = {
+            rate_limit_api_max: [1, 10000],
+            rate_limit_api_window: [1, 1440],
+            rate_limit_upload_max: [1, 10000],
+            rate_limit_upload_window: [1, 1440],
+            password_min_length: [1, 1000],
+            trash_retention_days: [1, 3650],
+        };
+
         const updateStmt = db.prepare('UPDATE settings SET value = ? WHERE key = ?');
         const updated = [];
 
         for (const [key, value] of Object.entries(settings)) {
-            if (!allowedNumericKeys.includes(key) && !allowedStringKeys.includes(key)) {
+            if (!allowedBooleanKeys.includes(key) && !allowedNumericKeys.includes(key) && !allowedStringKeys.includes(key)) {
                 return res.status(400).json({ error: `Unknown setting: ${key}` });
             }
 
             let finalValue = value;
 
-            if (allowedNumericKeys.includes(key)) {
+            if (allowedBooleanKeys.includes(key)) {
+                const numValue = Number(value);
+                if (numValue !== 0 && numValue !== 1) {
+                    return res.status(400).json({
+                        error: `Invalid value for ${key}: must be 0 or 1`
+                    });
+                }
+                finalValue = String(numValue);
+            } else if (allowedNumericKeys.includes(key)) {
                 // Validate numeric values
-                const numValue = parseInt(value, 10);
-                const minValue = key === 'trash_retention_days' ? 1 : 0;
-                const maxValue = key === 'trash_retention_days' ? 3650 : 1000;
-                if (isNaN(numValue) || numValue < minValue || numValue > maxValue) {
+                const numValue = Number(value);
+                const [minValue, maxValue] = numericBounds[key] || [1, 1000];
+                if (!Number.isInteger(numValue) || numValue < minValue || numValue > maxValue) {
                     return res.status(400).json({ 
-                        error: `Invalid value for ${key}: must be a number between ${minValue} and ${maxValue}` 
+                        error: `Invalid value for ${key}: must be a whole number between ${minValue} and ${maxValue}`
                     });
                 }
                 finalValue = String(numValue);

@@ -67,12 +67,12 @@ app.use(express.json());
 /**
  * DYNAMIC RATE LIMITING (fully admin-configurable)
  * -------------------------------------------------
- * Custom rate limiter that reads BOTH max and window from the settings DB
+ * Custom rate limiter that reads enabled, max, and window from the settings DB
  * on every request. Changes take effect immediately — no restart needed.
  *
  * express-rate-limit doesn't support dynamic windowMs, so we built our own.
  * Each IP's request timestamps are stored in memory. On each request:
- * 1. Read current max and window from DB
+ * 1. Read current enabled, max, and window from DB
  * 2. Filter out timestamps older than the window
  * 3. If count >= max, return 429 with a clear error message
  * 4. Otherwise, record this request and continue
@@ -81,11 +81,12 @@ app.use(express.json());
 // Helper: get a setting value from the database (with fallback)
 function getSetting(key, fallback) {
   const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
-  return row ? parseInt(row.value, 10) : fallback;
+  const value = row ? parseInt(row.value, 10) : fallback;
+  return Number.isFinite(value) ? value : fallback;
 }
 
 // Factory: creates a dynamic rate limiter middleware
-function createDynamicLimiter({ maxKey, maxDefault, windowKey, windowDefault, errorPrefix, skipPaths = [] }) {
+function createDynamicLimiter({ enabledKey, maxKey, maxDefault, windowKey, windowDefault, errorPrefix, skipPaths = [] }) {
   const hits = new Map(); // IP -> [timestamp, timestamp, ...]
 
   return (req, res, next) => {
@@ -95,8 +96,10 @@ function createDynamicLimiter({ maxKey, maxDefault, windowKey, windowDefault, er
     // Skip certain paths (e.g., admin settings) so admin doesn't lock themselves out
     if (skipPaths.some(p => req.path.startsWith(p))) return next();
 
-    const max = getSetting(maxKey, maxDefault);
-    const windowMinutes = getSetting(windowKey, windowDefault);
+    if (enabledKey && getSetting(enabledKey, 1) !== 1) return next();
+
+    const max = Math.max(1, getSetting(maxKey, maxDefault));
+    const windowMinutes = Math.max(1, getSetting(windowKey, windowDefault));
     const windowMs = windowMinutes * 60 * 1000;
     const ip = req.ip;
     const now = Date.now();
@@ -124,8 +127,9 @@ function createDynamicLimiter({ maxKey, maxDefault, windowKey, windowDefault, er
   };
 }
 
-// Global API limiter (default: 100 per 15 min)
+// Global API limiter (default: 1000 per 15 min)
 const globalLimiter = createDynamicLimiter({
+  enabledKey: 'rate_limit_api_enabled',
   maxKey: 'rate_limit_api_max',
   maxDefault: 1000,
   windowKey: 'rate_limit_api_window',
@@ -134,17 +138,6 @@ const globalLimiter = createDynamicLimiter({
   skipPaths: ['/admin/settings'],  // Don't lock admin out of settings
 });
 app.use('/api', globalLimiter);
-
-// Auth limiter (default: 10 per 15 min)
-const authLimiter = createDynamicLimiter({
-  maxKey: 'rate_limit_auth_max',
-  maxDefault: 10,
-  windowKey: 'rate_limit_auth_window',
-  windowDefault: 15,
-  errorPrefix: 'Too many login attempts.',
-});
-app.use('/api/auth/login', authLimiter);
-app.use('/api/auth/recover', authLimiter);
 
 /**
  * TEST ENDPOINT

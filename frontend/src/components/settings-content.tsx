@@ -47,10 +47,10 @@ export function SettingsContent() {
 
     // Rate limit settings (admin only)
     const [rateLimits, setRateLimits] = useState({
-        rate_limit_api_max: '100',
+        rate_limit_api_enabled: '1',
+        rate_limit_api_max: '1000',
         rate_limit_api_window: '15',
-        rate_limit_auth_max: '10',
-        rate_limit_auth_window: '15',
+        rate_limit_upload_enabled: '1',
         rate_limit_upload_max: '10',
         rate_limit_upload_window: '15',
     })
@@ -107,10 +107,10 @@ export function SettingsContent() {
                 ])
                 const s: RateLimitSettings = settingsData.settings
                 setRateLimits({
-                    rate_limit_api_max: s.rate_limit_api_max?.value || '100',
+                    rate_limit_api_enabled: s.rate_limit_api_enabled?.value || '1',
+                    rate_limit_api_max: s.rate_limit_api_max?.value || '1000',
                     rate_limit_api_window: s.rate_limit_api_window?.value || '15',
-                    rate_limit_auth_max: s.rate_limit_auth_max?.value || '10',
-                    rate_limit_auth_window: s.rate_limit_auth_window?.value || '15',
+                    rate_limit_upload_enabled: s.rate_limit_upload_enabled?.value || '1',
                     rate_limit_upload_max: s.rate_limit_upload_max?.value || '10',
                     rate_limit_upload_window: s.rate_limit_upload_window?.value || '15',
                 })
@@ -455,30 +455,43 @@ export function SettingsContent() {
                         </Card>
                     )}
 
-                    {/* Rate Limits (Admin Only) */}
+                    {/* Request Limits (Admin Only) */}
                     {isAdmin && (
                         <Card className="bg-card border-border">
                             <CardHeader>
                                 <div className="flex items-center gap-2">
                                     <Shield className="h-5 w-5 text-primary" />
-                                    <CardTitle className="text-card-foreground">Rate Limits</CardTitle>
+                                    <CardTitle className="text-card-foreground">Request Limits</CardTitle>
                                 </div>
-                                <CardDescription>Control how many requests users can make per time window</CardDescription>
+                                <CardDescription>Control API and upload request limits</CardDescription>
                             </CardHeader>
                             <CardContent className="space-y-6">
                                 {/* API Rate Limit */}
                                 <div className="p-4 rounded-lg bg-secondary space-y-3">
-                                    <p className="font-medium text-secondary-foreground">API Requests</p>
-                                    <p className="text-sm text-muted-foreground">Limits all API calls per IP address</p>
+                                    <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                                        <div>
+                                            <p className="font-medium text-secondary-foreground">API Requests</p>
+                                            <p className="text-sm text-muted-foreground">Limits all API calls per IP address</p>
+                                        </div>
+                                        <Switch
+                                            checked={rateLimits.rate_limit_api_enabled === '1'}
+                                            onCheckedChange={(checked) => setRateLimits({
+                                                ...rateLimits,
+                                                rate_limit_api_enabled: checked ? '1' : '0',
+                                            })}
+                                            className="shrink-0"
+                                        />
+                                    </div>
                                     <div className="grid gap-3 sm:grid-cols-2">
                                         <div className="space-y-1">
                                             <Label className="text-xs text-muted-foreground">Max requests</Label>
                                             <Input
                                                 type="number"
                                                 min="1"
-                                                max="1000"
+                                                max="10000"
                                                 value={rateLimits.rate_limit_api_max}
                                                 onChange={(e) => setRateLimits({ ...rateLimits, rate_limit_api_max: e.target.value })}
+                                                disabled={rateLimits.rate_limit_api_enabled !== '1'}
                                                 className="bg-background"
                                             />
                                         </div>
@@ -487,39 +500,10 @@ export function SettingsContent() {
                                             <Input
                                                 type="number"
                                                 min="1"
-                                                max="1000"
+                                                max="1440"
                                                 value={rateLimits.rate_limit_api_window}
                                                 onChange={(e) => setRateLimits({ ...rateLimits, rate_limit_api_window: e.target.value })}
-                                                className="bg-background"
-                                            />
-                                        </div>
-                                    </div>
-                                </div>
-
-                                {/* Auth Rate Limit */}
-                                <div className="p-4 rounded-lg bg-secondary space-y-3">
-                                    <p className="font-medium text-secondary-foreground">Login Attempts</p>
-                                    <p className="text-sm text-muted-foreground">Limits login and recovery attempts per IP (brute-force protection)</p>
-                                    <div className="grid gap-3 sm:grid-cols-2">
-                                        <div className="space-y-1">
-                                            <Label className="text-xs text-muted-foreground">Max attempts</Label>
-                                            <Input
-                                                type="number"
-                                                min="1"
-                                                max="1000"
-                                                value={rateLimits.rate_limit_auth_max}
-                                                onChange={(e) => setRateLimits({ ...rateLimits, rate_limit_auth_max: e.target.value })}
-                                                className="bg-background"
-                                            />
-                                        </div>
-                                        <div className="space-y-1">
-                                            <Label className="text-xs text-muted-foreground">Window (minutes)</Label>
-                                            <Input
-                                                type="number"
-                                                min="1"
-                                                max="1000"
-                                                value={rateLimits.rate_limit_auth_window}
-                                                onChange={(e) => setRateLimits({ ...rateLimits, rate_limit_auth_window: e.target.value })}
+                                                disabled={rateLimits.rate_limit_api_enabled !== '1'}
                                                 className="bg-background"
                                             />
                                         </div>
@@ -528,17 +512,30 @@ export function SettingsContent() {
 
                                 {/* Upload Rate Limit */}
                                 <div className="p-4 rounded-lg bg-secondary space-y-3">
-                                    <p className="font-medium text-secondary-foreground">File Uploads</p>
-                                    <p className="text-sm text-muted-foreground">Limits upload requests per IP to protect disk I/O</p>
+                                    <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                                        <div>
+                                            <p className="font-medium text-secondary-foreground">File Uploads</p>
+                                            <p className="text-sm text-muted-foreground">Limits upload requests per IP to protect disk I/O</p>
+                                        </div>
+                                        <Switch
+                                            checked={rateLimits.rate_limit_upload_enabled === '1'}
+                                            onCheckedChange={(checked) => setRateLimits({
+                                                ...rateLimits,
+                                                rate_limit_upload_enabled: checked ? '1' : '0',
+                                            })}
+                                            className="shrink-0"
+                                        />
+                                    </div>
                                     <div className="grid gap-3 sm:grid-cols-2">
                                         <div className="space-y-1">
                                             <Label className="text-xs text-muted-foreground">Max uploads</Label>
                                             <Input
                                                 type="number"
                                                 min="1"
-                                                max="1000"
+                                                max="10000"
                                                 value={rateLimits.rate_limit_upload_max}
                                                 onChange={(e) => setRateLimits({ ...rateLimits, rate_limit_upload_max: e.target.value })}
+                                                disabled={rateLimits.rate_limit_upload_enabled !== '1'}
                                                 className="bg-background"
                                             />
                                         </div>
@@ -547,9 +544,10 @@ export function SettingsContent() {
                                             <Input
                                                 type="number"
                                                 min="1"
-                                                max="1000"
+                                                max="1440"
                                                 value={rateLimits.rate_limit_upload_window}
                                                 onChange={(e) => setRateLimits({ ...rateLimits, rate_limit_upload_window: e.target.value })}
+                                                disabled={rateLimits.rate_limit_upload_enabled !== '1'}
                                                 className="bg-background"
                                             />
                                         </div>

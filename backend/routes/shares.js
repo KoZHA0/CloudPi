@@ -23,7 +23,7 @@ const eventBus = require('../utils/event-bus');
 const router = express.Router();
 
 const STORAGE_DIR = path.join(__dirname, '..', 'storage');
-const VALID_PERMISSIONS = new Set(['view', 'comment', 'edit', 'upload']);
+const VALID_PERMISSIONS = new Set(['view', 'edit', 'upload']);
 
 function requireAuth(req, res, next) {
     try {
@@ -433,7 +433,6 @@ function buildShareResponse(shareId) {
 function permissionLabel(permission) {
     const labels = {
         view: 'View',
-        comment: 'Comment',
         edit: 'Edit',
         upload: 'Upload only',
     };

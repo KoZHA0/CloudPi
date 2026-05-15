@@ -230,6 +230,12 @@ function getInitialSortDirection(): "asc" | "desc" {
     return window.localStorage.getItem(FILES_SORT_DIRECTION_KEY) === "desc" ? "desc" : "asc"
 }
 
+function sharePermissionLabel(permission?: SharePermission | string | null) {
+    if (permission === "edit") return "Edit access"
+    if (permission === "upload") return "Upload only access"
+    return "View only access"
+}
+
 function parseIdParam(value: string | null) {
     if (!value) return null
     const id = Number(value)
@@ -4693,7 +4699,6 @@ export function FilesContent() {
                                     </SelectTrigger>
                                     <SelectContent>
                                         <SelectItem value="view">View only</SelectItem>
-                                        <SelectItem value="comment">Can comment</SelectItem>
                                         <SelectItem value="edit">Can edit/download</SelectItem>
                                         {shareFiles.length === 1 && shareFile?.type === "folder" && <SelectItem value="upload">Upload only</SelectItem>}
                                     </SelectContent>
@@ -5007,8 +5012,8 @@ export function FilesContent() {
                                         <div>
                                             <p className="text-xs text-muted-foreground">Shared by</p>
                                             <p className="text-sm text-card-foreground">{detailFile.shared_by_name || "Another user"}</p>
-                                            <p className="text-xs text-muted-foreground mt-0.5 capitalize">
-                                                {detailFile.share_permission || "view"} access
+                                            <p className="text-xs text-muted-foreground mt-0.5">
+                                                {sharePermissionLabel(detailFile.share_permission)}
                                                 {detailFile.share_allow_download === 0 ? " · downloads disabled" : ""}
                                             </p>
                                         </div>

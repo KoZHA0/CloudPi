@@ -313,14 +313,13 @@ try {
   // Column already exists, ignore error
 }
 
-// Add failed_login_attempts counter (for account lockout)
+// Legacy login lockout columns retained for old databases.
 try {
   db.exec(`ALTER TABLE users ADD COLUMN failed_login_attempts INTEGER DEFAULT 0`);
 } catch (e) {
   // Column already exists, ignore error
 }
 
-// Add locked_until timestamp (NULL = not locked)
 try {
   db.exec(`ALTER TABLE users ADD COLUMN locked_until DATETIME DEFAULT NULL`);
 } catch (e) {
@@ -534,6 +533,27 @@ db.exec(`
 db.exec(`CREATE INDEX IF NOT EXISTS idx_activity_events_user_created ON activity_events(user_id, created_at DESC)`);
 
 /**
+ * SECURITY ATTEMPTS TABLE
+ * -----------------------
+ * Persistent login throttle/audit records.
+ * Attempts are grouped by normalized subnet in the login throttle utility.
+ */
+db.exec(`
+  CREATE TABLE IF NOT EXISTS security_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    action TEXT NOT NULL,
+    ip_address TEXT,
+    ip_subnet TEXT NOT NULL,
+    username_attempted TEXT,
+    user_agent TEXT,
+    result TEXT NOT NULL,
+    occurred_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+
+db.exec(`CREATE INDEX IF NOT EXISTS idx_security_attempts_action_subnet_time ON security_attempts(action, ip_subnet, occurred_at)`);
+
+/**
  * SETTINGS TABLE
  * --------------
  * Key-value store for admin-configurable settings.
@@ -603,19 +623,13 @@ try {
 
 // Seed default settings (INSERT OR IGNORE = don't overwrite existing values)
 const defaultSettings = [
-  ["rate_limit_api_max", "100", "Max API requests per 15 minutes per IP"],
+  ["rate_limit_api_enabled", "1", "Enable global API request rate limiting"],
+  ["rate_limit_api_max", "1000", "Max API requests per 15 minutes per IP"],
   ["rate_limit_api_window", "15", "API rate limit window in minutes"],
-  [
-    "rate_limit_auth_max",
-    "10",
-    "Max login/recovery attempts per 15 minutes per IP",
-  ],
-  ["rate_limit_auth_window", "15", "Auth rate limit window in minutes"],
+  ["rate_limit_upload_enabled", "1", "Enable file upload rate limiting"],
   ["rate_limit_upload_max", "10", "Max file uploads per 15 minutes per IP"],
   ["rate_limit_upload_window", "15", "Upload rate limit window in minutes"],
   ["password_min_length", "8", "Minimum password length"],
-  ["account_lockout_attempts", "5", "Failed login attempts before account lockout"],
-  ["account_lockout_duration", "15", "Account lockout duration in minutes"],
   ["smtp_host", "", "SMTP server hostname"],
   ["smtp_port", "587", "SMTP server port"],
   ["smtp_user", "", "SMTP authentication username"],
@@ -631,6 +645,24 @@ const insertSetting = db.prepare(
 for (const [key, value, desc] of defaultSettings) {
   insertSetting.run(key, value, desc);
 }
+
+const deprecatedSettings = [
+  "rate_limit_auth_max",
+  "rate_limit_auth_window",
+  "login_delay_free_attempts",
+  "login_delay_base_seconds",
+  "login_delay_max_seconds",
+  "account_lockout_attempts",
+  "account_lockout_duration",
+];
+const deleteSetting = db.prepare("DELETE FROM settings WHERE key = ?");
+for (const key of deprecatedSettings) {
+  deleteSetting.run(key);
+}
+
+// Legacy lockout columns are retained for old DB compatibility, but login
+// throttling now lives in security_attempts.
+db.exec(`UPDATE users SET failed_login_attempts = 0, locked_until = NULL WHERE failed_login_attempts != 0 OR locked_until IS NOT NULL`);
 
 // encryption_enabled is now a permanent setting — no longer deleted
 

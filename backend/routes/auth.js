@@ -23,6 +23,12 @@ const { sendEmail } = require('../utils/mailer');
 const { generateSecret, generateURI, verify } = require('otplib');
 const qrcode = require('qrcode');
 const { ensureProtectedInternalStorageAvailable } = require('../utils/protected-storage');
+const {
+    clearLoginFailuresForSource,
+    enforceLoginThrottle,
+    recordFailedLoginAttempt,
+    sendLoginThrottleBlock,
+} = require('../utils/login-throttle');
 
 const router = express.Router();
 
@@ -31,7 +37,8 @@ const router = express.Router();
  */
 function getSetting(key, fallback) {
     const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
-    return row ? parseInt(row.value, 10) : fallback;
+    const value = row ? parseInt(row.value, 10) : fallback;
+    return Number.isFinite(value) ? value : fallback;
 }
 
 /**
@@ -213,20 +220,27 @@ router.post('/login', async (req, res) => {
         const { username, password } = req.body;
 
         // Validate required fields
-        if (!username || !password) {
+        if (!String(username || '').trim() || !password) {
             return res.status(400).json({
                 error: 'Missing required fields',
                 required: ['username', 'password']
             });
         }
 
+        const loginUsername = String(username).trim();
+        const throttle = await enforceLoginThrottle(req, loginUsername);
+        if (throttle.blocked) return sendLoginThrottleBlock(res, throttle);
+
         // Find user by username
         const user = db.prepare(
             'SELECT * FROM users WHERE username = ?'
-        ).get(username);
+        ).get(loginUsername);
 
         if (!user) {
-            return res.status(401).json({ error: 'Invalid username or password' });
+            recordFailedLoginAttempt(req, loginUsername, throttle);
+            return res.status(401).json({
+                error: 'Invalid username or password',
+            });
         }
 
         // Check if account is disabled
@@ -234,55 +248,18 @@ router.post('/login', async (req, res) => {
             return res.status(403).json({ error: 'Account is disabled. Contact your administrator.' });
         }
 
-        // Check if account is locked
-        if (user.locked_until) {
-            const lockExpiry = new Date(user.locked_until);
-            if (lockExpiry > new Date()) {
-                const minutesLeft = Math.ceil((lockExpiry - new Date()) / 60000);
-                return res.status(423).json({
-                    error: `Account is locked. Try again in ${minutesLeft} minute(s).`,
-                    locked_until: user.locked_until
-                });
-            } else {
-                // Lock expired — reset counters
-                db.prepare('UPDATE users SET failed_login_attempts = 0, locked_until = NULL WHERE id = ?')
-                    .run(user.id);
-            }
-        }
-
         // Compare password with hash
         const passwordMatch = await bcrypt.compare(password, user.password);
 
         if (!passwordMatch) {
-            // Increment failed attempts
-            const attempts = (user.failed_login_attempts || 0) + 1;
-            const maxAttempts = getSetting('account_lockout_attempts', 5);
-            const lockoutMinutes = getSetting('account_lockout_duration', 15);
-
-            if (attempts >= maxAttempts) {
-                // Lock the account
-                const lockUntil = new Date(Date.now() + lockoutMinutes * 60 * 1000).toISOString();
-                db.prepare('UPDATE users SET failed_login_attempts = ?, locked_until = ? WHERE id = ?')
-                    .run(attempts, lockUntil, user.id);
-                return res.status(423).json({
-                    error: `Too many failed attempts. Account locked for ${lockoutMinutes} minutes.`,
-                    locked_until: lockUntil
-                });
-            } else {
-                db.prepare('UPDATE users SET failed_login_attempts = ? WHERE id = ?')
-                    .run(attempts, user.id);
-                return res.status(401).json({
-                    error: 'Invalid username or password',
-                    attempts_remaining: maxAttempts - attempts
-                });
-            }
+            recordFailedLoginAttempt(req, loginUsername, throttle);
+            return res.status(401).json({
+                error: 'Invalid username or password',
+            });
         }
 
-        // Successful login — reset failed attempts
-        if (user.failed_login_attempts > 0 || user.locked_until) {
-            db.prepare('UPDATE users SET failed_login_attempts = 0, locked_until = NULL WHERE id = ?')
-                .run(user.id);
-        }
+        // Successful credential check clears failed attempts for this source subnet.
+        clearLoginFailuresForSource(req, throttle);
 
         // Create JWT token
         if (user.two_factor_enabled) {

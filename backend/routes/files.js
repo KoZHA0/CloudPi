@@ -470,7 +470,8 @@ const upload = multer({
  */
 function getUploadSetting(key, fallback) {
     const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
-    return row ? parseInt(row.value, 10) : fallback;
+    const value = row ? parseInt(row.value, 10) : fallback;
+    return Number.isFinite(value) ? value : fallback;
 }
 
 function getTrashRetentionDays() {
@@ -538,8 +539,10 @@ const uploadLimiter = (req, res, next) => {
     // Skip CORS preflight
     if (req.method === 'OPTIONS') return next();
 
-    const max = getUploadSetting('rate_limit_upload_max', 10);
-    const windowMinutes = getUploadSetting('rate_limit_upload_window', 15);
+    if (getUploadSetting('rate_limit_upload_enabled', 1) !== 1) return next();
+
+    const max = Math.max(1, getUploadSetting('rate_limit_upload_max', 10));
+    const windowMinutes = Math.max(1, getUploadSetting('rate_limit_upload_window', 15));
     const windowMs = windowMinutes * 60 * 1000;
     const ip = req.ip;
     const now = Date.now();

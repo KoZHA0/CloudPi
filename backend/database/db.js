@@ -416,7 +416,7 @@ db.exec(`
  * - file_id: Which file/folder is being shared
  * - shared_by: User who created the share
  * - shared_with_email: Email of recipient (NULL for public link)
- * - permission: 'view' (read-only) or 'edit' (can modify)
+ * - permission: legacy field; new shares are view-only with downloads controlled separately
  * - share_link: Unique URL for link sharing
  */
 db.exec(`
@@ -734,6 +734,7 @@ try {
 db.exec(`UPDATE shares SET share_type = CASE WHEN shared_with IS NULL THEN 'link' ELSE 'user' END WHERE share_type IS NULL`);
 db.exec(`UPDATE shares SET allow_download = 1 WHERE allow_download IS NULL`);
 db.exec(`UPDATE shares SET access_count = 0 WHERE access_count IS NULL`);
+db.exec(`UPDATE shares SET permission = 'view' WHERE permission IS NULL OR permission != 'view'`);
 
 // Add storage_quota column if it doesn't exist (NULL = unlimited, value in bytes)
 try {

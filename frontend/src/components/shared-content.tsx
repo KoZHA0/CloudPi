@@ -86,7 +86,6 @@ import {
     type ShareActivityItem,
     type FileItem,
     type Breadcrumb,
-    type SharePermission,
 } from "@/lib/api"
 
 type SharesTab = "outgoing" | "incoming"
@@ -152,20 +151,6 @@ function isExpiringSoon(share: ShareItem) {
     return days <= 7
 }
 
-function permissionLabel(permission: SharePermission | string) {
-    const labels: Record<SharePermission, string> = {
-        view: "View only",
-        edit: "Can edit/download",
-        upload: "Upload only",
-    }
-    return labels[effectivePermission(permission)]
-}
-
-function effectivePermission(permission: SharePermission | string): SharePermission {
-    if (permission === "edit" || permission === "upload") return permission
-    return "view"
-}
-
 export function SharedContent() {
     const location = useLocation()
     const navigate = useNavigate()
@@ -178,14 +163,11 @@ export function SharedContent() {
     const [error, setError] = useState<string | null>(null)
 
     const [searchQuery, setSearchQuery] = useState("")
-    const [shareTypeFilter, setShareTypeFilter] = useState("all")
-    const [permissionFilter, setPermissionFilter] = useState("all")
     const [statusFilter, setStatusFilter] = useState("all")
     const [fileTypeFilter, setFileTypeFilter] = useState("all")
     const [sortKey, setSortKey] = useState<SortKey>("date")
 
     const [selectedShares, setSelectedShares] = useState<number[]>([])
-    const [bulkPermission, setBulkPermission] = useState<SharePermission>("view")
     const [busy, setBusy] = useState(false)
 
     const [confirmTarget, setConfirmTarget] = useState<{ share: ShareItem; action: ConfirmAction } | null>(null)
@@ -245,17 +227,13 @@ export function SharedContent() {
     const stats = useMemo(() => {
         const active = myShares.filter((share) => !isExpired(share)).length
         const expired = myShares.length - active
-        const links = myShares.filter((share) => share.share_type === "link").length
-        const protectedLinks = myShares.filter((share) => share.password_protected).length
-        return { active, expired, links, protectedLinks }
+        return { active, expired }
     }, [myShares])
 
     const currentList = useMemo(() => {
         const source = tab === "outgoing" ? myShares : sharedWithMe
         return source
             .filter((share) => share.file_name.toLowerCase().includes(searchQuery.toLowerCase()))
-            .filter((share) => shareTypeFilter === "all" || share.share_type === shareTypeFilter)
-            .filter((share) => permissionFilter === "all" || effectivePermission(share.permission) === permissionFilter)
             .filter((share) => statusFilter === "all" || (statusFilter === "expired" ? isExpired(share) : !isExpired(share)))
             .filter((share) => fileTypeFilter === "all" || share.file_type === fileTypeFilter)
             .sort((a, b) => {
@@ -268,7 +246,7 @@ export function SharedContent() {
                 if (sortKey === "accessed") return (b.access_count || 0) - (a.access_count || 0)
                 return (parseDate(b.created_at)?.getTime() || 0) - (parseDate(a.created_at)?.getTime() || 0)
             })
-    }, [tab, myShares, sharedWithMe, searchQuery, shareTypeFilter, permissionFilter, statusFilter, fileTypeFilter, sortKey])
+    }, [tab, myShares, sharedWithMe, searchQuery, statusFilter, fileTypeFilter, sortKey])
 
     function toggleSelected(shareIdValue: number) {
         setSelectedShares((current) =>
@@ -292,18 +270,6 @@ export function SharedContent() {
             await loadShares()
         } catch (err) {
             setError(err instanceof Error ? err.message : "Action failed")
-        } finally {
-            setBusy(false)
-        }
-    }
-
-    async function handlePermissionChange(share: ShareItem, permission: SharePermission) {
-        setBusy(true)
-        try {
-            await updateShare(share.id, { permission })
-            await loadShares()
-        } catch (err) {
-            setError(err instanceof Error ? err.message : "Failed to update share")
         } finally {
             setBusy(false)
         }
@@ -348,30 +314,11 @@ export function SharedContent() {
         }
     }
 
-    async function handleBulkPermission() {
-        if (selectedShares.length === 0) return
-        const userShareIds = selectedShares.filter((id) => myShares.find((share) => share.id === id)?.share_type !== "link")
-        if (userShareIds.length === 0) {
-            setError("Legacy link shares can only be revoked.")
-            return
-        }
-        setBusy(true)
-        try {
-            await bulkShareAction(userShareIds, "update", { permission: bulkPermission })
-            setSelectedShares([])
-            await loadShares()
-        } catch (err) {
-            setError(err instanceof Error ? err.message : "Failed to update shares")
-        } finally {
-            setBusy(false)
-        }
-    }
-
     async function handleBulkExtend() {
         if (selectedShares.length === 0) return
         const userShareIds = selectedShares.filter((id) => myShares.find((share) => share.id === id)?.share_type !== "link")
         if (userShareIds.length === 0) {
-            setError("Legacy link shares can only be revoked.")
+            setError("Link shares can only be revoked.")
             return
         }
         setBusy(true)
@@ -466,7 +413,7 @@ export function SharedContent() {
     }
 
     async function openIncomingPreview(share: ShareItem) {
-        if (share.file_type === "folder" || share.permission === "upload") return
+        if (share.file_type === "folder") return
         setPreviewShare(share)
         setPreviewTextContent(null)
         setPreviewError(null)
@@ -619,7 +566,7 @@ export function SharedContent() {
                                 <p className="truncate font-semibold text-foreground">{share.file_name}</p>
                                 <Badge variant={linkShare ? "outline" : "secondary"} className="gap-1">
                                     {linkShare ? <Link2 className="h-3 w-3" /> : <Users2 className="h-3 w-3" />}
-                                    {linkShare ? "Legacy link" : "User"}
+                                    {linkShare ? "Link" : "User"}
                                 </Badge>
                                 {expired && <Badge variant="destructive">Expired</Badge>}
                                 {!expired && isExpiringSoon(share) && (
@@ -638,7 +585,7 @@ export function SharedContent() {
                                 {formatFileSize(share.file_size)} - shared {formatDate(share.created_at)}
                             </p>
                             <div className="mt-2 flex flex-wrap gap-3 text-xs text-muted-foreground">
-                                <span>{tab === "outgoing" ? "To" : "From"}: <span className="text-foreground">{linkShare ? "Legacy public link" : (tab === "outgoing" ? share.shared_with_name : share.shared_by_name) || "Unknown"}</span></span>
+                                <span>{tab === "outgoing" ? "To" : "From"}: <span className="text-foreground">{linkShare ? "Link" : (tab === "outgoing" ? share.shared_with_name : share.shared_by_name) || "Unknown"}</span></span>
                                 <span>Expires: <span className="text-foreground">{share.expires_at ? formatDate(share.expires_at) : "Never"}</span></span>
                                 <span>Accesses: <span className="text-foreground">{share.access_count || 0}</span></span>
                                 <span>Last: <span className="text-foreground">{formatDate(share.last_accessed_at)}</span></span>
@@ -666,20 +613,6 @@ export function SharedContent() {
                                 </>
                             ) : (
                                 <>
-                                    <Select
-                                        value={effectivePermission(share.permission)}
-                                        onValueChange={(value) => handlePermissionChange(share, value as SharePermission)}
-                                        disabled={busy}
-                                    >
-                                        <SelectTrigger size="sm" className="w-[150px]">
-                                            <SelectValue />
-                                        </SelectTrigger>
-                                        <SelectContent>
-                                            <SelectItem value="view">View only</SelectItem>
-                                            <SelectItem value="edit">Can edit/download</SelectItem>
-                                            {share.file_type === "folder" && <SelectItem value="upload">Upload only</SelectItem>}
-                                        </SelectContent>
-                                    </Select>
                                     <div className="flex items-center gap-2 rounded-md border border-border px-2 py-1.5">
                                         <Download className="h-3.5 w-3.5 text-muted-foreground" />
                                         <Switch
@@ -721,12 +654,11 @@ export function SharedContent() {
                             )
                         ) : (
                             <>
-                                <Badge variant="secondary">{permissionLabel(share.permission)}</Badge>
                                 <Button
                                     variant={share.shortcut_id ? "secondary" : "outline"}
                                     size="sm"
                                     className="gap-2"
-                                    disabled={expired || share.permission === "upload" || busy}
+                                    disabled={expired || busy}
                                     onClick={() => toggleMyFilesShortcut(share)}
                                 >
                                     <FolderPlus className="h-3.5 w-3.5" />
@@ -737,7 +669,7 @@ export function SharedContent() {
                                         variant="outline"
                                         size="sm"
                                         className="gap-2"
-                                        disabled={expired || share.permission === "upload"}
+                                        disabled={expired}
                                         onClick={() => openSharedFolder(share)}
                                     >
                                         <FolderOpen className="h-3.5 w-3.5" />
@@ -748,7 +680,7 @@ export function SharedContent() {
                                         variant="outline"
                                         size="sm"
                                         className="gap-2"
-                                        disabled={expired || share.permission === "upload"}
+                                        disabled={expired}
                                         onClick={() => openIncomingPreview(share)}
                                     >
                                         <Eye className="h-3.5 w-3.5" />
@@ -798,7 +730,7 @@ export function SharedContent() {
                 </Button>
             </div>
 
-            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <div className="grid gap-3 sm:grid-cols-2">
                 <div className="rounded-lg border border-border px-4 py-3">
                     <p className="text-xs text-muted-foreground">Active shares</p>
                     <p className="text-2xl font-bold">{stats.active}</p>
@@ -806,14 +738,6 @@ export function SharedContent() {
                 <div className="rounded-lg border border-border px-4 py-3">
                     <p className="text-xs text-muted-foreground">Expired shares</p>
                     <p className="text-2xl font-bold">{stats.expired}</p>
-                </div>
-                <div className="rounded-lg border border-border px-4 py-3">
-                    <p className="text-xs text-muted-foreground">Legacy links</p>
-                    <p className="text-2xl font-bold">{stats.links}</p>
-                </div>
-                <div className="rounded-lg border border-border px-4 py-3">
-                    <p className="text-xs text-muted-foreground">Legacy protected</p>
-                    <p className="text-2xl font-bold">{stats.protectedLinks}</p>
                 </div>
             </div>
 
@@ -840,7 +764,7 @@ export function SharedContent() {
                 </Button>
             </div>
 
-            <div className="grid gap-3 lg:grid-cols-[minmax(220px,1fr)_repeat(5,max-content)] lg:items-center">
+            <div className="grid gap-3 lg:grid-cols-[minmax(220px,1fr)_repeat(3,max-content)] lg:items-center">
                 <div className="relative">
                     <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
                     <Input
@@ -850,23 +774,6 @@ export function SharedContent() {
                         className="pl-9"
                     />
                 </div>
-                <Select value={shareTypeFilter} onValueChange={setShareTypeFilter}>
-                    <SelectTrigger className="w-full lg:w-[130px]"><SelectValue /></SelectTrigger>
-                    <SelectContent>
-                        <SelectItem value="all">All shares</SelectItem>
-                        <SelectItem value="link">Legacy links</SelectItem>
-                        <SelectItem value="user">Users</SelectItem>
-                    </SelectContent>
-                </Select>
-                <Select value={permissionFilter} onValueChange={setPermissionFilter}>
-                    <SelectTrigger className="w-full lg:w-[150px]"><SelectValue /></SelectTrigger>
-                    <SelectContent>
-                        <SelectItem value="all">Any permission</SelectItem>
-                        <SelectItem value="view">View only</SelectItem>
-                        <SelectItem value="edit">Can edit</SelectItem>
-                        <SelectItem value="upload">Upload only</SelectItem>
-                    </SelectContent>
-                </Select>
                 <Select value={statusFilter} onValueChange={setStatusFilter}>
                     <SelectTrigger className="w-full lg:w-[130px]"><SelectValue /></SelectTrigger>
                     <SelectContent>
@@ -901,15 +808,6 @@ export function SharedContent() {
             {selectedShares.length > 0 && tab === "outgoing" && (
                 <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border px-3 py-2">
                     <span className="text-sm text-muted-foreground">{selectedShares.length} selected</span>
-                    <Select value={bulkPermission} onValueChange={(value) => setBulkPermission(value as SharePermission)}>
-                        <SelectTrigger size="sm" className="w-[150px]"><SelectValue /></SelectTrigger>
-                        <SelectContent>
-                            <SelectItem value="view">View only</SelectItem>
-                            <SelectItem value="edit">Can edit</SelectItem>
-                            <SelectItem value="upload">Upload only</SelectItem>
-                        </SelectContent>
-                    </Select>
-                    <Button variant="outline" size="sm" onClick={handleBulkPermission} disabled={busy}>Apply permission</Button>
                     <Button variant="outline" size="sm" onClick={handleBulkExtend} disabled={busy}>Extend 7 days</Button>
                     <Button variant="outline" size="sm" className="text-destructive" onClick={handleBulkRevoke} disabled={busy}>
                         Revoke

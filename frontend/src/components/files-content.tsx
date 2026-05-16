@@ -48,13 +48,6 @@ import { Checkbox } from "@/components/ui/checkbox"
 import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
 import {
-    Select,
-    SelectContent,
-    SelectItem,
-    SelectTrigger,
-    SelectValue,
-} from "@/components/ui/select"
-import {
     Folder,
     FileText,
     ImageIcon,
@@ -148,7 +141,6 @@ import {
     type FileItem,
     type Breadcrumb,
     type ShareUser,
-    type SharePermission,
     type FileVersion,
     type FileVersionsResponse,
 } from "@/lib/api"
@@ -228,12 +220,6 @@ function getInitialSortKey(): FilesSortKey {
 function getInitialSortDirection(): "asc" | "desc" {
     if (typeof window === "undefined") return "asc"
     return window.localStorage.getItem(FILES_SORT_DIRECTION_KEY) === "desc" ? "desc" : "asc"
-}
-
-function sharePermissionLabel(permission?: SharePermission | string | null) {
-    if (permission === "edit") return "Edit access"
-    if (permission === "upload") return "Upload only access"
-    return "View only access"
 }
 
 function parseIdParam(value: string | null) {
@@ -391,7 +377,6 @@ export function FilesContent() {
     const [shareLoading, setShareLoading] = useState(false)
     const [selectedShareUsers, setSelectedShareUsers] = useState<number[]>([])
     const [shareUserQuery, setShareUserQuery] = useState("")
-    const [sharePermission, setSharePermission] = useState<SharePermission>("view")
     const [shareExpiry, setShareExpiry] = useState("")
     const [allowShareDownload, setAllowShareDownload] = useState(true)
     const [shareStatus, setShareStatus] = useState<{ type: 'success' | 'warning' | 'error'; message: string } | null>(null)
@@ -1601,7 +1586,6 @@ export function FilesContent() {
         setShareLoading(true)
         setSelectedShareUsers([])
         setShareUserQuery("")
-        setSharePermission("view")
         setShareExpiry("")
         setAllowShareDownload(true)
         setShareStatus(null)
@@ -1630,7 +1614,6 @@ export function FilesContent() {
         setShareLoading(true)
         setSelectedShareUsers([])
         setShareUserQuery("")
-        setSharePermission("view")
         setShareExpiry("")
         setAllowShareDownload(true)
         setShareStatus(null)
@@ -1672,7 +1655,7 @@ export function FilesContent() {
         for (const file of targets) {
             for (const userId of selectedShareUsers) {
                 try {
-                    const result = await createShareLink(file.id, userId, sharePermission, shareOptions)
+                    const result = await createShareLink(file.id, userId, shareOptions)
                     const user = shareUsers.find(u => u.id === userId)
                     const label = targets.length > 1
                         ? `${getDisplayName(file)} -> ${user?.username || 'user'}`
@@ -4690,29 +4673,14 @@ export function FilesContent() {
                             </div>
                         </div>
 
-                        <div className="grid gap-3 sm:grid-cols-2">
-                            <div className="space-y-2">
-                                <Label>Permission</Label>
-                                <Select value={sharePermission} onValueChange={(value) => setSharePermission(value as SharePermission)}>
-                                    <SelectTrigger className="w-full">
-                                        <SelectValue />
-                                    </SelectTrigger>
-                                    <SelectContent>
-                                        <SelectItem value="view">View only</SelectItem>
-                                        <SelectItem value="edit">Can edit/download</SelectItem>
-                                        {shareFiles.length === 1 && shareFile?.type === "folder" && <SelectItem value="upload">Upload only</SelectItem>}
-                                    </SelectContent>
-                                </Select>
-                            </div>
-                            <div className="space-y-2">
-                                <Label htmlFor="shareExpiry">Expiry</Label>
-                                <Input
-                                    id="shareExpiry"
-                                    type="datetime-local"
-                                    value={shareExpiry}
-                                    onChange={(e) => setShareExpiry(e.target.value)}
-                                />
-                            </div>
+                        <div className="space-y-2">
+                            <Label htmlFor="shareExpiry">Expiry</Label>
+                            <Input
+                                id="shareExpiry"
+                                type="datetime-local"
+                                value={shareExpiry}
+                                onChange={(e) => setShareExpiry(e.target.value)}
+                            />
                         </div>
 
                         <div className="flex items-center justify-between rounded-md border border-border p-3">
@@ -5013,8 +4981,7 @@ export function FilesContent() {
                                             <p className="text-xs text-muted-foreground">Shared by</p>
                                             <p className="text-sm text-card-foreground">{detailFile.shared_by_name || "Another user"}</p>
                                             <p className="text-xs text-muted-foreground mt-0.5">
-                                                {sharePermissionLabel(detailFile.share_permission)}
-                                                {detailFile.share_allow_download === 0 ? " · downloads disabled" : ""}
+                                                {detailFile.share_allow_download === 0 ? "Downloads disabled" : "Downloads allowed"}
                                             </p>
                                         </div>
                                     </div>

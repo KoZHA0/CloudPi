@@ -173,6 +173,29 @@ function removePathRecursive(targetPath) {
     fs.rmSync(targetPath, { recursive: true, force: true });
 }
 
+function fsyncDirectory(dirPath) {
+    try {
+        const fd = fs.openSync(dirPath, 'r');
+        try {
+            fs.fsyncSync(fd);
+        } finally {
+            fs.closeSync(fd);
+        }
+    } catch (_) {
+        // Directory fsync is not supported on every platform/filesystem.
+    }
+}
+
+function flushStoredFileToDisk(filePath) {
+    const fd = fs.openSync(filePath, 'r');
+    try {
+        fs.fsyncSync(fd);
+    } finally {
+        fs.closeSync(fd);
+    }
+    fsyncDirectory(path.dirname(filePath));
+}
+
 function getRegularUploadTempPath(storageSourceId, userId, uploadId) {
     return path.join(getStorageBasePath(storageSourceId, userId), REGULAR_UPLOAD_TEMP_ROOT, uploadId);
 }
@@ -654,6 +677,12 @@ async function uploadWorker(task, callback) {
                     // If the original is still there, proceed unencrypted (graceful degradation)
                     console.warn(`   → File saved unencrypted as fallback`);
                 }
+            }
+
+            try {
+                flushStoredFileToDisk(diskPath);
+            } catch (syncErr) {
+                throw new Error(`Could not flush "${file.originalname}" to storage - ${syncErr.message}`);
             }
 
             const uploaded = saveUploadedFileVersionAware(db, {
@@ -1595,9 +1624,11 @@ router.post('/uploads/:uploadId/complete', requireAuth, async (req, res) => {
                 const chunk = fs.readFileSync(getRegularUploadChunkPath(session.tempPath, index));
                 fs.writeSync(writeFd, chunk);
             }
+            fs.fsyncSync(writeFd);
         } finally {
             fs.closeSync(writeFd);
         }
+        fsyncDirectory(path.dirname(finalPath));
 
         const actualSize = fs.statSync(finalPath).size;
         if (actualSize !== session.size) {

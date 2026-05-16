@@ -981,7 +981,6 @@ export async function getShareUsers(): Promise<{ users: ShareUser[] }> {
 export async function createShareLink(
     fileId: number,
     sharedWithId: number,
-    permission: SharePermission = 'view',
     options: ShareOptions = {}
 ): Promise<{ message: string; share: ShareItem }> {
     return apiRequest<{ message: string; share: ShareItem }>('/shares', {
@@ -989,7 +988,6 @@ export async function createShareLink(
         body: JSON.stringify({
             fileId,
             sharedWithId,
-            permission,
             expiresAt: options.expiresAt || null,
             allowDownload: options.allowDownload ?? true,
         }),
@@ -1024,7 +1022,6 @@ export async function revokeShare(shareId: number): Promise<{ message: string }>
 export async function updateShare(
     shareId: number,
     updates: {
-        permission?: SharePermission;
         expiresAt?: string | null;
         allowDownload?: boolean;
         password?: string;
@@ -1040,7 +1037,6 @@ export async function bulkShareAction(
     shareIds: number[],
     action: 'revoke' | 'update',
     updates: {
-        permission?: SharePermission;
         expiresAt?: string | null;
         allowDownload?: boolean;
     } = {}

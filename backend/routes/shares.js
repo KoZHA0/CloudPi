@@ -23,7 +23,6 @@ const eventBus = require('../utils/event-bus');
 const router = express.Router();
 
 const STORAGE_DIR = path.join(__dirname, '..', 'storage');
-const VALID_PERMISSIONS = new Set(['view', 'edit', 'upload']);
 
 function requireAuth(req, res, next) {
     try {
@@ -118,11 +117,6 @@ function assertSharedFileStorageAvailable(file, res, action = 'access') {
 
 function isVaultItem(file) {
     return !!file && (file.is_secure_vault === 1 || file.vault_root_id !== null);
-}
-
-function normalizePermission(permission) {
-    const normalized = String(permission || 'view').toLowerCase();
-    return VALID_PERMISSIONS.has(normalized) ? normalized : 'view';
 }
 
 function normalizeAllowDownload(value) {
@@ -430,18 +424,9 @@ function buildShareResponse(shareId) {
     `).get(shareId);
 }
 
-function permissionLabel(permission) {
-    const labels = {
-        view: 'View',
-        edit: 'Edit',
-        upload: 'Upload only',
-    };
-    return labels[permission] || 'View';
-}
-
 function getShareNotificationDetails(shareId) {
     return db.prepare(`
-        SELECT s.id, s.file_id, s.shared_by, s.shared_with, s.permission,
+        SELECT s.id, s.file_id, s.shared_by, s.shared_with,
                ${shareTypeExpression()} as share_type,
                f.name as file_name, f.type as file_type,
                u_by.username as shared_by_name,
@@ -471,7 +456,7 @@ function notifyShareReceived(shareId) {
             userId: share.shared_with,
             type: 'share.received',
             title: `${share.shared_by_name} shared a ${itemKind} with you`,
-            body: `${share.shared_by_name} gave you ${permissionLabel(share.permission)} access to "${share.file_name}".`,
+            body: `${share.shared_by_name} shared "${share.file_name}" with you.`,
             link: '/shares/incoming',
             metadata: {
                 shareId: share.id,
@@ -479,7 +464,6 @@ function notifyShareReceived(shareId) {
                 fileName: share.file_name,
                 fileType: share.file_type,
                 sharedBy: share.shared_by,
-                permission: share.permission,
             },
         });
     } catch (error) {
@@ -529,7 +513,6 @@ function logShareCreated(shareId) {
                 fileName: share.file_name,
                 fileType: share.file_type,
                 recipientId: share.shared_with,
-                permission: share.permission,
             },
         });
 
@@ -538,7 +521,7 @@ function logShareCreated(shareId) {
             actorId: share.shared_by,
             type: 'share.received',
             title: `${share.shared_by_name} shared "${share.file_name}"`,
-            body: `${permissionLabel(share.permission)} access in Shared with Me`,
+            body: 'Available in Shared with Me',
             link: '/shares/incoming',
             metadata: {
                 shareId: share.id,
@@ -546,7 +529,6 @@ function logShareCreated(shareId) {
                 fileName: share.file_name,
                 fileType: share.file_type,
                 sharedBy: share.shared_by,
-                permission: share.permission,
             },
         });
     } catch (error) {
@@ -606,8 +588,8 @@ function logShareUpdated(shareId) {
             type: 'share.updated',
             title: `Updated share for "${share.file_name}"`,
             body: share.shared_with_name
-                ? `${share.shared_with_name} now has ${permissionLabel(share.permission)} access`
-                : `${permissionLabel(share.permission)} access`,
+                ? `Updated sharing settings for ${share.shared_with_name}`
+                : 'Updated sharing settings',
             link: '/shares/outgoing',
             metadata: {
                 shareId: share.id,
@@ -615,7 +597,6 @@ function logShareUpdated(shareId) {
                 fileName: share.file_name,
                 fileType: share.file_type,
                 recipientId: share.shared_with,
-                permission: share.permission,
             },
         });
     } catch (error) {
@@ -651,11 +632,6 @@ function logShareLeft(shareId, userId) {
 function applyShareUpdates(shareId, body, currentShare) {
     const fields = [];
     const params = [];
-
-    if (body.permission !== undefined) {
-        fields.push('permission = ?');
-        params.push(normalizePermission(body.permission));
-    }
 
     if (body.expiresAt !== undefined || body.expires_at !== undefined) {
         fields.push('expires_at = ?');
@@ -782,7 +758,6 @@ router.post('/', requireAuth, (req, res) => {
         const {
             fileId,
             sharedWithId,
-            permission = 'view',
             shareType,
             createPublicLink,
         } = req.body;
@@ -802,7 +777,6 @@ router.post('/', requireAuth, (req, res) => {
         if (isVaultItem(file)) return res.status(400).json({ error: 'Encrypted vault items cannot be shared yet' });
         if (!assertSharedFileStorageAvailable(file, res, 'share')) return;
 
-        const normalizedPermission = normalizePermission(permission);
         const expiresAt = normalizeExpiresAt(req.body.expiresAt ?? req.body.expires_at);
         const allowDownload = normalizeAllowDownload(req.body.allowDownload ?? req.body.allow_download);
 
@@ -820,7 +794,6 @@ router.post('/', requireAuth, (req, res) => {
 
         if (existing) {
             applyShareUpdates(existing.id, {
-                permission: normalizedPermission,
                 expiresAt,
                 allowDownload,
             }, { ...existing, share_type: 'user' });
@@ -837,7 +810,7 @@ router.post('/', requireAuth, (req, res) => {
                 share_type, expires_at, allow_download
             )
             VALUES (?, ?, ?, ?, ?, 'user', ?, ?)
-        `).run(file.id, userId, targetUser.id, normalizedPermission, generateShareLink(), expiresAt ?? null, allowDownload);
+        `).run(file.id, userId, targetUser.id, 'view', generateShareLink(), expiresAt ?? null, allowDownload);
         notifyShareReceived(result.lastInsertRowid);
         logShareCreated(result.lastInsertRowid);
 
@@ -926,9 +899,6 @@ router.post('/:id/shortcut', requireAuth, (req, res) => {
         const share = getRecipientShare(req.params.id, req.user.userId);
         if (!share) return res.status(404).json({ error: 'Share not found' });
         if (!assertActiveShare(share, res)) return;
-        if (share.permission === 'upload') {
-            return res.status(400).json({ error: 'Upload-only shares cannot be added to My Files' });
-        }
 
         db.prepare(`
             INSERT OR IGNORE INTO share_shortcuts (user_id, share_id)
@@ -1007,7 +977,6 @@ router.get('/:shareId/preview', requireAuth, async (req, res) => {
         const share = getRecipientShare(req.params.shareId, req.user.userId);
         if (!share) return res.status(404).json({ error: 'Share not found' });
         if (!assertActiveShare(share, res)) return;
-        if (share.permission === 'upload') return res.status(403).json({ error: 'This share does not allow browsing' });
 
         recordShareAccess(share.id, req, 'preview', req.user.userId);
         await sendStoredFile(fileFromShare(share), res, true);
@@ -1041,7 +1010,6 @@ router.get('/shared-folder/:shareId/files', requireAuth, (req, res) => {
             return res.status(404).json({ error: 'Shared folder not found' });
         }
         if (!assertActiveShare(share, res)) return;
-        if (share.permission === 'upload') return res.status(403).json({ error: 'This share does not allow browsing' });
         if (!assertSharedFileStorageAvailable(fileFromShare(share), res, 'browse')) return;
 
         const parentId = req.query.parent_id || share.file_id;
@@ -1112,7 +1080,6 @@ router.get('/shared-folder/:shareId/preview/:fileId', requireAuth, async (req, r
         const share = getRecipientShare(req.params.shareId, userId);
         if (!share) return res.status(404).json({ error: 'Share not found' });
         if (!assertActiveShare(share, res)) return;
-        if (share.permission === 'upload') return res.status(403).json({ error: 'This share does not allow browsing' });
 
         const file = db.prepare("SELECT * FROM files WHERE id = ? AND user_id = ? AND type != 'folder' AND trashed = 0")
             .get(req.params.fileId, share.owner_id);
@@ -1221,7 +1188,6 @@ router.get('/public/:link/preview', async (req, res) => {
         if (!share) return res.status(404).json({ error: 'Shared file not found' });
         if (!assertActiveShare(share, res)) return;
         if (!hasValidShareAccessToken(req, share)) return res.status(401).json({ error: 'Password required' });
-        if (share.permission === 'upload') return res.status(403).json({ error: 'This share does not allow browsing' });
 
         recordShareAccess(share.id, req, 'preview');
         await sendStoredFile(fileFromShare(share), res, true);
